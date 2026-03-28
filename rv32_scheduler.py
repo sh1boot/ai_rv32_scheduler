@@ -2494,6 +2494,72 @@ def _rule_arith_branch(a: "Instruction", b: "Instruction",
     return True
 
 
+def _rule_dual_move(a: "Instruction", b: "Instruction",
+                    liveness: dict) -> bool:
+    """
+    Two independent register-move or small-immediate-load instructions.
+
+    Matches any combination of:
+        mv   rd, rs          (copy register, rs in x0..x15)
+        li   rd, imm         (load 5-bit signed immediate, −16..+15)
+
+    Constraints:
+      - A and B must each be mv or li.
+      - Both destination registers must be in x0..x15 (4-bit field).
+      - For mv: the source register must be in x0..x15.
+      - For li: the immediate must be a plain integer literal fitting in
+        5 signed bits (−16..+15).  Symbol-relative values are rejected.
+      - The two destination registers must be distinct; encoding two writes
+        to the same register in one compact word serves no purpose.
+      - Either order is valid — (mv, li), (li, mv), (mv, mv), (li, li).
+        The BnB scheduler will try both orderings, so a single symmetric
+        predicate covers all four cases.
+
+    No liveness check is required because neither instruction produces an
+    intermediate value that the other consumes; both destinations are
+    independently written.
+
+    Canonical examples:
+        mv   a0, a1          # a0 = a1
+        li   a2, 7           # a2 = 7
+
+        li   x8, -1          # x8 = -1
+        li   x9, 0           # x9 = 0
+
+        mv   x10, x11        # copy pair
+        mv   x12, x13
+    """
+    _DUAL_MOVE_MN = frozenset({"mv", "li"})
+
+    def _ok(instr: "Instruction") -> bool:
+        if instr.mnemonic not in _DUAL_MOVE_MN:
+            return False
+        rd = instr.defs[0] if instr.defs else None
+        if rd is None or rd not in _REG4:
+            return False
+        if instr.mnemonic == "mv":
+            rs = instr.uses[0] if instr.uses else None
+            if rs is None or rs not in _REG4:
+                return False
+        else:  # li
+            imm = instr.imm
+            if imm is None or imm < -16 or imm > 15:
+                return False
+        return True
+
+    if not (_ok(a) and _ok(b)):
+        return False
+
+    # Distinct destinations — encoding two writes to the same register
+    # in a single compact word is pointless and likely unrepresentable.
+    rd_a = a.defs[0]
+    rd_b = b.defs[0]
+    if rd_a == rd_b:
+        return False
+
+    return True
+
+
 # Registry: (display_name, rule_function)
 # Rules are tested in order; the first match wins.
 COMPACT32_RULES: list = [
@@ -2505,6 +2571,7 @@ COMPACT32_RULES: list = [
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_branch",        _rule_arith_branch),
+    ("dual_move",           _rule_dual_move),
 ]
 
 
@@ -2572,6 +2639,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         if a.dual_arith_ok:
             eligible.add("dual_arith")
             eligible.add("arith_branch")
+        if a.mnemonic in ("mv", "li"):
+            eligible.add("dual_move")
         return frozenset(eligible)
 
     # Pre-build the eligible set for each instruction once, then cache it.
