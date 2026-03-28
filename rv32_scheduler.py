@@ -1,22 +1,39 @@
 """
 rv32_scheduler.py
 
-RV32 instruction scheduler: reads assembly source, reorders instructions
-within basic blocks to maximise pairing opportunities, and emits the
-reordered assembly with PAIR+ annotations.
+Reads RV32 assembly, builds a dependency graph respecting:
+  - RAW / WAW / WAR register hazards (integer AND floating-point registers)
+  - Memory ordering (loads/stores preserve relative order)
+  - Atomic ordering (AMO instructions are treated as memory barriers)
+  - CSR hazards (reads/writes to the same CSR are ordered)
+  - Vector register hazards (v0-v31)
+
+Supported extensions
+--------------------
+  I   Base integer
+  M   Multiply / divide
+  A   Atomics
+  F   Single-precision floating-point
+  D   Double-precision floating-point
+  Q   Quad-precision floating-point
+  C   Compressed instructions  (16-bit; decoded to canonical names)
+  Zicsr   CSR access instructions
+  Zifencei  fence.i
+  Zba / Zbb / Zbc / Zbs  Bit-manipulation (B-extension subsets)
+  V   Vector (RVV 1.0)
+
+The scheduler exposes a hook -- pair_score(instr_a, instr_b) -> float --
+that an external optimiser can override to bias instruction placement.
 
 Usage
 -----
-    python rv32_scheduler.py input.s
-    python rv32_scheduler.py input.s --scorer compact32
-    python rv32_scheduler.py input.s --no-rename -v
-    python rv32_scheduler.py --list-rules
-    python rv32_scheduler.py -          # read from stdin
+    python rv32_scheduler.py input.s            # print reordered assembly
+    python rv32_scheduler.py input.s -v         # also dump dep-graph to stderr
+    python rv32_scheduler.py -                  # read from stdin
 
 Python API
 ----------
-    from rv32_scheduler import AssemblyScheduler
-    from rv32_core import Instruction
+    from rv32_scheduler import AssemblyScheduler, Instruction
 
     def my_score(a: Instruction, b: Instruction) -> float:
         if a.mnemonic == "fmul.s" and b.mnemonic == "fadd.s":
@@ -30,30 +47,845 @@ Python API
 import re
 import sys
 import argparse
-import copy
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Callable
-
-from rv32_core import (
-    Instruction,
-    DepGraph,
-    parse_line,
-    build_dep_graph,
-    compute_liveness,
-    _INT_ABI, _FP_ABI,
-)
-from rv32_scorers import (
-    PairScoreFn,
-    can_compress,
-    _compress_pair_score,
-    COMPACT32_RULES,
-    SCORERS,
-)
+from typing import Optional, Callable
 
 # ---------------------------------------------------------------------------
-# Pair statistics
+# Register name tables
 # ---------------------------------------------------------------------------
+
+_INT_ABI: dict = {
+    "zero": "x0", "ra": "x1", "sp": "x2", "gp": "x3", "tp": "x4",
+    "t0": "x5", "t1": "x6", "t2": "x7",
+    "s0": "x8", "fp": "x8", "s1": "x9",
+    "a0": "x10", "a1": "x11", "a2": "x12", "a3": "x13",
+    "a4": "x14", "a5": "x15", "a6": "x16", "a7": "x17",
+    "s2": "x18", "s3": "x19", "s4": "x20", "s5": "x21",
+    "s6": "x22", "s7": "x23", "s8": "x24", "s9": "x25",
+    "s10": "x26", "s11": "x27",
+    "t3": "x28", "t4": "x29", "t5": "x30", "t6": "x31",
+}
+
+_FP_ABI: dict = {
+    "ft0": "f0",  "ft1": "f1",  "ft2": "f2",  "ft3": "f3",
+    "ft4": "f4",  "ft5": "f5",  "ft6": "f6",  "ft7": "f7",
+    "fs0": "f8",  "fs1": "f9",
+    "fa0": "f10", "fa1": "f11",
+    "fa2": "f12", "fa3": "f13", "fa4": "f14", "fa5": "f15",
+    "fa6": "f16", "fa7": "f17",
+    "fs2": "f18", "fs3": "f19", "fs4": "f20", "fs5": "f21",
+    "fs6": "f22", "fs7": "f23", "fs8": "f24", "fs9": "f25",
+    "fs10": "f26", "fs11": "f27",
+    "ft8": "f28", "ft9": "f29", "ft10": "f30", "ft11": "f31",
+}
+
+
+def _normalise_reg(name: str) -> str:
+    s = name.lower().strip().rstrip(",").rstrip(")").strip()
+    if s in _INT_ABI:
+        return _INT_ABI[s]
+    if s in _FP_ABI:
+        return _FP_ABI[s]
+    return s
+
+
+def _is_reg_token(tok: str) -> bool:
+    t = tok.lower().strip().rstrip(",")
+    if t in _INT_ABI or t in _FP_ABI:
+        return True
+    return bool(re.match(r"^[xfv]\d{1,2}$", t))
+
+
+# ---------------------------------------------------------------------------
+# ISA opcode tables
+# ---------------------------------------------------------------------------
+# mnemonic -> (def_slot, (use_slot, ...))
+#
+# Slot keys: rd/fd/vd  rs1/rs2  fs1/fs2/fs3  vs1/vs2/vs3
+#            mem_base  csr  (imm/label slots are consumed but not tracked)
+
+_I = {
+    "add":   ("rd", ("rs1","rs2")), "sub":   ("rd", ("rs1","rs2")),
+    "sll":   ("rd", ("rs1","rs2")), "slt":   ("rd", ("rs1","rs2")),
+    "sltu":  ("rd", ("rs1","rs2")), "xor":   ("rd", ("rs1","rs2")),
+    "srl":   ("rd", ("rs1","rs2")), "sra":   ("rd", ("rs1","rs2")),
+    "or":    ("rd", ("rs1","rs2")), "and":   ("rd", ("rs1","rs2")),
+    "addi":  ("rd", ("rs1",)),      "slti":  ("rd", ("rs1",)),
+    "sltiu": ("rd", ("rs1",)),      "xori":  ("rd", ("rs1",)),
+    "ori":   ("rd", ("rs1",)),      "andi":  ("rd", ("rs1",)),
+    "slli":  ("rd", ("rs1",)),      "srli":  ("rd", ("rs1",)),
+    "srai":  ("rd", ("rs1",)),
+    "lui":   ("rd", ()),            "auipc": ("rd", ()),
+    "jal":   ("rd", ()),            "jalr":  ("rd", ("rs1",)),
+    "beq":   (None, ("rs1","rs2")), "bne":   (None, ("rs1","rs2")),
+    "blt":   (None, ("rs1","rs2")), "bge":   (None, ("rs1","rs2")),
+    "bltu":  (None, ("rs1","rs2")), "bgeu":  (None, ("rs1","rs2")),
+    "lb":    ("rd",  ("mem_base",)), "lh":   ("rd",  ("mem_base",)),
+    "lw":    ("rd",  ("mem_base",)), "lbu":  ("rd",  ("mem_base",)),
+    "lhu":   ("rd",  ("mem_base",)),
+    "sb":    (None, ("rs1","mem_base")),
+    "sh":    (None, ("rs1","mem_base")),
+    "sw":    (None, ("rs1","mem_base")),
+    # ── Pseudo-instructions ──────────────────────────────────────────────
+    # These are assembler aliases for base instructions.  They are decoded
+    # here so that the dependency analyser sees their actual register usage
+    # rather than treating them as barriers.
+    "beqz":  (None, ("rs1",)),      # beq  rs, x0, label
+    "bnez":  (None, ("rs1",)),      # bne  rs, x0, label
+    "blez":  (None, ("rs1",)),      # bge  x0, rs, label
+    "bgez":  (None, ("rs1",)),      # bge  rs, x0, label
+    "bltz":  (None, ("rs1",)),      # blt  rs, x0, label
+    "bgtz":  (None, ("rs1",)),      # blt  x0, rs, label
+    "mv":    ("rd",  ("rs1",)),     # addi rd, rs, 0
+    "not":   ("rd",  ("rs1",)),     # xori rd, rs, -1
+    "neg":   ("rd",  ("rs1",)),     # sub  rd, x0, rs
+    "negw":  ("rd",  ("rs1",)),     # subw rd, x0, rs
+    "seqz":  ("rd",  ("rs1",)),     # sltiu rd, rs, 1
+    "snez":  ("rd",  ("rs1",)),     # sltu  rd, x0, rs
+    "sltz":  ("rd",  ("rs1",)),     # slt   rd, rs, x0
+    "sgtz":  ("rd",  ("rs1",)),     # slt   rd, x0, rs
+    "sext.w":("rd",  ("rs1",)),     # addiw rd, rs, 0
+    "zext.b":("rd",  ("rs1",)),     # andi  rd, rs, 255
+    "nop":   (None,  ()),           # addi  x0, x0, 0
+    "ret":   (None,  ("rs1",)),     # jalr  x0, x1, 0  (uses ra)
+    "li":    ("rd",  ()),           # lui+addi or addi — dest only, imm is immediate
+    "la":    ("rd",  ()),           # auipc+addi — dest only
+    "j":     (None,  ()),           # jal x0, label
+    "jr":    (None,  ("rs1",)),     # jalr x0, rs, 0
+    "call":  ("rd",  ()),           # auipc+jalr — writes ra (x1); treated conservatively
+    "tail":  (None,  ()),           # auipc+jalr x0 — no dest
+}
+
+_M = {
+    "mul":    ("rd", ("rs1","rs2")), "mulh":   ("rd", ("rs1","rs2")),
+    "mulhsu": ("rd", ("rs1","rs2")), "mulhu":  ("rd", ("rs1","rs2")),
+    "div":    ("rd", ("rs1","rs2")), "divu":   ("rd", ("rs1","rs2")),
+    "rem":    ("rd", ("rs1","rs2")), "remu":   ("rd", ("rs1","rs2")),
+}
+
+_A = {
+    "lr.w":      ("rd", ("rs1",)),
+    "sc.w":      ("rd", ("rs1","rs2")),
+    "amoswap.w": ("rd", ("rs1","rs2")), "amoadd.w":  ("rd", ("rs1","rs2")),
+    "amoand.w":  ("rd", ("rs1","rs2")), "amoor.w":   ("rd", ("rs1","rs2")),
+    "amoxor.w":  ("rd", ("rs1","rs2")), "amomax.w":  ("rd", ("rs1","rs2")),
+    "amomin.w":  ("rd", ("rs1","rs2")), "amomaxu.w": ("rd", ("rs1","rs2")),
+    "amominu.w": ("rd", ("rs1","rs2")),
+}
+
+_F = {
+    "flw":      ("fd",  ("mem_base",)), "fsw":      (None, ("fs1","mem_base")),
+    "fadd.s":   ("fd",  ("fs1","fs2")), "fsub.s":   ("fd",  ("fs1","fs2")),
+    "fmul.s":   ("fd",  ("fs1","fs2")), "fdiv.s":   ("fd",  ("fs1","fs2")),
+    "fsqrt.s":  ("fd",  ("fs1",)),      "fmin.s":   ("fd",  ("fs1","fs2")),
+    "fmax.s":   ("fd",  ("fs1","fs2")),
+    "fmadd.s":  ("fd",  ("fs1","fs2","fs3")),
+    "fmsub.s":  ("fd",  ("fs1","fs2","fs3")),
+    "fnmsub.s": ("fd",  ("fs1","fs2","fs3")),
+    "fnmadd.s": ("fd",  ("fs1","fs2","fs3")),
+    "fsgnj.s":  ("fd",  ("fs1","fs2")), "fsgnjn.s": ("fd",  ("fs1","fs2")),
+    "fsgnjx.s": ("fd",  ("fs1","fs2")),
+    "fcvt.w.s":  ("rd", ("fs1",)),      "fcvt.wu.s": ("rd", ("fs1",)),
+    "fcvt.s.w":  ("fd", ("rs1",)),      "fcvt.s.wu": ("fd", ("rs1",)),
+    "fmv.x.w":  ("rd",  ("fs1",)),      "fmv.w.x":  ("fd",  ("rs1",)),
+    "feq.s":    ("rd",  ("fs1","fs2")), "flt.s":    ("rd",  ("fs1","fs2")),
+    "fle.s":    ("rd",  ("fs1","fs2")), "fclass.s": ("rd",  ("fs1",)),
+}
+
+_D = {
+    "fld":       ("fd",  ("mem_base",)), "fsd":       (None,  ("fs1","mem_base")),
+    "fadd.d":    ("fd",  ("fs1","fs2")), "fsub.d":    ("fd",  ("fs1","fs2")),
+    "fmul.d":    ("fd",  ("fs1","fs2")), "fdiv.d":    ("fd",  ("fs1","fs2")),
+    "fsqrt.d":   ("fd",  ("fs1",)),      "fmin.d":    ("fd",  ("fs1","fs2")),
+    "fmax.d":    ("fd",  ("fs1","fs2")),
+    "fmadd.d":   ("fd",  ("fs1","fs2","fs3")),
+    "fmsub.d":   ("fd",  ("fs1","fs2","fs3")),
+    "fnmsub.d":  ("fd",  ("fs1","fs2","fs3")),
+    "fnmadd.d":  ("fd",  ("fs1","fs2","fs3")),
+    "fsgnj.d":   ("fd",  ("fs1","fs2")), "fsgnjn.d":  ("fd",  ("fs1","fs2")),
+    "fsgnjx.d":  ("fd",  ("fs1","fs2")),
+    "fcvt.s.d":  ("fd",  ("fs1",)),      "fcvt.d.s":  ("fd",  ("fs1",)),
+    "fcvt.w.d":  ("rd",  ("fs1",)),      "fcvt.wu.d": ("rd",  ("fs1",)),
+    "fcvt.d.w":  ("fd",  ("rs1",)),      "fcvt.d.wu": ("fd",  ("rs1",)),
+    "fmv.x.d":   ("rd",  ("fs1",)),      "fmv.d.x":   ("fd",  ("rs1",)),
+    "feq.d":     ("rd",  ("fs1","fs2")), "flt.d":     ("rd",  ("fs1","fs2")),
+    "fle.d":     ("rd",  ("fs1","fs2")), "fclass.d":  ("rd",  ("fs1",)),
+}
+
+_Q = {
+    "flq":       ("fd",  ("mem_base",)), "fsq":       (None,  ("fs1","mem_base")),
+    "fadd.q":    ("fd",  ("fs1","fs2")), "fsub.q":    ("fd",  ("fs1","fs2")),
+    "fmul.q":    ("fd",  ("fs1","fs2")), "fdiv.q":    ("fd",  ("fs1","fs2")),
+    "fsqrt.q":   ("fd",  ("fs1",)),      "fmin.q":    ("fd",  ("fs1","fs2")),
+    "fmax.q":    ("fd",  ("fs1","fs2")),
+    "fmadd.q":   ("fd",  ("fs1","fs2","fs3")),
+    "fmsub.q":   ("fd",  ("fs1","fs2","fs3")),
+    "fnmsub.q":  ("fd",  ("fs1","fs2","fs3")),
+    "fnmadd.q":  ("fd",  ("fs1","fs2","fs3")),
+    "fsgnj.q":   ("fd",  ("fs1","fs2")), "fsgnjn.q":  ("fd",  ("fs1","fs2")),
+    "fsgnjx.q":  ("fd",  ("fs1","fs2")),
+    "fcvt.s.q":  ("fd",  ("fs1",)),      "fcvt.q.s":  ("fd",  ("fs1",)),
+    "fcvt.d.q":  ("fd",  ("fs1",)),      "fcvt.q.d":  ("fd",  ("fs1",)),
+    "fcvt.w.q":  ("rd",  ("fs1",)),      "fcvt.wu.q": ("rd",  ("fs1",)),
+    "fcvt.q.w":  ("fd",  ("rs1",)),      "fcvt.q.wu": ("fd",  ("rs1",)),
+    "feq.q":     ("rd",  ("fs1","fs2")), "flt.q":     ("rd",  ("fs1","fs2")),
+    "fle.q":     ("rd",  ("fs1","fs2")), "fclass.q":  ("rd",  ("fs1",)),
+}
+
+_ZICSR = {
+    "csrrw":  ("rd", ("rs1","csr")), "csrrs":  ("rd", ("rs1","csr")),
+    "csrrc":  ("rd", ("rs1","csr")),
+    "csrrwi": ("rd", ("csr",)),      "csrrsi": ("rd", ("csr",)),
+    "csrrci": ("rd", ("csr",)),
+}
+CSR_WRITERS = frozenset(_ZICSR)
+
+_B = {
+    "sh1add": ("rd", ("rs1","rs2")), "sh2add": ("rd", ("rs1","rs2")),
+    "sh3add": ("rd", ("rs1","rs2")),
+    "andn":   ("rd", ("rs1","rs2")), "orn":    ("rd", ("rs1","rs2")),
+    "xnor":   ("rd", ("rs1","rs2")),
+    "clz":    ("rd", ("rs1",)),      "ctz":    ("rd", ("rs1",)),
+    "cpop":   ("rd", ("rs1",)),
+    "max":    ("rd", ("rs1","rs2")), "maxu":   ("rd", ("rs1","rs2")),
+    "min":    ("rd", ("rs1","rs2")), "minu":   ("rd", ("rs1","rs2")),
+    "sext.b": ("rd", ("rs1",)),      "sext.h": ("rd", ("rs1",)),
+    "zext.h": ("rd", ("rs1",)),
+    "rol":    ("rd", ("rs1","rs2")), "ror":    ("rd", ("rs1","rs2")),
+    "rori":   ("rd", ("rs1",)),
+    "orc.b":  ("rd", ("rs1",)),      "rev8":   ("rd", ("rs1",)),
+    "clmul":  ("rd", ("rs1","rs2")), "clmulh": ("rd", ("rs1","rs2")),
+    "clmulr": ("rd", ("rs1","rs2")),
+    "bclr":   ("rd", ("rs1","rs2")), "bclri":  ("rd", ("rs1",)),
+    "bext":   ("rd", ("rs1","rs2")), "bexti":  ("rd", ("rs1",)),
+    "binv":   ("rd", ("rs1","rs2")), "binvi":  ("rd", ("rs1",)),
+    "bset":   ("rd", ("rs1","rs2")), "bseti":  ("rd", ("rs1",)),
+}
+
+_V = {
+    "vadd.vv": ("vd",("vs1","vs2")),  "vadd.vx": ("vd",("vs1","rs1")),
+    "vadd.vi": ("vd",("vs1",)),
+    "vsub.vv": ("vd",("vs1","vs2")),  "vsub.vx": ("vd",("vs1","rs1")),
+    "vrsub.vx":("vd",("vs1","rs1")),  "vrsub.vi":("vd",("vs1",)),
+    "vmul.vv": ("vd",("vs1","vs2")),  "vmul.vx": ("vd",("vs1","rs1")),
+    "vmulh.vv":("vd",("vs1","vs2")),  "vmulh.vx":("vd",("vs1","rs1")),
+    "vdiv.vv": ("vd",("vs1","vs2")),  "vdiv.vx": ("vd",("vs1","rs1")),
+    "vrem.vv": ("vd",("vs1","vs2")),  "vrem.vx": ("vd",("vs1","rs1")),
+    "vand.vv": ("vd",("vs1","vs2")),  "vand.vx": ("vd",("vs1","rs1")),
+    "vand.vi": ("vd",("vs1",)),
+    "vor.vv":  ("vd",("vs1","vs2")),  "vor.vx":  ("vd",("vs1","rs1")),
+    "vor.vi":  ("vd",("vs1",)),
+    "vxor.vv": ("vd",("vs1","vs2")),  "vxor.vx": ("vd",("vs1","rs1")),
+    "vxor.vi": ("vd",("vs1",)),
+    "vsll.vv": ("vd",("vs1","vs2")),  "vsll.vx": ("vd",("vs1","rs1")),
+    "vsll.vi": ("vd",("vs1",)),
+    "vsrl.vv": ("vd",("vs1","vs2")),  "vsrl.vx": ("vd",("vs1","rs1")),
+    "vsrl.vi": ("vd",("vs1",)),
+    "vsra.vv": ("vd",("vs1","vs2")),  "vsra.vx": ("vd",("vs1","rs1")),
+    "vsra.vi": ("vd",("vs1",)),
+    "vfadd.vv":("vd",("vs1","vs2")),  "vfadd.vf":("vd",("vs1","fs1")),
+    "vfsub.vv":("vd",("vs1","vs2")),  "vfsub.vf":("vd",("vs1","fs1")),
+    "vfmul.vv":("vd",("vs1","vs2")),  "vfmul.vf":("vd",("vs1","fs1")),
+    "vfdiv.vv":("vd",("vs1","vs2")),  "vfdiv.vf":("vd",("vs1","fs1")),
+    "vfsqrt.v":("vd",("vs1",)),
+    "vfmadd.vv":("vd",("vs1","vs2")), "vfmadd.vf":("vd",("vs1","fs1")),
+    "vfmsub.vv":("vd",("vs1","vs2")), "vfmsub.vf":("vd",("vs1","fs1")),
+    "vfnmadd.vv":("vd",("vs1","vs2")),"vfnmadd.vf":("vd",("vs1","fs1")),
+    "vfnmsub.vv":("vd",("vs1","vs2")),"vfnmsub.vf":("vd",("vs1","fs1")),
+    "vle8.v":  ("vd",("rs1",)),       "vle16.v": ("vd",("rs1",)),
+    "vle32.v": ("vd",("rs1",)),       "vle64.v": ("vd",("rs1",)),
+    "vse8.v":  (None,("vs1","rs1")),  "vse16.v": (None,("vs1","rs1")),
+    "vse32.v": (None,("vs1","rs1")),  "vse64.v": (None,("vs1","rs1")),
+    "vmv.v.v": ("vd",("vs1",)),       "vmv.v.x": ("vd",("rs1",)),
+    "vmv.v.i": ("vd",()),             "vmv.x.s": ("rd",("vs1",)),
+    "vmv.s.x": ("vd",("rs1",)),
+    "vsetvli": ("rd",("rs1",)),       "vsetivli":("rd",()),
+    "vsetvl":  ("rd",("rs1","rs2")),
+    "vredsum.vs":("vd",("vs1","vs2")),"vredmax.vs":("vd",("vs1","vs2")),
+    "vredmin.vs":("vd",("vs1","vs2")),"vredand.vs":("vd",("vs1","vs2")),
+    "vredor.vs": ("vd",("vs1","vs2")),"vredxor.vs":("vd",("vs1","vs2")),
+    "vfredsum.vs":("vd",("vs1","vs2")),"vfredmax.vs":("vd",("vs1","vs2")),
+    "vfredmin.vs":("vd",("vs1","vs2")),
+    "vmand.mm":("vd",("vs1","vs2")),  "vmor.mm": ("vd",("vs1","vs2")),
+    "vmxor.mm":("vd",("vs1","vs2")),  "vmnand.mm":("vd",("vs1","vs2")),
+    "vmnor.mm":("vd",("vs1","vs2")),  "vmxnor.mm":("vd",("vs1","vs2")),
+    "vmnot.m": ("vd",("vs1",)),
+    "vslideup.vx":   ("vd",("vs1","rs1")), "vslideup.vi":   ("vd",("vs1",)),
+    "vslidedown.vx": ("vd",("vs1","rs1")), "vslidedown.vi": ("vd",("vs1",)),
+    "vslide1up.vx":  ("vd",("vs1","rs1")), "vslide1down.vx":("vd",("vs1","rs1")),
+    "vmseq.vv":("vd",("vs1","vs2")),  "vmseq.vx":("vd",("vs1","rs1")),
+    "vmseq.vi":("vd",("vs1",)),       "vmsne.vv":("vd",("vs1","vs2")),
+    "vmsne.vx":("vd",("vs1","rs1")),  "vmsne.vi":("vd",("vs1",)),
+    "vmsltu.vv":("vd",("vs1","vs2")), "vmsltu.vx":("vd",("vs1","rs1")),
+    "vmslt.vv":("vd",("vs1","vs2")),  "vmslt.vx":("vd",("vs1","rs1")),
+    "vmsleu.vv":("vd",("vs1","vs2")), "vmsleu.vx":("vd",("vs1","rs1")),
+    "vmsle.vv":("vd",("vs1","vs2")),  "vmsle.vx":("vd",("vs1","rs1")),
+    "vmsgtu.vx":("vd",("vs1","rs1")), "vmsgt.vx":("vd",("vs1","rs1")),
+    "vfcvt.xu.f.v":("vd",("vs1",)),  "vfcvt.x.f.v":("vd",("vs1",)),
+    "vfcvt.f.xu.v":("vd",("vs1",)),  "vfcvt.f.x.v":("vd",("vs1",)),
+}
+
+ALL_TABLES: dict = {**_I, **_M, **_A, **_F, **_D, **_Q, **_ZICSR, **_B, **_V}
+
+BARRIERS = frozenset({
+    "fence", "fence.i", "ecall", "ebreak",
+    "vsetvli", "vsetivli", "vsetvl",
+})
+_AMO_PREFIXES = ("lr.", "sc.", "amo")
+_LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
+                    {k for k in _V if k.startswith("vle")})
+_STORES = frozenset({"sb","sh","sw","fsw","fsd","fsq"} |
+                    {k for k in _V if k.startswith("vse")})
+_AMO_SUFFIX_RE = re.compile(r"\.(aq|rl|aqrl)$")
+
+# C-extension: 2-operand compressed form where rd is also implicit rs1.
+# c.add rd, rs2  =>  add rd, rd, rs2
+_C_ALIASES: dict = {
+    "c.add":"add",    "c.addi":"addi",  "c.addi16sp":"addi",
+    "c.addi4spn":"addi", "c.and":"and", "c.andi":"andi",
+    "c.beqz":"beq",   "c.bnez":"bne",  "c.ebreak":"ebreak",
+    "c.j":"jal",      "c.jal":"jal",   "c.jalr":"jalr",   "c.jr":"jalr",
+    "c.li":"addi",    "c.lui":"lui",   "c.lw":"lw",       "c.lwsp":"lw",
+    "c.mv":"add",     "c.nop":"addi",  "c.or":"or",
+    "c.slli":"slli",  "c.srai":"srai", "c.srli":"srli",
+    "c.sub":"sub",    "c.sw":"sw",     "c.swsp":"sw",      "c.xor":"xor",
+}
+
+
+# ---------------------------------------------------------------------------
+# Instruction dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Instruction:
+    index:    int
+    raw:      str
+    mnemonic: str
+    operands:  list = field(default_factory=list)
+    defs:      list = field(default_factory=list)
+    uses:      list = field(default_factory=list)
+    csr_defs:  list = field(default_factory=list)
+    csr_uses:  list = field(default_factory=list)
+    is_load:    bool = False
+    is_store:   bool = False
+    is_amo:     bool = False
+    is_barrier: bool = False
+    is_branch:  bool = False   # conditional/unconditional branch or jump
+    # Cached decoded values — populated by parse_line, used by scorer rules
+    # to avoid re-parsing raw strings on every scorer call.
+    imm:        object = None  # int immediate if present, else None
+    mem:        object = None  # (offset:int, base:str) for load/store, else None
+    dual_arith_ok:       bool = False  # satisfies _dual_arith_ok() constraints
+    dual_arith_chain_ok: bool = False  # satisfies _dual_arith_ok(allow_chain_reg=True) and defs x31
+
+    def __repr__(self):
+        return f"I{self.index}:{self.mnemonic}"
+
+
+# ---------------------------------------------------------------------------
+# Operand decoder
+# ---------------------------------------------------------------------------
+
+def _mem_base(operand: str):
+    m = re.match(r"[^(]*\(([^)]+)\)", operand)
+    return _normalise_reg(m.group(1)) if m else None
+
+
+def _strip_vec_mask(operand: str):
+    s = operand.strip().rstrip(",")
+    return "v0" if s in ("v0.t", "v0") else None
+
+
+def _decode_operands(mnemonic, pat_def, pat_uses, ops):
+    defs, uses, csr_defs, csr_uses = [], [], [], []
+
+    mask_reg = None
+    if ops and _strip_vec_mask(ops[-1]) is not None:
+        mask_reg = _strip_vec_mask(ops[-1])
+        ops = ops[:-1]
+
+    it = iter(ops)
+    def nxt():
+        try: return next(it)
+        except StopIteration: return None
+
+    if pat_def is not None:
+        tok = nxt()
+        if tok is None:
+            return defs, uses, csr_defs, csr_uses
+        reg = _normalise_reg(tok)
+        if pat_def in ("rd","fd","vd") and reg != "x0":
+            defs.append(reg)
+
+    for slot in pat_uses:
+        tok = nxt()
+        if tok is None:
+            break
+        if slot == "mem_base":
+            base = _mem_base(tok)
+            if base: uses.append(base)
+        elif slot == "csr":
+            csr_id = f"csr:{tok.lower()}"
+            csr_uses.append(csr_id)
+            if mnemonic in CSR_WRITERS:
+                csr_defs.append(csr_id)
+        elif slot in ("rs1","rs2","fs1","fs2","fs3","vs1","vs2","vs3"):
+            uses.append(_normalise_reg(tok))
+
+    if mask_reg:
+        uses.append(mask_reg)
+    uses = [r for r in uses if r != "x0"]
+    return defs, uses, csr_defs, csr_uses
+
+
+# ---------------------------------------------------------------------------
+# Line parser
+# ---------------------------------------------------------------------------
+
+def parse_line(index: int, line: str):
+    stripped = line.strip()
+    if (not stripped
+            or stripped.startswith(("#",";","//"))
+            or stripped.startswith(".")
+            or re.match(r"^\w+\s*:", stripped)):
+        return None
+
+    code = re.split(r"[#;]", stripped)[0].strip()
+    if not code:
+        return None
+
+    tokens = code.split()
+    raw_mn = tokens[0].lower()
+
+    is_c_insn = raw_mn in _C_ALIASES
+    mnemonic  = _C_ALIASES.get(raw_mn, raw_mn)
+    mnemonic  = _AMO_SUFFIX_RE.sub("", mnemonic)
+
+    ops = [p.strip() for p in " ".join(tokens[1:]).split(",") if p.strip()]
+
+    # C-extension implicit rs1=rd expansion for 2-operand compressed forms
+    if is_c_insn and len(ops) == 2 and mnemonic in ALL_TABLES:
+        pat_def, pat_uses = ALL_TABLES[mnemonic]
+        if (pat_def in ("rd","fd")
+                and pat_uses and pat_uses[0] in ("rs1","fs1")):
+            ops = [ops[0], ops[0]] + ops[1:]
+
+    instr = Instruction(index=index, raw=line, mnemonic=mnemonic, operands=ops)
+    instr.is_load    = mnemonic in _LOADS
+    instr.is_store   = mnemonic in _STORES
+    instr.is_amo     = any(mnemonic.startswith(p) for p in _AMO_PREFIXES)
+    instr.is_barrier = mnemonic in BARRIERS or instr.is_amo
+
+    # Branches and jumps must be scheduled after all instructions that
+    # precede them in the original basic block.  They are NOT full barriers:
+    # they don't prevent reordering among instructions that follow them
+    # (there normally aren't any in a basic block).
+    _BRANCH_MNEMONICS = frozenset({
+        "beq", "bne", "blt", "bge", "bltu", "bgeu",
+        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+        "jal", "jalr", "j", "jr",
+    })
+    instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+
+    if mnemonic not in ALL_TABLES:
+        instr.is_barrier = True
+        instr.uses = [_normalise_reg(t.rstrip(",")) for t in tokens[1:]
+                      if _is_reg_token(t)]
+        return instr
+
+    pat_def, pat_uses = ALL_TABLES[mnemonic]
+    defs, uses, csr_defs, csr_uses = _decode_operands(mnemonic, pat_def, pat_uses, ops)
+    instr.defs, instr.uses = defs, uses
+    instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
+
+    # call/tail are multi-instruction pseudo-ops (auipc + jalr) that may
+    # clobber any caller-saved register and cross arbitrary call boundaries.
+    # ret is jalr x0, ra, 0 — ends a function, nothing meaningful after it.
+    # Treat all three as barriers so nothing reorders past them.
+    if mnemonic in ("call", "tail", "ret"):
+        instr.is_barrier = True
+
+    # ── Cache immediate and memory operand ───────────────────────────────
+    # Populate once at parse time so scorer rules don't have to re-parse
+    # raw strings (which involves regex) on every pair_score() call.
+    _IMM_RE  = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)$")
+    _MEM_RE  = re.compile(r"\s*(-?\d+)\s*\(([^)]+)\)")
+    # Immediate: last comma-separated token, if it's a plain integer literal
+    _code = re.split(r"[#;]", instr.raw)[0].strip()
+    _parts = _code.split(None, 1)
+    if len(_parts) >= 2:
+        _ops = [o.strip() for o in _parts[1].split(",")]
+        _last = _ops[-1].strip()
+        if _IMM_RE.fullmatch(_last):
+            try:
+                instr.imm = int(_last, 0)
+            except ValueError:
+                pass
+    # Memory operand: offset(base) form, present on loads and stores
+    if (instr.is_load or instr.is_store) and len(_parts) >= 2:
+        _ops2 = [o.strip() for o in _parts[1].split(",")]
+        # memory operand is the last operand for loads, second for stores
+        _mem_op = _ops2[-1]
+        _m = _MEM_RE.match(_mem_op)
+        if _m:
+            instr.mem = (int(_m.group(1)), _normalise_reg(_m.group(2).strip()))
+
+    # Pre-computation of dual-arith eligibility is deferred to
+    # _finalize_instruction() which is called right after this return.
+    # We can't call _dual_arith_ok here because it is defined later in the
+    # file, but Python resolves names at call time so calling via
+    # _finalize_instruction works fine.
+    _finalize_instruction(instr)
+    return instr
+
+
+def _finalize_instruction(instr: "Instruction") -> None:
+    """Populate fields that depend on functions defined after parse_line."""
+    instr.dual_arith_ok       = _dual_arith_ok(instr)
+    instr.dual_arith_chain_ok = (
+        _dual_arith_ok(instr, allow_chain_reg=True)
+        and bool(instr.defs) and instr.defs[0] == "x31"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dependency graph
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DepGraph:
+    instructions: list
+    successors:   dict = field(default_factory=lambda: defaultdict(set))
+    predecessors: dict = field(default_factory=lambda: defaultdict(set))
+
+    def add_edge(self, before: int, after: int):
+        if before != after:
+            self.successors[before].add(after)
+            self.predecessors[after].add(before)
+
+    def in_degree(self) -> dict:
+        return {i.index: len(self.predecessors[i.index])
+                for i in self.instructions}
+
+
+def build_dep_graph(instructions: list) -> DepGraph:
+    graph = DepGraph(instructions=instructions)
+    last_writer: dict = {}
+    last_readers: dict = defaultdict(list)
+    last_csr_writer: dict = {}
+    last_csr_readers: dict = defaultdict(list)
+    mem_ops: list = []
+    last_barrier: int = -1
+
+    for instr in instructions:
+        idx = instr.index
+
+        if instr.is_barrier:
+            for prev in instructions:
+                if prev.index < idx:
+                    graph.add_edge(prev.index, idx)
+            last_barrier = idx
+            if instr.is_amo:
+                mem_ops.append(idx)
+
+        if instr.is_branch and not instr.is_barrier:
+            # Branch must come after every instruction that precedes it in
+            # the original sequence.  This prevents the scheduler from moving
+            # the branch earlier and skipping instructions that belong in the
+            # same basic block.  Unlike a full barrier, we do NOT set
+            # last_barrier, so instructions after the branch (if any) are not
+            # forced to follow it.
+            for prev in instructions:
+                if prev.index < idx:
+                    graph.add_edge(prev.index, idx)
+
+        if last_barrier >= 0 and last_barrier != idx:
+            graph.add_edge(last_barrier, idx)
+
+        for reg in instr.uses:
+            if reg in last_writer:
+                graph.add_edge(last_writer[reg], idx)
+        for reg in instr.defs:
+            for r in last_readers.get(reg, []):
+                graph.add_edge(r, idx)
+            if reg in last_writer:
+                graph.add_edge(last_writer[reg], idx)
+
+        for csr in instr.csr_uses:
+            if csr in last_csr_writer:
+                graph.add_edge(last_csr_writer[csr], idx)
+        for csr in instr.csr_defs:
+            for r in last_csr_readers.get(csr, []):
+                graph.add_edge(r, idx)
+            if csr in last_csr_writer:
+                graph.add_edge(last_csr_writer[csr], idx)
+
+        if (instr.is_load or instr.is_store) and not instr.is_amo:
+            if mem_ops:
+                graph.add_edge(mem_ops[-1], idx)
+            mem_ops.append(idx)
+
+        for reg in instr.defs:
+            last_writer[reg] = idx
+            last_readers[reg] = []
+        for reg in instr.uses:
+            last_readers[reg].append(idx)
+        for csr in instr.csr_defs:
+            last_csr_writer[csr] = idx
+            last_csr_readers[csr] = []
+        for csr in instr.csr_uses:
+            last_csr_readers[csr].append(idx)
+
+    return graph
+
+
+# ---------------------------------------------------------------------------
+# Liveness analysis
+# ---------------------------------------------------------------------------
+
+def compute_liveness(instructions: list) -> dict:
+    """
+    Perform a single backward pass over *instructions* (in original program
+    order) and return a dict mapping each instruction index to the set of
+    registers that are "last-used" by that instruction -- i.e. registers that
+    are read by the instruction and are not read again before being
+    overwritten (or before the end of the block).
+
+    A register is considered dead-after-use at instruction I when:
+      - I reads the register, AND
+      - No later instruction (in original order) reads it before the next
+        write to that register (or end-of-block).
+
+    The returned dict has the shape:
+        { instr_index: frozenset of register names }
+
+    Only tracks integer (x*) and floating-point (f*) architectural registers.
+    x0 is never reported as a last-use because it cannot hold a meaningful
+    value.
+
+    Example
+    -------
+        liveness = compute_liveness(graph.instructions)
+        for instr in scheduled:
+            dead = liveness[instr.index]
+            if dead:
+                print(f"  ; kills: {', '.join(sorted(dead))}")
+    """
+    # live_out[reg] = True  means the register is still needed by some
+    # later instruction.  We walk backward and clear it when we see a write.
+    live_out: dict = {}          # reg -> bool (currently live)
+    last_use: dict = {}          # instr_index -> set[reg]
+
+    for instr in reversed(instructions):
+        idx = instr.index
+        killed: set = set()
+
+        # Registers *defined* by this instruction become dead before this
+        # point (unless they're also used here, which can happen for e.g.
+        # c.add rd,rs2 where rd==rs1).
+        for reg in instr.defs:
+            live_out[reg] = False   # killed by this write
+
+        # Registers *used* by this instruction: if not already live from a
+        # later instruction, this is the last use.
+        for reg in instr.uses:
+            if reg == "x0":
+                continue
+            if not live_out.get(reg, False):
+                killed.add(reg)
+            live_out[reg] = True    # mark as live going upward
+
+        last_use[idx] = frozenset(killed)
+
+    return last_use
+
+
+# ---------------------------------------------------------------------------
+# Compressed-encoding eligibility
+# ---------------------------------------------------------------------------
+
+# RVC integer registers: x8-x15 (s0-s1, a0-a5)
+_CL_INT_REGS = frozenset(f"x{n}" for n in range(8, 16))
+# RVC float registers: f8-f15
+_CL_FP_REGS  = frozenset(f"f{n}" for n in range(8, 16))
+
+# Mnemonics that have a known 16-bit C-extension encoding on RV32C.
+# Derived from the RVC instruction listing (RISC-V ISA spec §12).
+# Note: we use the *canonical* (expanded) mnemonic, not the c.* prefix.
+_CAN_COMPRESS_MNEMONICS: frozenset = frozenset({
+    # CR format
+    "jalr",   # c.jr / c.jalr  (rd==x0 or rd!=x0, rs2==x0)
+    "add",    # c.add / c.mv
+    # CI format
+    "addi",   # c.addi / c.li / c.lui / c.addi16sp / c.addi4spn / c.nop
+    "lui",    # c.lui
+    "slli",   # c.slli
+    "lw",     # c.lwsp / c.lw
+    "flw",    # c.flwsp / c.flw   (F-extension)
+    "fld",    # c.fldsp / c.fld   (D-extension)
+    # CSS format
+    "sw",     # c.swsp / c.sw
+    "fsw",    # c.fswsp / c.fsw
+    "fsd",    # c.fsdsp / c.fsd
+    # CL/CS format -- subset of registers only
+    # (already covered by lw/sw/flw/fsw/fld/fsd above)
+    # CB / CJ format
+    "beq",    # c.beqz  (rs2 == x0)
+    "bne",    # c.bnez  (rs2 == x0)
+    "jal",    # c.jal / c.j
+    # CA format (CL register subset)
+    "sub",    # c.sub
+    "xor",    # c.xor
+    "or",     # c.or
+    "and",    # c.and
+    "srai",   # c.srai
+    "srli",   # c.srli
+    "andi",   # c.andi
+    # pseudo-instructions that assemble to compressed forms
+    "nop",    # c.nop
+    "ret",    # c.jr ra  ->  c.ret
+    "mv",     # c.mv
+})
+
+
+def can_compress(instr: "Instruction") -> bool:
+    """
+    Return True if *instr* is a candidate for a 16-bit RVC encoding.
+
+    This is a conservative static test: it checks the mnemonic and, where
+    the compressed form restricts the register set, the actual operand
+    registers.  It does NOT check immediate ranges (those are only known
+    after register allocation / final code-gen), so it may return True for
+    instructions that ultimately won't compress due to an out-of-range
+    immediate.
+
+    Checks performed
+    ----------------
+    * Mnemonic must appear in the RVC instruction set.
+    * For CA-format arithmetic (sub/xor/or/and/srai/srli/andi) both the
+      destination and the single source must be in the CL register set
+      (x8-x15).
+    * For CL/CS memory ops (lw/sw/flw/fsw/fld/fsd) using the 3-register
+      form, both rd/rs and the base must be in the CL register set.
+    * c.beqz / c.bnez require rs2 == x0.
+    * c.jr / c.jalr require rs2 == x0 (already true for jalr in the table,
+      but we accept either form).
+    * Loads/stores using the SP-based forms (lwsp/swsp etc.) are accepted
+      for any rd/rs when the base register is sp (x2).
+    """
+    mn = instr.mnemonic
+
+    if mn not in _CAN_COMPRESS_MNEMONICS:
+        return False
+
+    defs = instr.defs
+    uses = instr.uses
+
+    # CA-format: sub/xor/or/and require rd and rs2 in CL set
+    if mn in ("sub", "xor", "or", "and"):
+        rd  = defs[0] if defs else None
+        rs2 = uses[0] if uses else None
+        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS
+
+    # CB-format shifts: srai/srli/andi -- rd (==rs1) must be in CL set
+    if mn in ("srai", "srli", "andi"):
+        rd = defs[0] if defs else None
+        return rd in _CL_INT_REGS
+
+    # Branches: c.beqz / c.bnez require rs2 == x0
+    if mn in ("beq", "bne"):
+        # uses = [rs1, rs2]; c.beqz/c.bnez encode rs1 in CL set, rs2==x0
+        rs1 = uses[0] if len(uses) > 0 else None
+        rs2 = uses[1] if len(uses) > 1 else None
+        return rs1 in _CL_INT_REGS and rs2 == "x0"
+
+    # Memory ops: accept SP-relative (any rd) OR CL-register-only form
+    if mn in ("lw", "flw", "fld"):
+        base = uses[0] if uses else None
+        rd   = defs[0] if defs else None
+        if base == "x2":          # c.lwsp / c.flwsp / c.fldsp
+            return True
+        cl_regs = _CL_FP_REGS if mn in ("flw", "fld") else _CL_INT_REGS
+        return base in _CL_INT_REGS and rd in cl_regs
+
+    if mn in ("sw", "fsw", "fsd"):
+        # uses = [rs2_data, base]
+        base    = uses[1] if len(uses) > 1 else (uses[0] if uses else None)
+        rs2     = uses[0] if uses else None
+        if base == "x2":          # c.swsp / c.fswsp / c.fsdsp
+            return True
+        cl_regs = _CL_FP_REGS if mn in ("fsw", "fsd") else _CL_INT_REGS
+        return base in _CL_INT_REGS and rs2 in cl_regs
+
+    # jalr -> c.jr (rd==x0, rs2==x0) or c.jalr (rd==ra, rs2==x0)
+    if mn == "jalr":
+        return True   # standard jalr ra,rs1,0 and jr rs1 both compress
+
+    # add -> c.mv (rd!=x0, rs1==x0) or c.add (rd!=x0, rs1!=x0, rs2!=x0)
+    if mn == "add":
+        rd  = defs[0] if defs else None
+        return rd is not None and rd != "x0"
+
+    # addi covers c.addi, c.li, c.lui-adjacent, c.addi16sp, c.addi4spn, c.nop
+    # No register restriction beyond rd != x0 (c.nop is addi x0,x0,0)
+    if mn == "addi":
+        return True
+
+    # slli: rd (==rs1) can be any non-zero register; shamt must be 1-31
+    # (we can't check shamt here, so accept all)
+    if mn == "slli":
+        rd = defs[0] if defs else None
+        return rd is not None and rd != "x0"
+
+    # lui: rd must not be x0 or x2
+    if mn == "lui":
+        rd = defs[0] if defs else None
+        return rd is not None and rd not in ("x0", "x2")
+
+    # jal: c.jal (RV32 only, rd==ra) or c.j (rd==x0)
+    if mn == "jal":
+        return True
+
+    # ret / nop / mv: always compress
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Default pair-score: prefer pairs where both instructions can be compressed
+# ---------------------------------------------------------------------------
+
+def _compress_pair_score(a: "Instruction", b: "Instruction") -> float:
+    """
+    Default scoring function.
+
+    Returns 1.0 when both *a* and *b* are candidates for RVC 16-bit
+    encoding (so an optimiser can pack two compressed instructions into a
+    single 32-bit word), -1.0 when only *b* is not compressible (nudging
+    the scheduler to prefer a compressible candidate instead), and 0.0
+    otherwise.
+    """
+    a_ok = can_compress(a)
+    b_ok = can_compress(b)
+    if a_ok and b_ok:
+        return 1.0
+    if a_ok and not b_ok:
+        return -1.0
+    return 0.0
+
+
+def _rvc_describe_pair(a: "Instruction", b: "Instruction") -> str:
+    return "rvc" if (can_compress(a) and can_compress(b)) else ""
+
+_compress_pair_score._describe_pair = _rvc_describe_pair
+
+
+# ---------------------------------------------------------------------------
+# Pair scoring helpers
+# ---------------------------------------------------------------------------
+
+PairScoreFn = Callable[["Instruction", "Instruction"], float]
+
 
 @dataclass
 class PairStats:
@@ -82,13 +914,35 @@ class PairStats:
         Pair slots where this rule matched *neither* instruction combination
         in the slot (i.e. pair_score was 0 for the slot as a whole), but the
         rule *did* fire on the same two instructions when tested independently.
-        A high missed count suggests the scheduler couldn't align this rule's
-        matches to winnable slots, often due to dependency constraints.
+        In practice this means the slot was a failed pair (neither instruction
+        satisfied any rule as the winning instruction in that slot), yet this
+        rule still saw a match — indicating the scheduler placed a matching
+        pair into an already-lost slot.  A high missed count suggests the
+        scheduler couldn't align this rule's matches to winnable slots, often
+        due to dependency constraints.
 
     rvc_eligible : int
         Instructions in the final scheduled sequence satisfying can_compress().
         Reference ceiling: floor(rvc_eligible / 2) is the maximum achievable
         RVC pairs if every eligible instruction could be matched with another.
+
+    singleton_tally : {(mnemonic_a, mnemonic_b): int}
+        For every position i where instruction i ended up as a singleton and
+        i+1 exists, record (i.mnemonic, (i+1).mnemonic).  This is exactly
+        the (a, b) pair the scorer tested and rejected.  Sorted by count
+        descending, this reveals which opcode combinations are most often
+        adjacent but unpairable — the highest-count entries are the best
+        candidates for new pairing rules.
+
+        Note: the last instruction in the sequence (no successor) contributes
+        a (mnemonic, "") entry — i.e. it is counted as a singleton with an
+        empty partner mnemonic, since there is no adjacent instruction to
+        compare against.
+
+    unpaired_opcode_tally : {mnemonic: int}
+        Flat count of instructions that ended up unpaired, keyed by mnemonic.
+        Useful for "which opcodes most often miss pairing" without worrying
+        about the pairing partner.
 
     Size estimate
     -------------
@@ -110,9 +964,16 @@ class PairStats:
     baseline_bytes:   int
     saving_bytes:     int
     saving_pct:       float
+    singleton_tally:        dict   # {(mn_a, mn_b): count} — unpaired adjacent pairs
+    unpaired_opcode_tally:  dict   # {mnemonic: count} — flat singleton opcode counts
 
-    def summary_lines(self) -> list:
-        """Return comment lines suitable for appending to assembly output."""
+    def summary_lines(self, opcode_tally: bool = False) -> list:
+        """Return comment lines suitable for appending to assembly output.
+
+        opcode_tally: when True, append the singleton opcode-pair tally and
+            the flat unpaired-opcode tally sections.  Omitted by default to
+            keep normal output concise.
+        """
         lines = [
             f"# pairs:     {self.successful_pairs}/{self.possible_pairs}"
             f"  ({self.paired_instrs} of {self.total_instrs} instructions paired)",
@@ -140,6 +1001,33 @@ class PairStats:
             f"  (baseline {self.baseline_bytes},"
             f" saving {self.saving_bytes} = {self.saving_pct:.1f}%)"
         )
+        if opcode_tally:
+            lines.extend(self._opcode_tally_lines())
+        return lines
+
+    # Maximum rows shown in each tally section.  Keeps output readable even
+    # for large files with many distinct mnemonic combinations.
+    _TALLY_LIMIT = 20
+
+    def _opcode_tally_lines(self) -> list:
+        """Format the singleton opcode-pair tally and flat unpaired-opcode tally."""
+        lines = []
+
+        # --- paired opcode-pair tally ---
+        if self.singleton_tally:
+            lines.append(f"# unpaired opcode pairs (top {self._TALLY_LIMIT}):")
+            ranked = sorted(self.singleton_tally.items(), key=lambda kv: -kv[1])
+            for (mn_a, mn_b), cnt in ranked[:self._TALLY_LIMIT]:
+                b_label = mn_b if mn_b else "(end)"
+                lines.append(f"#   {cnt:5d}  {mn_a} | {b_label}")
+
+        # --- flat unpaired opcode tally ---
+        if self.unpaired_opcode_tally:
+            lines.append(f"# unpaired opcodes (top {self._TALLY_LIMIT}):")
+            ranked = sorted(self.unpaired_opcode_tally.items(), key=lambda kv: -kv[1])
+            for mn, cnt in ranked[:self._TALLY_LIMIT]:
+                lines.append(f"#   {cnt:5d}  {mn}")
+
         return lines
 
 
@@ -421,26 +1309,34 @@ def rename_destinations(
 
       a) **Destination convergence**: if instruction A's destination is
          renameable and instruction B has a register (def or use) that A could
-         be renamed to, try that rename.
+         be renamed to, try that rename.  This covers the sign-extend idiom:
+
+             slli  t0, a0, 24       # intermediate dead, dest could be t1
+             srai  t1, t0, 24       # t1 is the final value
+           → rename slli dest to t1:
+             slli  t1, a0, 24  # PAIR+
+             srai  t1, t1, 24
 
       b) **Temporary convergence**: if both instructions in the pair write
          dead destinations, try renaming both into the ABI temporary set
-         (``t0``–``t2`` = x5–x7, ``t3``–``t6`` = x28–x31).
-
-      c) **Joint rename of both A and B**.
+         (``t0``–``t2`` = x5–x7, ``t3``–``t6`` = x28–x31) so downstream
+         scoring functions that reward temporaries can fire.
 
     A register is *renameable* at position P when:
       - It is not architecturally reserved (x0, ra, sp, gp, tp).
       - It is not a vector register.
       - Its defined value is dead: either no later instruction in the block
         reads it before the next write, or it is only read by instructions
-        that are within the rename window.
+        that are within the rename window (the span from the def to its last
+        consumer).
 
     Safety invariant: no rename is ever applied unless ``count_pairs``
     strictly increases, so correctness is preserved by construction.
 
     Returns the (possibly modified) scheduled list.
     """
+    import copy
+
     scheduled = [copy.copy(i) for i in scheduled]
     n = len(scheduled)
     trials_remaining: list = [max_trials]   # mutable counter shared by helpers
@@ -458,6 +1354,8 @@ def rename_destinations(
     # live_table[pos]  – registers live at the start of position pos
     # free_table[pos]  – the prev_free state entering position pos in the
     #                    greedy-advance walk of `scheduled`.
+    #                    free_table[0] = False (no predecessor).
+    #                    free_table[i] = True  when position i-1 was a singleton.
     # ------------------------------------------------------------------
     def _build_live_table() -> list:
         t = [None] * (n + 1)
@@ -896,6 +1794,12 @@ class AssemblyScheduler:
                 # from one side of a label to the other, because external code
                 # may branch to the label and expect to find the original
                 # instruction sequence on both sides.
+                #
+                # We achieve this by inserting a synthetic zero-cost barrier
+                # instruction into the instruction list.  The barrier carries
+                # no register effects and is never emitted; it exists solely
+                # to force the dependency graph to draw edges from every
+                # predecessor to it and from it to every successor.
                 sentinel = Instruction(
                     index    = instr_index,
                     raw      = "",           # never emitted
@@ -904,7 +1808,12 @@ class AssemblyScheduler:
                 sentinel.is_barrier = True
                 instr_index += 1
                 instructions.append(sentinel)
+                # The label text goes into _items as a pass-through tied to
+                # the sentinel, so it is re-emitted immediately before the
+                # first instruction that follows the label.
                 self._items.append(("pass", line))
+                # Associate the sentinel with the label position so the
+                # emitter can reconstruct the correct interleaving.
                 self._items.append(("instr", sentinel))
                 continue
 
@@ -931,7 +1840,8 @@ class AssemblyScheduler:
         return self._liveness
 
     def emit(self, pair_score: PairScoreFn = _compress_pair_score,
-             rename: bool = True) -> str:
+             rename: bool = True,
+             opcode_tally: bool = False) -> str:
         """
         Schedule and emit the reordered assembly.
 
@@ -944,7 +1854,8 @@ class AssemblyScheduler:
             If True (default), attempt destination-register renaming after
             scheduling to improve the pair score further.
 
-        The returned string includes a trailing summary comment block.
+        The returned string includes a trailing comment line of the form:
+            # pairs: K/N  (K successful strict pairs out of N/2 possible)
         """
         if self.graph is None:
             self.analyse()
@@ -986,9 +1897,25 @@ class AssemblyScheduler:
                     pending.clear()
 
         # --- Annotate pairs, build stats, append summary ---
+        # All pairing logic operates on real_scheduled (no sentinels).
         total_instrs   = len(real_scheduled)
+        possible_pairs = total_instrs // 2
         successful     = 0
-        describe_fn    = getattr(pair_score, "_describe_pair", None)
+        rule_counts: dict = {}
+        describe_fn = getattr(pair_score, "_describe_pair", None)
+
+        # Greedy-advance walk: the pairing model that drives both the
+        # PAIR+ annotations and all statistics.
+        #
+        # Walk the scheduled sequence left-to-right.  At each position i:
+        #   - If pair_score(i, i+1) > 0: form a pair, advance i by 2.
+        #   - Otherwise: emit i as a singleton, advance i by 1.
+        #
+        # A singleton never prevents the following instruction from pairing.
+        # Rule classification follows first-match priority:
+        #   rule_counts [winner] += 1  — pair formed and winner rule fired
+        #   rule_shadow [rule]   += 1  — rule also matched but lost to winner
+        #   rule_missed [winner] += 1  — winner rule matched but pair_score=0
 
         pair_starts = []  # positions of the first instruction in each pair
         pair_rules  = {}  # position -> winning rule name
@@ -996,8 +1923,10 @@ class AssemblyScheduler:
         rule_counts: dict = {}
         rule_shadow: dict = {}
         rule_missed: dict = {}
+        singleton_tally:       dict = {}   # {(mn_a, mn_b): count}
+        unpaired_opcode_tally: dict = {}   # {mnemonic: count}
 
-        rule_list     = getattr(pair_score, "_rule_list", None)
+        rule_list    = getattr(pair_score, "_rule_list", None)
         liveness_snap = (pair_score._liveness_cell[0]
                          if hasattr(pair_score, "_liveness_cell") else {})
 
@@ -1034,12 +1963,25 @@ class AssemblyScheduler:
                         rule_counts[rule] = rule_counts.get(rule, 0) + 1
                         i += 2
                         continue
-            # No pair formed at position i: singleton
+
+            # No pair formed at position i: singleton.
+            # Record the (a, b) opcode combination that failed to pair, using
+            # the same adjacent instruction the scorer examined.  When i is the
+            # last instruction, record ("", "") as the partner mnemonic.
+            mn_a = real_scheduled[i].mnemonic
+            mn_b = real_scheduled[i + 1].mnemonic if i + 1 < total_instrs else ""
+            key = (mn_a, mn_b)
+            singleton_tally[key]       = singleton_tally.get(key, 0) + 1
+            unpaired_opcode_tally[mn_a] = unpaired_opcode_tally.get(mn_a, 0) + 1
             i += 1
 
+        # possible_pairs: maximum achievable under greedy-advance model.
         possible_pairs_greedy = total_instrs // 2
+
+        # RVC eligibility (over real instructions only, no sentinels).
         rvc_eligible = sum(1 for i in real_scheduled if can_compress(i))
 
+        # Size estimate.
         paired_instrs   = successful * 2
         unpaired_instrs = total_instrs - paired_instrs
         total_words     = successful + unpaired_instrs
@@ -1062,10 +2004,20 @@ class AssemblyScheduler:
             baseline_bytes   = baseline_bytes,
             saving_bytes     = saving_bytes,
             saving_pct       = saving_pct,
+            singleton_tally        = singleton_tally,
+            unpaired_opcode_tally  = unpaired_opcode_tally,
         )
 
         # Rebuild output lines with PAIR+ annotations.
+        # real_pos maps original index -> position in real_scheduled (no sentinels).
         pair_start_set = set(pair_starts)
+        # Build a lookup: real_scheduled position -> instr, for annotation
+        # pair_starts indices are into real_scheduled.
+        # The output must interleave pass-throughs anchored by `scheduled`
+        # (including sentinels) but emit real instruction text from real_scheduled.
+        # We walk `scheduled` in order; for each instruction we look up its
+        # position in real_scheduled (if it's a real instruction) to check
+        # whether it starts a pair.
         raw_lines: list = []
         for sp, instr in enumerate(scheduled):
             raw_lines.extend(before_pos.get(sp, []))
@@ -1079,10 +2031,633 @@ class AssemblyScheduler:
             else:
                 raw_lines.append(instr.raw)
         raw_lines.extend(pending)
-        for line in self.last_stats.summary_lines():
+        for line in self.last_stats.summary_lines(opcode_tally=opcode_tally):
             raw_lines.append(line)
         return "\n".join(raw_lines)
 
+
+
+# ---------------------------------------------------------------------------
+# Compact-32 pairing scorer
+# ---------------------------------------------------------------------------
+#
+# Models a hypothetical 32-bit encoding that fuses two instructions into one
+# word when they share enough information to be encoded compactly together.
+#
+# Architecture
+# ------------
+# A "pairing rule" is a plain function with the signature:
+#
+#     rule(a, b, liveness) -> bool
+#
+# where:
+#   a, b      -- the two Instruction objects (a at the even slot, b at odd)
+#   liveness  -- dict[instr_index -> frozenset[str]] from compute_liveness,
+#                used to test whether a value is dead after its last use
+#
+# Rules are collected in COMPACT32_RULES, a list of (name, rule_fn) pairs.
+# The scorer fires the first matching rule and returns 1.0; if no rule
+# matches it returns 0.0 (or -1.0 when the RVC fallback applies).
+#
+# Adding a new rule
+# -----------------
+# 1. Write a function  def _rule_<name>(a, b, liveness): -> bool
+# 2. Append it to COMPACT32_RULES below with a short descriptive name.
+# That's it.  The scorer, the CLI --list-rules output, and the PAIR+
+# annotation comment all pick it up automatically.
+#
+# Liveness note
+# -------------
+# liveness[i] is the set of registers whose *last use* is instruction i —
+# i.e. registers that are dead immediately after i executes.  A register r
+# is "dead after a" when r in liveness[a.index].  This is used to verify
+# that an intermediate result (e.g. the comparison flag written to t6) is
+# not needed by any instruction other than b.
+
+_CMP_MNEMONICS = frozenset({
+    "slti", "sltiu", "slli", "srli", "srai",
+    "andi", "ori", "xori",
+    "slt", "sltu",
+    "seqz", "snez", "sltz", "sgtz",
+})
+_BRANCH_ZERO = frozenset({"beqz", "bnez", "beq", "bne"})
+
+def _rule_cmp_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool:
+    """
+    Compare-with-immediate + conditional branch on x31 (t6).
+
+    Matches:
+        slti / sltiu / seqz / snez  x31, rs, imm
+        beqz / bnez                 x31, label      (x31 dead after)
+    """
+    if not a.defs or a.defs[0] != "x31":
+        return False
+    if a.mnemonic not in _CMP_MNEMONICS:
+        return False
+    if b.mnemonic not in _BRANCH_ZERO:
+        return False
+    if "x31" not in b.uses:
+        return False
+    if "x31" not in liveness.get(b.index, frozenset()):
+        return False
+    return True
+
+
+def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
+                              liveness: dict) -> bool:
+    """
+    Pair of word loads from adjacent memory locations with the same base.
+
+    Matches:
+        lw  rd1, N(base)
+        lw  rd2, N+4(base)     (or N-4)
+
+    A compact encoding can represent both loads with one base register, one
+    starting offset, and two destination registers.  The two data registers
+    must be different; the base register may be the same for both (and
+    usually is).
+
+    Offset adjacency is detected from the raw operand text when the offset
+    is a plain integer literal.  Symbol-relative offsets (e.g. %lo(sym)(gp))
+    are not matched.
+    """
+    if a.mnemonic != "lw" or b.mnemonic != "lw":
+        return False
+
+    if a.mem is None or b.mem is None:
+        return False
+
+    off_a, base_a = a.mem
+    off_b, base_b = b.mem
+
+    if base_a != base_b:
+        return False
+    if abs(off_a - off_b) != 4:
+        return False
+
+    # Destination registers must be distinct
+    rd_a = a.defs[0] if a.defs else None
+    rd_b = b.defs[0] if b.defs else None
+    if rd_a is None or rd_b is None or rd_a == rd_b:
+        return False
+
+    return True
+
+
+def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
+                               liveness: dict) -> bool:
+    """
+    Pair of word stores to adjacent memory locations with the same base.
+
+    Matches:
+        sw  rs1, N(base)
+        sw  rs2, N+4(base)     (or N-4)
+
+    Symmetric to _rule_adjacent_load_pair.  The two source data registers
+    must be different.
+    """
+    if a.mnemonic != "sw" or b.mnemonic != "sw":
+        return False
+
+    if a.mem is None or b.mem is None:
+        return False
+
+    off_a, base_a = a.mem
+    off_b, base_b = b.mem
+
+    if base_a != base_b:
+        return False
+    if abs(off_a - off_b) != 4:
+        return False
+
+    # Source data registers (first operand for sw) must be distinct
+    rs_a = a.uses[0] if a.uses else None
+    rs_b = b.uses[0] if b.uses else None
+    if rs_a is None or rs_b is None or rs_a == rs_b:
+        return False
+
+    return True
+
+
+def _rule_pre_increment(a: "Instruction", b: "Instruction",
+                        liveness: dict) -> bool:
+    """
+    Address arithmetic followed by a memory op using that result as base (pre-increment).
+
+    Matches:
+        add / addi / sub / sh1add / sh2add / sh3add   rd, ...
+        lw / sw / lh / sh / lb / sb / lhu / lbu       ..., N(rd)
+
+    The arithmetic result register must be the base register of the memory
+    operation.  For stores, the data register must differ from rd.
+    """
+    _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+    _MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
+
+    if a.mnemonic not in _ADDR_ARITH or b.mnemonic not in _MEM_OPS:
+        return False
+    if not a.defs:
+        return False
+    rd = a.defs[0]
+    if rd not in b.uses:
+        return False
+    # For stores: data reg != rd (would be unrepresentable in a compact encoding)
+    if b.mnemonic in ("sw", "sh", "sb"):
+        if b.uses and b.uses[0] == rd:
+            return False
+    return True
+
+
+def _rule_post_increment(a: "Instruction", b: "Instruction",
+                          liveness: dict) -> bool:
+    """
+    Memory op followed by address arithmetic on the same base (post-increment).
+
+    Matches:
+        lw / sw / lh / sh / lb / sb / lhu / lbu       ..., N(base)
+        add / addi / sub / sh1add / sh2add / sh3add   rd, base, ...
+
+    The arithmetic's first source must be the memory op's base register.
+    For loads, the arithmetic destination must not alias the load destination.
+    """
+    _MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
+    _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+
+    if a.mnemonic not in _MEM_OPS or b.mnemonic not in _ADDR_ARITH:
+        return False
+    base = a.uses[-1] if a.uses else None
+    if base is None:
+        return False
+    if not b.uses or b.uses[0] != base:
+        return False
+    # For loads: arithmetic result must not alias the load destination
+    if a.mnemonic in ("lw", "lh", "lb", "lhu", "lbu"):
+        load_rd  = a.defs[0] if a.defs else None
+        arith_rd = b.defs[0] if b.defs else None
+        if load_rd is not None and load_rd == arith_rd:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Dual-arithmetic rules
+# ---------------------------------------------------------------------------
+#
+# Both rules model a 32-bit encoding that packs two arithmetic operations
+# into one word.  The encoding budget is tight, so each instruction must
+# satisfy three constraints simultaneously:
+#
+#   1. MNEMONIC — must be one of the permitted arithmetic operations:
+#        addi addiw andi add addw sub subw and bic or xor
+#      (addi4spn is treated as addi with sp as rs1 and a scaled immediate;
+#       bic is accepted as a synonym for andn from the Zbb extension)
+#
+#   2. RSD (register-source-destination) — the first source register and
+#      the destination register must be the SAME register, encoded once.
+#      For immediate-form ops (addi, andi, …): rd == rs1.
+#      For register-form ops (add, sub, and, or, xor, bic/andn):  rd == rs1.
+#      addi4spn is exempt: its implicit rs1 is sp (x2) and rd may differ.
+#
+#   3. REGISTER RANGE — all register operands (rd/rs1 and any rs2) must be
+#      in x0..x15, encodable in 4 bits.
+#
+#   4. IMMEDIATE WIDTH — for immediate-form ops, the immediate must fit in
+#      5 signed bits (−16..+15).  For addi4spn specifically the immediate
+#      is a byte offset that is a non-zero multiple of 4; the 5-bit unsigned
+#      field encodes imm>>2, so the byte offset must be in 4..124 (step 4).
+#      Register-form ops (add, sub, and, or, xor, bic) have no immediate.
+#
+# The two variants differ only in how the pair is linked:
+#
+#   dual_arith        — the two instructions are independent; their only
+#                       relationship is that both satisfy constraints 1-4.
+#
+#   dual_arith_chain  — instruction A's destination is t6 (x31), and
+#                       instruction B's first source (rs1) is also t6.
+#                       t6 must be dead after B (its value does not escape
+#                       the pair).  This models a fused "compute-then-use"
+#                       where the intermediate value in t6 is implicit in
+#                       the encoding and costs no register file allocation.
+#                       Note: t6 (x31) is outside x0..x15, so the normal
+#                       register-range constraint is deliberately relaxed
+#                       for the linked register only.
+
+# Mnemonics accepted by both dual-arith rules.
+_DUAL_ARITH_MN = frozenset({
+    "addi", "addiw", "andi",           # immediate arithmetic
+    "add",  "addw",                     # register addition
+    "sub",  "subw",                     # register subtraction
+    "and",  "bic",  "andn",             # bitwise AND / AND-NOT (bic == andn)
+    "or",   "xor",                      # bitwise OR / XOR
+})
+
+# Registers encodable in 4 bits: x0..x15
+_REG4 = frozenset(f"x{n}" for n in range(16))
+
+# t6 is the implicit chain register for dual_arith_chain
+_CHAIN_REG = "x31"
+
+
+def _parse_immediate(instr: "Instruction") -> "int | None":
+    """Return the cached immediate parsed at parse_line time, or None."""
+    return instr.imm
+
+
+def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
+    """
+    Return True if *instr* satisfies all constraints for the dual-arith
+    encoding:
+      - Mnemonic is in _DUAL_ARITH_MN
+      - RSD: rd == rs1  (or addi4spn special case)
+      - All register operands in x0..x15  (relaxed for the chain register
+        when allow_chain_reg is True)
+      - Immediate fits in 5 signed bits if applicable
+
+    allow_chain_reg=True relaxes the register-range check for rd/rs1 when
+    the register is _CHAIN_REG (x31=t6).  Used for the A instruction in
+    dual_arith_chain (whose destination is t6).
+    """
+    mn = instr.mnemonic
+
+    if mn not in _DUAL_ARITH_MN:
+        return False
+
+    rd  = instr.defs[0] if instr.defs else None
+    rs1 = instr.uses[0] if instr.uses else None
+
+    if rd is None or rs1 is None:
+        return False
+
+    # ── addi4spn special case ──────────────────────────────────────────────
+    # addi rd, sp, imm where imm is a non-zero multiple of 4, 4..124.
+    # The 5-bit unsigned field encodes imm >> 2 (values 1..31).
+    # rs1 is sp (x2) — rs1 != rd is allowed for this form only.
+    if mn == "addi" and rs1 == "x2" and rd != "x2":
+        reg_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
+        if not reg_ok:
+            return False
+        imm = _parse_immediate(instr)
+        if imm is None:
+            return False
+        # Must be a positive multiple of 4 in 4..124
+        if imm <= 0 or imm % 4 != 0 or imm > 124:
+            return False
+        return True
+
+    # ── Standard RSD constraint: rd == rs1 ────────────────────────────────
+    if rd != rs1:
+        return False
+
+    # ── Register range ────────────────────────────────────────────────────
+    rsd = rd   # rd == rs1
+    rsd_ok = (rsd in _REG4) or (allow_chain_reg and rsd == _CHAIN_REG)
+    if not rsd_ok:
+        return False
+
+    # rs2 (second source for register-form ops) must always be in x0..x15
+    if len(instr.uses) >= 2:
+        rs2 = instr.uses[1]
+        if rs2 not in _REG4:
+            return False
+
+    # ── Immediate range: 5 signed bits → −16..+15 ─────────────────────────
+    imm_forms = frozenset({"addi", "addiw", "andi"})
+    if mn in imm_forms:
+        imm = _parse_immediate(instr)
+        if imm is None:
+            return False
+        if imm < -16 or imm > 15:
+            return False
+
+    return True
+
+
+def _rule_dual_arith(a: "Instruction", b: "Instruction",
+                     liveness: dict) -> bool:
+    """
+    Two independent arithmetic operations, each satisfying the dual-arith
+    encoding constraints (RSD form, registers in x0..x15, 5-bit immediate).
+    """
+    return a.dual_arith_ok and b.dual_arith_ok
+
+
+def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
+                            liveness: dict) -> bool:
+    """
+    Two arithmetic operations linked through t6 (x31) as an implicit
+    intermediate register.
+
+    Instruction A writes its result to t6 (x31).
+    Instruction B reads t6 as its first source (rs1).
+    t6 must be dead after B — its value does not escape the pair.
+
+    This models a fused "compute-then-use" sequence where the intermediate
+    value in t6 is implicit in the compact encoding and costs no register
+    file bits:
+
+        addi  x31, a0, 5     # A: t6 = a0 + 5
+        and   a1,  x31, a2   # B: a1 = t6 & a2;  t6 dead after
+
+    Constraints on A:
+      - Mnemonic in _DUAL_ARITH_MN
+      - RSD: rd == rs1  (so A computes  t6 = t6 op imm/rs2)
+      - rd == t6 (x31)  — the chain register
+      - rs1 (== rd) == t6 is outside x0..x15 but is explicitly allowed
+      - rs2 (if present) must be in x0..x15
+
+    Constraints on B:
+      - Mnemonic in _DUAL_ARITH_MN
+      - RSD: rd == rs1 == t6  i.e. first source is t6
+      - rd (the output of B) must be in x0..x15
+      - rs2 (if present) must be in x0..x15
+      - 5-bit immediate constraint applies as normal
+      - t6 must be dead after B  (liveness check)
+    """
+    # ── Instruction A: must write t6 as its RSD register ──────────────────
+    if not a.dual_arith_chain_ok:
+        return False
+
+    # ── Instruction B: must read t6 as rs1 ────────────────────────────────
+    if b.mnemonic not in _DUAL_ARITH_MN:
+        return False
+    rs1_b = b.uses[0] if b.uses else None
+    if rs1_b != _CHAIN_REG:
+        return False
+
+    # B's destination (rd) must be in x0..x15 (the result must be addressable)
+    rd_b = b.defs[0] if b.defs else None
+    if rd_b is None or rd_b not in _REG4:
+        return False
+
+    # B's rs2 (if present) must be in x0..x15
+    if len(b.uses) >= 2 and b.uses[1] not in _REG4:
+        return False
+
+    # B's immediate must fit in 5 signed bits
+    if b.mnemonic in frozenset({"addi", "addiw", "andi"}):
+        imm = _parse_immediate(b)
+        if imm is None or imm < -16 or imm > 15:
+            return False
+
+    # ── t6 must be dead after B ────────────────────────────────────────────
+    if _CHAIN_REG not in liveness.get(b.index, frozenset()):
+        return False
+
+    return True
+
+
+def _rule_arith_branch(a: "Instruction", b: "Instruction",
+                       liveness: dict) -> bool:
+    """
+    Arithmetic operation (dual-arith subset) followed by a conditional
+    branch on whether the result is zero.
+
+    Matches:
+        <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
+        beqz / bnez      rd, label          (same rd)
+
+    The arithmetic instruction must satisfy all dual-arith encoding
+    constraints: mnemonic in _DUAL_ARITH_MN, RSD form (rd == rs1),
+    all register operands in x0..x15, and 5-bit signed immediate for
+    immediate forms.
+
+    The branch tests whether rd is zero; rd must be the same register as
+    the arithmetic destination.  Unlike cmp_branch, rd is explicitly
+    encoded in the compact word (it appears in both instructions), so
+    there is no liveness requirement — rd may be read after the branch.
+
+    Canonical examples:
+        addi  x8, x8, -1      # decrement loop counter
+        bnez  x8, .loop       # branch while counter != 0
+
+        and   x10, x10, x11   # mask result
+        beqz  x10, .done      # branch if masked value is zero
+    """
+    if not a.dual_arith_ok:
+        return False
+
+    rd = a.defs[0] if a.defs else None
+    if rd is None:
+        return False
+
+    # B must be a zero-test branch
+    if b.mnemonic not in ("beqz", "bnez"):
+        return False
+
+    # B must test the same register that A produced
+    # beqz/bnez are pseudo-instructions; after parsing, b.uses[0] is the
+    # tested register (they expand to beq/bne rs,x0,label).
+    tested = b.uses[0] if b.uses else None
+    if tested != rd:
+        return False
+
+    return True
+
+
+# Registry: (display_name, rule_function)
+# Rules are tested in order; the first match wins.
+COMPACT32_RULES: list = [
+    ("cmp_branch",          _rule_cmp_branch),
+    ("adjacent_load_pair",  _rule_adjacent_load_pair),
+    ("adjacent_store_pair", _rule_adjacent_store_pair),
+    ("pre_increment",       _rule_pre_increment),
+    ("post_increment",      _rule_post_increment),
+    ("dual_arith",          _rule_dual_arith),
+    ("dual_arith_chain",    _rule_dual_arith_chain),
+    ("arith_branch",        _rule_arith_branch),
+]
+
+
+def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
+    """
+    Return a pair-scoring function for the compact-32 encoding experiment.
+
+    The returned function:
+      - Returns 1.0 if any rule in COMPACT32_RULES matches the pair.
+      - Returns 0.0 otherwise.
+
+    *liveness* is the dict returned by compute_liveness(), needed by rules
+    that test whether an intermediate register is dead after the pair.
+
+    The scorer holds its liveness reference in a mutable cell so that
+    ``AssemblyScheduler.emit()`` can refresh it after register renaming
+    (renaming changes which registers are dead at each instruction, so the
+    liveness map must be recomputed over the renamed sequence before the
+    final pair-count and annotation pass).
+
+    Usage::
+
+        sched = AssemblyScheduler(src)
+        sched.analyse()
+        scorer = make_compact32_scorer(sched.liveness)
+        output = sched.emit(pair_score=scorer)
+    """
+    # Mutable cell: [current_liveness_dict].  emit() may write a fresh dict
+    # into cell[0] after renaming; the closure always reads cell[0].
+    cell: list = [liveness]
+
+    # Branches (instructions that transfer control) may only appear in the
+    # second slot of a compact32 pair.  Enforced here so no individual rule
+    # needs to repeat the check.
+    _BRANCH_MN = frozenset({
+        "beq", "bne", "blt", "bge", "bltu", "bgeu",
+        "beqz", "bnez",                        # pseudo-instructions
+        "jal", "jalr",                         # unconditional jumps
+    })
+
+    # Per-rule A-side guards: a cheap boolean per instruction that must be True
+    # before calling the full (more expensive) rule function.  This avoids
+    # executing any rule body when instruction A clearly can't satisfy it.
+    _LOAD_MN  = frozenset({"lw", "lh", "lb", "lhu", "lbu"})
+    _STORE_MN = frozenset({"sw", "sh", "sb"})
+    _ARITH_ADDR = frozenset({"add", "addi", "sub",
+                              "sh1add", "sh2add", "sh3add"})
+    _MEM_OP_MN  = _LOAD_MN | _STORE_MN
+
+    def _a_eligible(a: "Instruction") -> "frozenset[str]":
+        """Return the set of rule names for which instruction A could match."""
+        eligible = set()
+        if a.defs and a.defs[0] == "x31":
+            eligible.add("cmp_branch")
+            if a.dual_arith_chain_ok:
+                eligible.add("dual_arith_chain")
+        if a.mnemonic == "lw":
+            eligible.add("adjacent_load_pair")
+        if a.mnemonic == "sw":
+            eligible.add("adjacent_store_pair")
+        if a.mnemonic in _ARITH_ADDR:
+            eligible.add("pre_increment")
+        if a.mnemonic in _MEM_OP_MN:
+            eligible.add("post_increment")
+        if a.dual_arith_ok:
+            eligible.add("dual_arith")
+            eligible.add("arith_branch")
+        return frozenset(eligible)
+
+    # Pre-build the eligible set for each instruction once, then cache it.
+    # (The cache is a simple dict keyed by instruction index.)
+    _elig_cache: dict = {}
+
+    def _get_eligible(a: "Instruction") -> "frozenset[str]":
+        idx = a.index
+        if idx not in _elig_cache:
+            _elig_cache[idx] = _a_eligible(a)
+        return _elig_cache[idx]
+
+    def _score(a: "Instruction", b: "Instruction") -> float:
+        if a.mnemonic in _BRANCH_MN:
+            return 0.0   # branches only allowed in the second slot
+        elig = _get_eligible(a)
+        if not elig:
+            return 0.0
+        for _name, rule in COMPACT32_RULES:
+            if _name in elig and rule(a, b, cell[0]):
+                return 1.0
+        return 0.0
+
+    def _describe(a: "Instruction", b: "Instruction") -> str:
+        """Return the name of the first matching rule, or empty string."""
+        if a.mnemonic in _BRANCH_MN:
+            return ""
+        elig = _get_eligible(a)
+        for name, rule in COMPACT32_RULES:
+            if name in elig and rule(a, b, cell[0]):
+                return name
+        return ""
+
+    # Attach the cell so emit() can update it without rebuilding the scorer.
+    _score._liveness_cell = cell
+    # Attach the describe hook so emit() can collect per-rule counts.
+    _score._describe_pair = _describe
+    # Attach the rule list so emit() can compute per-rule candidate counts.
+    _score._rule_list = COMPACT32_RULES
+    return _score
+
+
+def _describe_pair(a: "Instruction", b: "Instruction",
+                   liveness: dict) -> str:
+    """Return the name of the first matching compact32 rule, or ''."""
+    for name, rule in COMPACT32_RULES:
+        if rule(a, b, liveness):
+            return name
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Scorer registry — maps CLI name -> factory or direct function
+# ---------------------------------------------------------------------------
+#
+# Each entry is (name, description, factory_or_fn) where factory_or_fn is
+# either a plain PairScoreFn (takes a, b) or a callable that takes a
+# post-analysis AssemblyScheduler and returns a PairScoreFn.  The CLI
+# detects which kind it is by checking for the 'needs_sched' attribute.
+
+def _scorer_factory(needs_sched=False):
+    """Decorator that marks a factory as needing the scheduler object."""
+    def decorator(fn):
+        fn.needs_sched = needs_sched
+        return fn
+    return decorator
+
+
+@_scorer_factory(needs_sched=False)
+def _make_rvc(sched=None):
+    return _compress_pair_score
+
+
+@_scorer_factory(needs_sched=True)
+def _make_compact32(sched):
+    return make_compact32_scorer(sched.liveness)
+
+
+SCORERS: dict = {
+    "rvc":       (_make_rvc,
+                  "Pair instructions that both have a 16-bit RVC encoding "
+                  "(default)"),
+    "compact32": (_make_compact32,
+                  "Pair instructions that can be fused into a compact 32-bit "
+                  "encoding (cmp+branch, adjacent loads/stores, …)"),
+}
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1103,6 +2678,10 @@ def main():
                          f"Choices: {list(SCORERS)}. Default: rvc")
     ap.add_argument("--list-rules", action="store_true",
                     help="List available scorers and compact32 rules, then exit")
+    ap.add_argument("--opcode-tally", action="store_true",
+                    help="Append a ranked tally of unpaired opcode combinations "
+                         "to the output and stderr report. Use this to identify "
+                         "the best candidates for new pairing rules.")
     args = ap.parse_args()
 
     if args.list_rules:
@@ -1137,10 +2716,10 @@ def main():
                   f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
 
     factory, _ = SCORERS[args.scorer]
-    pair_score = factory(sched) if getattr(factory, "needs_sched", False) \
-                  else factory()
+    pair_score = factory(sched) if getattr(factory, "needs_sched", False)                  else factory()
 
-    output = sched.emit(pair_score=pair_score, rename=args.rename)
+    output = sched.emit(pair_score=pair_score, rename=args.rename,
+                        opcode_tally=args.opcode_tally)
     print(output)
     if sched.last_stats is not None:
         st = sched.last_stats
@@ -1170,6 +2749,9 @@ def main():
         print(f"# size estimate: {st.estimated_bytes} bytes"
               f"  (baseline {st.baseline_bytes},"
               f" saving {st.saving_bytes} = {st.saving_pct:.1f}%)", file=sys.stderr)
+        if args.opcode_tally:
+            for line in st._opcode_tally_lines():
+                print(line, file=sys.stderr)
 
 
 if __name__ == "__main__":
