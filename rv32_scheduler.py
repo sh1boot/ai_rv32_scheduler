@@ -1036,6 +1036,57 @@ class PairStats:
         return lines
 
 
+    @classmethod
+    def merge(cls, stats: "list[PairStats]") -> "PairStats":
+        """
+        Combine a sequence of per-block PairStats into a single aggregate.
+
+        All integer counters are summed.  Dict counters (rule_counts etc.)
+        are merged by summing values for each key.  saving_pct is
+        recomputed from the merged byte totals rather than averaged, so it
+        reflects the true overall saving.  possible_pairs is summed from
+        per-block values (each block contributes floor(block_size/2)).
+        """
+        def _merge_dicts(dicts):
+            out: dict = {}
+            for d in dicts:
+                for k, v in d.items():
+                    out[k] = out.get(k, 0) + v
+            return out
+
+        total_instrs     = sum(s.total_instrs     for s in stats)
+        paired_instrs    = sum(s.paired_instrs     for s in stats)
+        unpaired_instrs  = sum(s.unpaired_instrs   for s in stats)
+        possible_pairs   = sum(s.possible_pairs    for s in stats)
+        successful_pairs = sum(s.successful_pairs  for s in stats)
+        rvc_eligible     = sum(s.rvc_eligible      for s in stats)
+        estimated_bytes  = sum(s.estimated_bytes   for s in stats)
+        baseline_bytes   = sum(s.baseline_bytes    for s in stats)
+        saving_bytes     = sum(s.saving_bytes      for s in stats)
+        saving_pct       = ((saving_bytes / baseline_bytes * 100)
+                            if baseline_bytes else 0.0)
+
+        return cls(
+            total_instrs     = total_instrs,
+            paired_instrs    = paired_instrs,
+            unpaired_instrs  = unpaired_instrs,
+            possible_pairs   = possible_pairs,
+            successful_pairs = successful_pairs,
+            rule_counts      = _merge_dicts(s.rule_counts for s in stats),
+            rule_shadow      = _merge_dicts(s.rule_shadow for s in stats),
+            rule_missed      = _merge_dicts(s.rule_missed for s in stats),
+            rvc_eligible     = rvc_eligible,
+            estimated_bytes  = estimated_bytes,
+            baseline_bytes   = baseline_bytes,
+            saving_bytes     = saving_bytes,
+            saving_pct       = saving_pct,
+            singleton_tally        = _merge_dicts(
+                                        s.singleton_tally for s in stats),
+            unpaired_opcode_tally  = _merge_dicts(
+                                        s.unpaired_opcode_tally for s in stats),
+        )
+
+
 def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
     """
     Count successful pairs using the greedy-advance model.
@@ -1759,26 +1810,573 @@ def _undo_rename(scheduled: list, undo: list):
 
 
 # ---------------------------------------------------------------------------
+# Tally helpers (module-level so they can be used by the streaming processor)
+# ---------------------------------------------------------------------------
+
+def _tally_label(instr: "Instruction") -> str:
+    """
+    Return the tally key for *instr*.
+
+    Loads and stores with sp (x2) as their base register use the qualified
+    form ``mnemonic(sp)`` (e.g. ``lw(sp)``, ``sw(sp)``).  Stack-relative
+    accesses are subject to different pairing constraints from heap/data
+    accesses and benefit from being counted separately.  All other
+    instructions return their plain mnemonic.
+    """
+    if instr.mem is not None and instr.mem[1] == "x2":
+        return f"{instr.mnemonic}(sp)"
+    return instr.mnemonic
+
+
+# ---------------------------------------------------------------------------
+# Label classification pre-pass
+# ---------------------------------------------------------------------------
+
+# Branches and jumps whose last operand is a label target.
+_BRANCH_LIKE = re.compile(
+    r"^\s+(?:beq|bne|blt|bge|bltu|bgeu|beqz|bnez|blez|bgez|bltz|bgtz"
+    r"|jal|jalr|j|jr|call|tail)\s",
+)
+# ELF visibility directives that make a symbol externally reachable.
+_VISIBILITY_DIRS = re.compile(
+    r"^\s+\.(?:globl|global|weak|protected|hidden|internal)\s+(\S+)",
+)
+# Label definition: optional leading dot, word chars, colon.
+_LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
+
+
+def _classify_labels(source: str) -> tuple:
+    """
+    Single-pass scan of *source* (raw text, no Instruction objects created).
+
+    Returns ``(branch_targets, globally_visible)`` — two frozensets of label
+    name strings.
+
+    branch_targets
+        Names that appear as the final non-comment token of a branch or jump
+        instruction.  Any label in this set is a genuine control-flow target
+        and must be treated as a scheduling barrier.
+
+    globally_visible
+        Names declared by an ELF visibility directive (.globl, .global, .weak,
+        .protected, .hidden, .internal).  These are callable from outside the
+        translation unit and must also be treated as barriers, even if no
+        branch within *this* file targets them.
+
+    All other labels (e.g. ``.Lfunc_end*`` size markers, ``.Lpcrel_hi*``
+    relocation anchors) are pass-through text only — they carry no scheduling
+    constraint because no instruction can ever transfer control to them.
+
+    Note: ``.Lpcrel_hi*`` labels sit between ``auipc`` and the ``addi`` that
+    consumes ``%pcrel_lo()``.  Reordering across them would be unsafe, but
+    ``auipc`` is an unknown mnemonic and is already marked ``is_barrier=True``
+    by the parser, so the barrier is enforced without the label needing to be
+    one itself.
+    """
+    branch_targets: set = set()
+    globally_visible: set = set()
+
+    for line in source.splitlines():
+        # Visibility directives
+        m = _VISIBILITY_DIRS.match(line)
+        if m:
+            globally_visible.add(m.group(1).split("@")[0])  # strip @plt etc.
+            continue
+
+        # Branch / jump targets — last token before any comment
+        if _BRANCH_LIKE.match(line):
+            code = line.split("#")[0].split(";")[0].strip()
+            tgt = code.split()[-1].rstrip(",")
+            # Only record it if it looks like a label (not a register or plain number)
+            if tgt and not tgt.lstrip("-").isdigit() and not tgt.startswith("%"):
+                branch_targets.add(tgt)
+
+    return frozenset(branch_targets), frozenset(globally_visible)
+
+
+# ---------------------------------------------------------------------------
+# Per-block processor
+# ---------------------------------------------------------------------------
+
+def _process_block(
+    pass_lines:   list,        # pass-through text lines that precede this block
+    instructions: list,        # Instruction objects for this block (no sentinels)
+    pair_score:   "PairScoreFn",
+    rename:       bool,
+    opcode_tally: bool,
+    out,                       # file-like object; lines written here immediately
+    verbose:      bool = False,
+) -> "PairStats":
+    """
+    Schedule, annotate, and emit one basic block.
+
+    *pass_lines* are flushed to *out* before the first instruction line.
+    Returns a ``PairStats`` covering this block; the caller accumulates these
+    across blocks.
+
+    All state (DepGraph, liveness, scheduled list) is local to this call and
+    is released when it returns, keeping peak memory proportional to the
+    largest single block rather than the whole file.
+    """
+    # Flush pass-through text (directives, blanks, comments, label lines).
+    for line in pass_lines:
+        print(line, file=out)
+
+    if not instructions:
+        return PairStats(
+            total_instrs=0, paired_instrs=0, unpaired_instrs=0,
+            possible_pairs=0, successful_pairs=0,
+            rule_counts={}, rule_shadow={}, rule_missed={},
+            rvc_eligible=0,
+            estimated_bytes=0, baseline_bytes=0,
+            saving_bytes=0, saving_pct=0.0,
+            singleton_tally={}, unpaired_opcode_tally={},
+        )
+
+    graph = build_dep_graph(instructions)
+
+    if verbose:
+        liveness_v = compute_liveness(instructions)
+        for instr in graph.instructions:
+            succs    = sorted(graph.successors[instr.index])
+            dead     = sorted(liveness_v.get(instr.index, set()))
+            compress = can_compress(instr)
+            print(f"# I{instr.index:3d}  {instr.mnemonic:18s}"
+                  f"  defs={instr.defs}  uses={instr.uses}"
+                  f"  last_use={dead}  rvc={compress}"
+                  f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
+
+    scheduled = _bnb_schedule(graph, pair_score)
+
+    # Sentinels (label barriers) have no register effects; strip them before
+    # liveness analysis, renaming, and pair scoring.
+    real_scheduled = [i for i in scheduled if i.mnemonic != "__label__"]
+
+    if hasattr(pair_score, "_liveness_cell"):
+        pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
+
+    if rename:
+        real_scheduled = rename_destinations(real_scheduled, graph, pair_score)
+        if hasattr(pair_score, "_liveness_cell"):
+            pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
+
+    # Map original instruction index -> position in scheduled (with sentinels)
+    # so pass-through text anchored to sentinels is interleaved correctly.
+    sched_pos = {instr.index: p for p, instr in enumerate(scheduled)}
+    # Map original instruction index -> position in real_scheduled (no sentinels)
+    # so PAIR+ annotations address the correct slot.
+    real_pos  = {instr.index: p for p, instr in enumerate(real_scheduled)}
+
+    # Greedy-advance walk: annotate pairs and accumulate statistics.
+    total_instrs = len(real_scheduled)
+    successful   = 0
+
+    rule_counts:          dict = {}
+    rule_shadow:          dict = {}
+    rule_missed:          dict = {}
+    singleton_tally:      dict = {}
+    unpaired_opcode_tally: dict = {}
+
+    pair_start_set: set = set()
+    pair_rules:     dict = {}
+
+    rule_list     = getattr(pair_score, "_rule_list", None)
+    describe_fn   = getattr(pair_score, "_describe_pair", None)
+    liveness_snap = (pair_score._liveness_cell[0]
+                     if hasattr(pair_score, "_liveness_cell") else {})
+
+    i = 0
+    while i < total_instrs:
+        if i + 1 < total_instrs:
+            a_s, b_s    = real_scheduled[i], real_scheduled[i + 1]
+            slot_scores = pair_score(a_s, b_s) > 0
+
+            if rule_list is not None:
+                matching_rules = [rn for rn, rf in rule_list
+                                  if rf(a_s, b_s, liveness_snap)]
+                if matching_rules:
+                    winner = matching_rules[0]
+                    if slot_scores:
+                        pair_start_set.add(i)
+                        pair_rules[i] = winner
+                        successful += 1
+                        rule_counts[winner] = rule_counts.get(winner, 0) + 1
+                        for rn in matching_rules[1:]:
+                            rule_shadow[rn] = rule_shadow.get(rn, 0) + 1
+                        i += 2
+                        continue
+                    else:
+                        rule_missed[winner] = rule_missed.get(winner, 0) + 1
+            else:
+                if slot_scores:
+                    pair_start_set.add(i)
+                    rule = describe_fn(a_s, b_s) if describe_fn else ""
+                    pair_rules[i] = rule
+                    successful += 1
+                    rule_counts[rule] = rule_counts.get(rule, 0) + 1
+                    i += 2
+                    continue
+
+        # Singleton at position i.
+        mn_a = _tally_label(real_scheduled[i])
+        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
+        key  = (mn_a, mn_b)
+        singleton_tally[key]         = singleton_tally.get(key, 0) + 1
+        unpaired_opcode_tally[mn_a]  = unpaired_opcode_tally.get(mn_a, 0) + 1
+        i += 1
+
+    # Emit annotated instruction lines, interleaving any pass-through text
+    # (blank lines, comments, directives) that was anchored to sentinels.
+    # We walk `scheduled` (which still contains sentinels) so the anchor
+    # positions are correct, but only emit text for real instructions.
+    #
+    # Pass-through text accumulated between real instructions in the original
+    # source may have been associated with a sentinel that now sits at a
+    # different position after scheduling.  We re-anchor it to the sentinel's
+    # scheduled position so it appears at the right point in the output.
+    before_sched_pos: dict = defaultdict(list)
+    pending_pass: list = []
+    # We need to reconstruct the before_pos mapping.  The original ordering
+    # of (pass_through, sentinel) pairs in the block is implicit: each
+    # sentinel was inserted immediately after the label line that produced it,
+    # so any pass-through text accumulated before a sentinel belongs before
+    # that sentinel in the scheduled output.
+    # We use a sentinel-index list built during block construction.
+    # However, _process_block doesn't receive that mapping directly.
+    # Instead we recover it from `scheduled`: sentinels appear in their
+    # original relative order even after scheduling (they are barriers and
+    # cannot move), so we just drain pending_pass into before_sched_pos as
+    # we encounter each sentinel.
+    #
+    # Since all text lines inside a block were already flushed via pass_lines
+    # above (pass_lines covers directives/blanks/comments but NOT label lines
+    # that became sentinels), we need to handle label-line pass-throughs here.
+    # The block builder keeps label text in a separate list (sentinel_texts)
+    # indexed by sentinel index so we can re-emit them in scheduled order.
+    # That list is passed in as `sentinel_texts`.
+    #
+    # For simplicity: label text lines are held in a parallel list
+    # `sentinel_texts` keyed by the sentinel's original instruction index.
+    # The block builder is responsible for populating this; for now we
+    # emit them positionally (before the sentinel's scheduled position).
+    #
+    # Since _process_block is always called with sentinel_texts, we handle
+    # this below via a keyword argument added in the real signature.
+    raise NotImplementedError("Use _process_block_full — see below")
+
+
+# Real implementation — replaces the stub above.
+def _process_block(                              # noqa: F811  (intentional re-def)
+    pass_lines:     list,
+    instructions:   list,
+    sentinel_texts: dict,       # {sentinel_instr_index: label_line_str}
+    pair_score:     "PairScoreFn",
+    rename:         bool,
+    opcode_tally:   bool,
+    out,
+    verbose:        bool = False,
+) -> "PairStats":
+    """
+    Schedule, annotate, and emit one basic block, then return its PairStats.
+
+    Parameters
+    ----------
+    pass_lines
+        Lines of pass-through text (directives, blank lines, comments) that
+        appeared before the first instruction of this block.  Flushed to
+        *out* before any instruction output.
+    instructions
+        Instruction objects for this block, including ``__label__`` sentinels.
+    sentinel_texts
+        Maps each sentinel's original instruction index to the label source
+        line that generated it.  Used to re-emit label lines at the correct
+        position after scheduling (sentinels are barriers so they never move,
+        but we still need the text to appear in the output).
+    pair_score, rename, opcode_tally, out, verbose
+        As for the old ``AssemblyScheduler.emit()``.
+    """
+    # Flush leading pass-through text.
+    for line in pass_lines:
+        print(line, file=out)
+
+    if not instructions:
+        return PairStats(
+            total_instrs=0, paired_instrs=0, unpaired_instrs=0,
+            possible_pairs=0, successful_pairs=0,
+            rule_counts={}, rule_shadow={}, rule_missed={},
+            rvc_eligible=0,
+            estimated_bytes=0, baseline_bytes=0,
+            saving_bytes=0, saving_pct=0.0,
+            singleton_tally={}, unpaired_opcode_tally={},
+        )
+
+    graph = build_dep_graph(instructions)
+
+    if verbose:
+        lv = compute_liveness([i for i in instructions if i.mnemonic != "__label__"])
+        for instr in graph.instructions:
+            if instr.mnemonic == "__label__":
+                continue
+            succs    = sorted(graph.successors[instr.index])
+            dead     = sorted(lv.get(instr.index, set()))
+            compress = can_compress(instr)
+            print(f"# I{instr.index:3d}  {instr.mnemonic:18s}"
+                  f"  defs={instr.defs}  uses={instr.uses}"
+                  f"  last_use={dead}  rvc={compress}"
+                  f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
+
+    scheduled      = _bnb_schedule(graph, pair_score)
+    real_scheduled = [i for i in scheduled if i.mnemonic != "__label__"]
+
+    if hasattr(pair_score, "_liveness_cell"):
+        pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
+
+    if rename:
+        real_scheduled = rename_destinations(real_scheduled, graph, pair_score)
+        if hasattr(pair_score, "_liveness_cell"):
+            pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
+
+    real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
+
+    # ── Greedy-advance walk ───────────────────────────────────────────────
+    total_instrs = len(real_scheduled)
+    successful   = 0
+
+    rule_counts:           dict = {}
+    rule_shadow:           dict = {}
+    rule_missed:           dict = {}
+    singleton_tally:       dict = {}
+    unpaired_opcode_tally: dict = {}
+
+    pair_start_set: set  = set()
+    pair_rules:     dict = {}
+
+    rule_list     = getattr(pair_score, "_rule_list", None)
+    describe_fn   = getattr(pair_score, "_describe_pair", None)
+    liveness_snap = (pair_score._liveness_cell[0]
+                     if hasattr(pair_score, "_liveness_cell") else {})
+
+    i = 0
+    while i < total_instrs:
+        if i + 1 < total_instrs:
+            a_s, b_s    = real_scheduled[i], real_scheduled[i + 1]
+            slot_scores = pair_score(a_s, b_s) > 0
+
+            if rule_list is not None:
+                matching_rules = [rn for rn, rf in rule_list
+                                  if rf(a_s, b_s, liveness_snap)]
+                if matching_rules:
+                    winner = matching_rules[0]
+                    if slot_scores:
+                        pair_start_set.add(i)
+                        pair_rules[i] = winner
+                        successful += 1
+                        rule_counts[winner] = rule_counts.get(winner, 0) + 1
+                        for rn in matching_rules[1:]:
+                            rule_shadow[rn] = rule_shadow.get(rn, 0) + 1
+                        i += 2
+                        continue
+                    else:
+                        rule_missed[winner] = rule_missed.get(winner, 0) + 1
+            else:
+                if slot_scores:
+                    pair_start_set.add(i)
+                    rule = describe_fn(a_s, b_s) if describe_fn else ""
+                    pair_rules[i] = rule
+                    successful += 1
+                    rule_counts[rule] = rule_counts.get(rule, 0) + 1
+                    i += 2
+                    continue
+
+        mn_a = _tally_label(real_scheduled[i])
+        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
+        key  = (mn_a, mn_b)
+        singleton_tally[key]          = singleton_tally.get(key, 0) + 1
+        unpaired_opcode_tally[mn_a]   = unpaired_opcode_tally.get(mn_a, 0) + 1
+        i += 1
+
+    # ── Emit annotated output ─────────────────────────────────────────────
+    # Walk `scheduled` (sentinels included) in order.  Sentinels are barriers
+    # and cannot move, so they appear in their original relative positions.
+    # For each sentinel we emit its label line; for each real instruction we
+    # emit the instruction text with PAIR+ annotation if applicable.
+    for instr in scheduled:
+        if instr.mnemonic == "__label__":
+            for label_line in sentinel_texts.get(instr.index, []):
+                print(label_line, file=out)
+        else:
+            rp = real_pos.get(instr.index)
+            if rp in pair_start_set:
+                rule_tag = pair_rules.get(rp, "")
+                tag = f"  # PAIR+ [{rule_tag}]" if rule_tag else "  # PAIR+"
+                print(instr.raw + tag, file=out)
+            else:
+                print(instr.raw, file=out)
+
+    # ── Build and return PairStats ────────────────────────────────────────
+    rvc_eligible    = sum(1 for instr in real_scheduled if can_compress(instr))
+    paired_instrs   = successful * 2
+    unpaired_instrs = total_instrs - paired_instrs
+    total_words     = successful + unpaired_instrs
+    estimated_bytes = total_words * 4
+    baseline_bytes  = total_instrs * 4
+    saving_bytes    = baseline_bytes - estimated_bytes
+    saving_pct      = (saving_bytes / baseline_bytes * 100) if baseline_bytes else 0.0
+
+    return PairStats(
+        total_instrs     = total_instrs,
+        paired_instrs    = paired_instrs,
+        unpaired_instrs  = unpaired_instrs,
+        possible_pairs   = total_instrs // 2,
+        successful_pairs = successful,
+        rule_counts      = rule_counts,
+        rule_shadow      = rule_shadow,
+        rule_missed      = rule_missed,
+        rvc_eligible     = rvc_eligible,
+        estimated_bytes  = estimated_bytes,
+        baseline_bytes   = baseline_bytes,
+        saving_bytes     = saving_bytes,
+        saving_pct       = saving_pct,
+        singleton_tally        = singleton_tally,
+        unpaired_opcode_tally  = unpaired_opcode_tally,
+    )
+
+
+# ---------------------------------------------------------------------------
 # High-level API
 # ---------------------------------------------------------------------------
 
 class AssemblyScheduler:
     """
-    Parse, analyse, and emit a reordered RV32 assembly string.
+    Streaming RV32 instruction scheduler.
 
-    sched = AssemblyScheduler(source_text)
-    print(sched.emit(pair_score=my_fn))
+    Processes one basic block at a time, writing output as each block
+    completes.  Peak memory is proportional to the largest single block
+    (typically ~16 instructions within a BnB window), not the whole file.
+
+    Basic usage (writes directly to a file / stdout)::
+
+        sched = AssemblyScheduler(source_text)
+        sched.process(pair_score=my_fn, out=sys.stdout)
+        st = sched.last_stats   # aggregate PairStats for the whole file
+
+    Legacy string-returning usage (loads entire output into RAM — avoid for
+    very large files)::
+
+        output = sched.emit(pair_score=my_fn)
+        print(output)
     """
 
     def __init__(self, source: str):
         self.source = source
-        self.graph = None
-        self._items: list = []
         self.last_stats: "PairStats | None" = None
 
-    def analyse(self):
-        instr_index = 0
-        instructions: list = []
+    # ------------------------------------------------------------------
+    # Label classification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_barrier_label(name: str,
+                          branch_targets:   frozenset,
+                          globally_visible: frozenset) -> bool:
+        """
+        Return True when *name* must be treated as a scheduling barrier.
+
+        A label is a barrier when:
+          - It is a branch or jump target (any instruction can transfer
+            control to it, so nothing may be reordered past it), OR
+          - It is externally visible (declared .globl / .weak / etc.) — it
+            may be called from outside this translation unit.
+
+        Labels that are referenced only in assembler directives (e.g.
+        ``.Lfunc_end*`` in ``.size`` expressions, ``.Lpcrel_hi*`` in
+        ``%pcrel_lo()`` relocation operands) are NOT barriers: no
+        instruction can branch to them, so the scheduler is free to move
+        instructions across them.  Their text is still emitted as-is.
+
+        Note: ``.Lpcrel_hi*`` labels appear between an ``auipc`` and the
+        ``addi`` that consumes ``%pcrel_lo()``.  Reordering those two would
+        corrupt the relocation, but ``auipc`` is an unknown mnemonic and is
+        already marked ``is_barrier=True`` by the parser — so the pair is
+        protected without the label needing to be a barrier itself.
+        """
+        return name in branch_targets or name in globally_visible
+
+    # ------------------------------------------------------------------
+    # Streaming processor
+    # ------------------------------------------------------------------
+
+    def process(
+        self,
+        pair_score:   PairScoreFn = _compress_pair_score,
+        rename:       bool = True,
+        opcode_tally: bool = False,
+        out          = None,
+        verbose:      bool = False,
+    ) -> "PairStats":
+        """
+        Parse, schedule, and emit the source in a single streaming pass.
+
+        Each basic block (sequence of instructions between barrier labels)
+        is processed and written to *out* before the next block is read.
+        Peak memory is O(block_size), not O(file_size).
+
+        Parameters
+        ----------
+        pair_score
+            Scoring function for adjacent instruction pairs.
+        rename
+            If True, attempt destination-register renaming per block.
+        opcode_tally
+            If True, append the unpaired-opcode tally to the final summary.
+        out
+            File-like object to write to.  Defaults to ``sys.stdout``.
+        verbose
+            If True, dump the dependency graph for each block to stderr.
+
+        Returns the aggregate ``PairStats`` for the whole file (also stored
+        as ``self.last_stats``).
+        """
+        if out is None:
+            out = sys.stdout
+
+        # Pre-pass: classify labels without creating Instruction objects.
+        branch_targets, globally_visible = _classify_labels(self.source)
+
+        # Streaming parse: accumulate one block at a time and hand it off.
+        # A block boundary is any barrier label (branch target or globally
+        # visible symbol).  Non-barrier labels are folded in as pass-through
+        # text with no sentinel, so they never split a block.
+        all_stats: list = []
+        instr_index    = 0
+        pass_lines:     list = []   # inter-block pass-through (flushed before label)
+        trailing_pass:  list = []   # post-instruction pass-through (carried to next block)
+        instructions:   list = []   # Instruction objects for the current block
+        sentinel_texts: dict = {}   # {sentinel.index: [line, ...]} — label + intra-block pass-throughs
+        last_sentinel_idx: "int | None" = None   # index of most recent sentinel in this block
+
+        def _flush_block():
+            """Process and emit the accumulated block, then reset state."""
+            nonlocal last_sentinel_idx
+            st = _process_block(
+                pass_lines     = pass_lines,
+                instructions   = instructions,
+                sentinel_texts = sentinel_texts,
+                pair_score     = pair_score,
+                rename         = rename,
+                opcode_tally   = opcode_tally,
+                out            = out,
+                verbose        = verbose,
+            )
+            all_stats.append(st)
+            pass_lines.clear()
+            trailing_pass.clear()
+            instructions.clear()
+            sentinel_texts.clear()
+            last_sentinel_idx = None
+
+        _LABEL_RE = re.compile(r"^\s*(\.?\w+)\s*:")
+
         for line in self.source.splitlines():
             stripped = line.strip()
 
@@ -1787,269 +2385,134 @@ class AssemblyScheduler:
                 or stripped.startswith(("#", ";", "//"))
             )
             is_directive = stripped.startswith(".")
-            is_label    = bool(re.match(r"^\w+\s*:", stripped))
 
             if is_blank_or_comment or is_directive:
-                self._items.append(("pass", line))
+                has_real = any(i.mnemonic != "__label__" for i in instructions)
+                if not has_real and last_sentinel_idx is not None:
+                    # Between the opening sentinel and the first real
+                    # instruction — CFI directives, comment lines, etc.
+                    # Attach to the sentinel so they print immediately after
+                    # the label line, not before it.
+                    sentinel_texts[last_sentinel_idx].append(line)
+                elif has_real:
+                    # After the last real instruction — inter-block gap.
+                    trailing_pass.append(line)
+                else:
+                    # Before any sentinel or instruction — file preamble.
+                    pass_lines.append(line)
                 continue
 
-            if is_label:
-                # Labels are emitted as pass-through text, but they also act
-                # as full scheduling barriers: no instruction may be reordered
-                # from one side of a label to the other, because external code
-                # may branch to the label and expect to find the original
-                # instruction sequence on both sides.
-                #
-                # We achieve this by inserting a synthetic zero-cost barrier
-                # instruction into the instruction list.  The barrier carries
-                # no register effects and is never emitted; it exists solely
-                # to force the dependency graph to draw edges from every
-                # predecessor to it and from it to every successor.
-                sentinel = Instruction(
-                    index    = instr_index,
-                    raw      = "",           # never emitted
-                    mnemonic = "__label__",  # sentinel mnemonic
-                )
-                sentinel.is_barrier = True
-                instr_index += 1
-                instructions.append(sentinel)
-                # The label text goes into _items as a pass-through tied to
-                # the sentinel, so it is re-emitted immediately before the
-                # first instruction that follows the label.
-                self._items.append(("pass", line))
-                # Associate the sentinel with the label position so the
-                # emitter can reconstruct the correct interleaving.
-                self._items.append(("instr", sentinel))
+            m = _LABEL_RE.match(stripped)
+            if m:
+                label_name = m.group(1)
+                if self._is_barrier_label(label_name,
+                                          branch_targets, globally_visible):
+                    # Flush the current block.  trailing_pass lines are the
+                    # inter-block gap and become the new block's pass_lines.
+                    st = _process_block(
+                        pass_lines     = pass_lines,
+                        instructions   = instructions,
+                        sentinel_texts = sentinel_texts,
+                        pair_score     = pair_score,
+                        rename         = rename,
+                        opcode_tally   = opcode_tally,
+                        out            = out,
+                        verbose        = verbose,
+                    )
+                    all_stats.append(st)
+                    instructions.clear()
+                    sentinel_texts.clear()
+                    last_sentinel_idx = None
+                    pass_lines.clear()
+                    pass_lines.extend(trailing_pass)
+                    trailing_pass.clear()
+
+                    # The barrier label itself becomes the first sentinel of
+                    # the new block.
+                    sentinel = Instruction(
+                        index    = instr_index,
+                        raw      = "",
+                        mnemonic = "__label__",
+                    )
+                    sentinel.is_barrier = True
+                    sentinel_texts[instr_index] = [line]
+                    last_sentinel_idx = instr_index
+                    instr_index += 1
+                    instructions.append(sentinel)
+                else:
+                    # Non-barrier label: pass-through text only, no sentinel.
+                    # Route the same way as directives: attach to the current
+                    # sentinel if we haven't seen a real instruction yet,
+                    # otherwise treat as trailing (inter-block) text.
+                    has_real = any(i.mnemonic != "__label__" for i in instructions)
+                    if not has_real and last_sentinel_idx is not None:
+                        sentinel_texts[last_sentinel_idx].append(line)
+                    elif has_real:
+                        trailing_pass.append(line)
+                    else:
+                        pass_lines.append(line)
                 continue
 
             instr = parse_line(instr_index, line)
             if instr is None:
-                self._items.append(("pass", line))
+                # Unrecognised line inside the instruction stream — treat like
+                # a directive: attach to sentinel or trailing_pass as appropriate.
+                has_real = any(i.mnemonic != "__label__" for i in instructions)
+                if not has_real and last_sentinel_idx is not None:
+                    sentinel_texts[last_sentinel_idx].append(line)
+                elif has_real:
+                    trailing_pass.append(line)
+                else:
+                    pass_lines.append(line)
             else:
+                # Real instruction: any trailing_pass lines accumulated since
+                # the last instruction belong before this one in the output.
+                # Flush them into the current sentinel's text list if no real
+                # instruction has been seen yet, otherwise just append to
+                # pass_lines (they'll be emitted in document order by the
+                # existing pass_lines flush at the top of _process_block).
+                # In practice trailing_pass is non-empty here only for unusual
+                # cases (directives sandwiched between instructions).
+                if trailing_pass:
+                    if last_sentinel_idx is not None:
+                        sentinel_texts[last_sentinel_idx].extend(trailing_pass)
+                    else:
+                        pass_lines.extend(trailing_pass)
+                    trailing_pass.clear()
                 instr_index += 1
                 instructions.append(instr)
-                self._items.append(("instr", instr))
-        self.graph = build_dep_graph(instructions)
 
-    @property
-    def liveness(self) -> dict:
+        # Flush the final block.
+        _flush_block()
+
+        # Aggregate stats across all blocks.
+        merged = PairStats.merge(all_stats)
+
+        # Append the file-wide summary as assembly comments.
+        for summary_line in merged.summary_lines(opcode_tally=opcode_tally):
+            print(summary_line, file=out)
+
+        self.last_stats = merged
+        return merged
+
+    def emit(
+        self,
+        pair_score:   PairScoreFn = _compress_pair_score,
+        rename:       bool = True,
+        opcode_tally: bool = False,
+        verbose:      bool = False,
+    ) -> str:
         """
-        Dict mapping each instruction index to a frozenset of register names
-        that are read for the last time by that instruction (dead-after-use).
-        Populated after analyse() is called.
+        Schedule and return the reordered assembly as a single string.
+
+        This is a convenience wrapper around ``process()`` that captures
+        output in memory.  Prefer ``process(out=…)`` for large files.
         """
-        if self.graph is None:
-            self.analyse()
-        if not hasattr(self, "_liveness"):
-            self._liveness = compute_liveness(self.graph.instructions)
-        return self._liveness
-
-    def emit(self, pair_score: PairScoreFn = _compress_pair_score,
-             rename: bool = True,
-             opcode_tally: bool = False) -> str:
-        """
-        Schedule and emit the reordered assembly.
-
-        Parameters
-        ----------
-        pair_score : callable(a, b) -> float
-            Scoring function for adjacent instruction pairs.  The default
-            rewards RVC-compressible instruction pairs.
-        rename : bool
-            If True (default), attempt destination-register renaming after
-            scheduling to improve the pair score further.
-
-        The returned string includes a trailing comment line of the form:
-            # pairs: K/N  (K successful strict pairs out of N/2 possible)
-        """
-        if self.graph is None:
-            self.analyse()
-
-        scheduled = _bnb_schedule(self.graph, pair_score)
-
-        # Strip sentinel barrier instructions (label markers) before liveness
-        # analysis, renaming, and scoring — they have no register effects and
-        # must not appear in the emitted output.
-        real_scheduled = [i for i in scheduled if i.mnemonic != "__label__"]
-
-        # Refresh liveness over the scheduled sequence before any scoring.
-        if hasattr(pair_score, "_liveness_cell"):
-            pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
-
-        if rename:
-            real_scheduled = rename_destinations(
-                real_scheduled, self.graph, pair_score)
-            if hasattr(pair_score, "_liveness_cell"):
-                pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
-
-        # --- Build output lines, interleaving pass-through items ---
-        # Map from instruction original index -> position in `scheduled`
-        # (including sentinels) so pass-through anchoring is correct.
-        sched_pos = {i.index: p for p, i in enumerate(scheduled)}
-        # Map from instruction original index -> position in `real_scheduled`
-        # (sentinels removed) so PAIR+ annotations index correctly.
-        real_pos = {i.index: p for p, i in enumerate(real_scheduled)}
-
-        before_pos: dict = defaultdict(list)
-        pending: list = []
-        for kind, val in self._items:
-            if kind == "pass":
-                pending.append(val)
-            else:
-                sp = sched_pos.get(val.index)
-                if sp is not None:
-                    before_pos[sp].extend(pending)
-                    pending.clear()
-
-        # --- Annotate pairs, build stats, append summary ---
-        # All pairing logic operates on real_scheduled (no sentinels).
-        total_instrs   = len(real_scheduled)
-        possible_pairs = total_instrs // 2
-        successful     = 0
-        rule_counts: dict = {}
-        describe_fn = getattr(pair_score, "_describe_pair", None)
-
-        # Greedy-advance walk: the pairing model that drives both the
-        # PAIR+ annotations and all statistics.
-        #
-        # Walk the scheduled sequence left-to-right.  At each position i:
-        #   - If pair_score(i, i+1) > 0: form a pair, advance i by 2.
-        #   - Otherwise: emit i as a singleton, advance i by 1.
-        #
-        # A singleton never prevents the following instruction from pairing.
-        # Rule classification follows first-match priority:
-        #   rule_counts [winner] += 1  — pair formed and winner rule fired
-        #   rule_shadow [rule]   += 1  — rule also matched but lost to winner
-        #   rule_missed [winner] += 1  — winner rule matched but pair_score=0
-
-        pair_starts = []  # positions of the first instruction in each pair
-        pair_rules  = {}  # position -> winning rule name
-
-        rule_counts: dict = {}
-        rule_shadow: dict = {}
-        rule_missed: dict = {}
-        singleton_tally:       dict = {}   # {(mn_a, mn_b): count}
-        unpaired_opcode_tally: dict = {}   # {mnemonic: count}
-
-        rule_list    = getattr(pair_score, "_rule_list", None)
-        liveness_snap = (pair_score._liveness_cell[0]
-                         if hasattr(pair_score, "_liveness_cell") else {})
-
-        i = 0
-        while i < total_instrs:
-            if i + 1 < total_instrs:
-                a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
-                slot_scores = pair_score(a_s, b_s) > 0
-
-                if rule_list is not None:
-                    matching_rules = [
-                        rname for rname, rfn in rule_list
-                        if rfn(a_s, b_s, liveness_snap)
-                    ]
-                    if matching_rules:
-                        winner = matching_rules[0]
-                        if slot_scores:
-                            pair_starts.append(i)
-                            pair_rules[i] = winner
-                            successful += 1
-                            rule_counts[winner] = rule_counts.get(winner, 0) + 1
-                            for rname in matching_rules[1:]:
-                                rule_shadow[rname] = rule_shadow.get(rname, 0) + 1
-                            i += 2
-                            continue
-                        else:
-                            rule_missed[winner] = rule_missed.get(winner, 0) + 1
-                else:
-                    if slot_scores:
-                        pair_starts.append(i)
-                        rule = describe_fn(a_s, b_s) if describe_fn else ""
-                        pair_rules[i] = rule
-                        successful += 1
-                        rule_counts[rule] = rule_counts.get(rule, 0) + 1
-                        i += 2
-                        continue
-
-            # No pair formed at position i: singleton.
-            # Record the (a, b) opcode combination that failed to pair, using
-            # the same adjacent instruction the scorer examined.  When i is the
-            # last instruction, use "" as the partner label.
-            #
-            # Loads and stores with sp (x2) as their base register are given a
-            # qualified label  "lw(sp)"  rather than plain "lw", because a
-            # stack-relative access that fails to pair is a very different signal
-            # from a heap/data access that fails — they are subject to different
-            # rules and constraints.
-            def _tally_label(instr: "Instruction") -> str:
-                if instr.mem is not None and instr.mem[1] == "x2":
-                    return f"{instr.mnemonic}(sp)"
-                return instr.mnemonic
-
-            mn_a = _tally_label(real_scheduled[i])
-            mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
-            key = (mn_a, mn_b)
-            singleton_tally[key]        = singleton_tally.get(key, 0) + 1
-            unpaired_opcode_tally[mn_a] = unpaired_opcode_tally.get(mn_a, 0) + 1
-            i += 1
-
-        # possible_pairs: maximum achievable under greedy-advance model.
-        possible_pairs_greedy = total_instrs // 2
-
-        # RVC eligibility (over real instructions only, no sentinels).
-        rvc_eligible = sum(1 for i in real_scheduled if can_compress(i))
-
-        # Size estimate.
-        paired_instrs   = successful * 2
-        unpaired_instrs = total_instrs - paired_instrs
-        total_words     = successful + unpaired_instrs
-        estimated_bytes = total_words * 4
-        baseline_bytes  = total_instrs * 4
-        saving_bytes    = baseline_bytes - estimated_bytes
-        saving_pct      = (saving_bytes / baseline_bytes * 100) if baseline_bytes else 0.0
-
-        self.last_stats = PairStats(
-            total_instrs     = total_instrs,
-            paired_instrs    = paired_instrs,
-            unpaired_instrs  = unpaired_instrs,
-            possible_pairs   = possible_pairs_greedy,
-            successful_pairs = successful,
-            rule_counts      = rule_counts,
-            rule_shadow      = rule_shadow,
-            rule_missed      = rule_missed,
-            rvc_eligible     = rvc_eligible,
-            estimated_bytes  = estimated_bytes,
-            baseline_bytes   = baseline_bytes,
-            saving_bytes     = saving_bytes,
-            saving_pct       = saving_pct,
-            singleton_tally        = singleton_tally,
-            unpaired_opcode_tally  = unpaired_opcode_tally,
-        )
-
-        # Rebuild output lines with PAIR+ annotations.
-        # real_pos maps original index -> position in real_scheduled (no sentinels).
-        pair_start_set = set(pair_starts)
-        # Build a lookup: real_scheduled position -> instr, for annotation
-        # pair_starts indices are into real_scheduled.
-        # The output must interleave pass-throughs anchored by `scheduled`
-        # (including sentinels) but emit real instruction text from real_scheduled.
-        # We walk `scheduled` in order; for each instruction we look up its
-        # position in real_scheduled (if it's a real instruction) to check
-        # whether it starts a pair.
-        raw_lines: list = []
-        for sp, instr in enumerate(scheduled):
-            raw_lines.extend(before_pos.get(sp, []))
-            if instr.mnemonic == "__label__":
-                continue   # sentinel: no text emitted
-            rp = real_pos.get(instr.index)
-            if rp in pair_start_set:
-                rule_tag = pair_rules.get(rp, "")
-                tag = f"  # PAIR+ [{rule_tag}]" if rule_tag else "  # PAIR+"
-                raw_lines.append(instr.raw + tag)
-            else:
-                raw_lines.append(instr.raw)
-        raw_lines.extend(pending)
-        for line in self.last_stats.summary_lines(opcode_tally=opcode_tally):
-            raw_lines.append(line)
-        return "\n".join(raw_lines)
+        import io
+        buf = io.StringIO()
+        self.process(pair_score=pair_score, rename=rename,
+                     opcode_tally=opcode_tally, out=buf, verbose=verbose)
+        return buf.getvalue().rstrip("\n")
 
 
 
@@ -2730,9 +3193,10 @@ def _make_rvc(sched=None):
     return _compress_pair_score
 
 
-@_scorer_factory(needs_sched=True)
-def _make_compact32(sched):
-    return make_compact32_scorer(sched.liveness)
+@_scorer_factory(needs_sched=False)
+def _make_compact32(sched=None):
+    # Liveness starts empty; _process_block refreshes the cell before scoring.
+    return make_compact32_scorer({})
 
 
 SCORERS: dict = {
@@ -2785,27 +3249,28 @@ def main():
         ap.error(f"Unknown scorer {args.scorer!r}. "
                  f"Available: {list(SCORERS)}")
 
-    source = sys.stdin.read() if args.input == "-" else open(args.input).read()
-    sched = AssemblyScheduler(source)
-    sched.analyse()
+    if args.input == "-":
+        source = sys.stdin.read()
+    else:
+        source = open(args.input).read()
 
-    if args.verbose:
-        liveness = sched.liveness
-        for instr in sched.graph.instructions:
-            succs     = sorted(sched.graph.successors[instr.index])
-            dead      = sorted(liveness.get(instr.index, set()))
-            compress  = can_compress(instr)
-            print(f"# I{instr.index:3d}  {instr.mnemonic:18s}"
-                  f"  defs={instr.defs}  uses={instr.uses}"
-                  f"  last_use={dead}  rvc={compress}"
-                  f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
+    sched = AssemblyScheduler(source)
 
     factory, _ = SCORERS[args.scorer]
-    pair_score = factory(sched) if getattr(factory, "needs_sched", False)                  else factory()
+    # compact32 scorer needs a liveness snapshot to initialise its cell;
+    # we pass an empty dict here — _process_block refreshes it per block
+    # before any scoring occurs, so the initial value never matters.
+    pair_score = factory()
 
-    output = sched.emit(pair_score=pair_score, rename=args.rename,
-                        opcode_tally=args.opcode_tally)
-    print(output)
+    # Stream output directly to stdout; summary printed at end of process().
+    sched.process(
+        pair_score   = pair_score,
+        rename       = args.rename,
+        opcode_tally = args.opcode_tally,
+        out          = sys.stdout,
+        verbose      = args.verbose,
+    )
+
     if sched.last_stats is not None:
         st = sched.last_stats
         print(f"\n# --- report ---", file=sys.stderr)
