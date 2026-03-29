@@ -336,6 +336,11 @@ class Instruction:
     mem:        object = None  # (offset:int, base:str) for load/store, else None
     dual_arith_ok:       bool = False
     dual_arith_chain_ok: bool = False
+    # Source lines (label definitions) that must be emitted immediately before
+    # this instruction wherever it is scheduled.  Used for non-barrier labels
+    # such as .Lpcrel_hi* that must stay anchored to the instruction they
+    # precede but do not constrain scheduling across them.
+    prefix_lines: list = field(default_factory=list)
 
     def __repr__(self):
         return f"I{self.index}:{self.mnemonic}"

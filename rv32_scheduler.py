@@ -1254,13 +1254,15 @@ def _process_block(
     # ── Emit annotated output ─────────────────────────────────────────────
     # Walk `scheduled` (sentinels included) in order.  Sentinels are barriers
     # and cannot move, so they appear in their original relative positions.
-    # For each sentinel we emit its label line; for each real instruction we
-    # emit the instruction text with PAIR+ annotation if applicable.
+    # For each real instruction, emit any prefix_lines (non-barrier labels
+    # anchored to it) first, then the instruction text.
     for instr in scheduled:
         if instr.mnemonic == _SENTINEL_MN:
             for label_line in sentinel_texts.get(instr.index, []):
                 print(label_line, file=out)
         else:
+            for prefix in instr.prefix_lines:
+                print(prefix, file=out)
             rp = real_pos.get(instr.index)
             if rp in pair_start_set:
                 rule_tag = pair_rules.get(rp, "")
@@ -1541,7 +1543,7 @@ class AssemblyScheduler:
             instructions.append(sentinel)
 
         def _add_instruction(instr: "Instruction") -> None:
-            """Add a real instruction, draining trailing_pass first."""
+            """Add a real instruction, draining trailing_pass and pending_prefixes first."""
             nonlocal instr_index
             if trailing_pass:
                 if last_sentinel_idx is not None:
@@ -1549,35 +1551,76 @@ class AssemblyScheduler:
                 else:
                     pass_lines.extend(trailing_pass)
                 trailing_pass.clear()
+            # Attach any buffered non-barrier label lines as prefix_lines on
+            # this instruction.  They travel with it when it is scheduled and
+            # are emitted immediately before it in the output.
+            if pending_prefixes:
+                instr.prefix_lines = list(pending_prefixes)
+                pending_prefixes.clear()
             # instr.index was already set by parse_line(instr_index, ...)
             instr_index += 1
             instructions.append(instr)
 
+        # Lines for non-barrier labels waiting to be attached to the next
+        # real instruction as prefix_lines.  If no instruction follows before
+        # the next block boundary they are flushed as pass-through text.
+        pending_prefixes: list = []
+
+        def _flush_pending_prefixes_as_passthrough() -> None:
+            """
+            If pending_prefixes are not consumed by an instruction before a
+            block boundary (e.g. a label followed only by .word directives),
+            emit them as pass-through text so they still appear in the output.
+            """
+            for pl in pending_prefixes:
+                _route_pass(pl)
+            pending_prefixes.clear()
+
         for line in self.source.splitlines():
-            # Plain assembly path.
             stripped = line.strip()
-            if (not stripped
-                    or stripped.startswith(("#", ";", "//"))
-                    or stripped.startswith(".")):
+            if not stripped or stripped.startswith(("#", ";", "//")):
                 _route_pass(line)
                 continue
 
+            # Check for a label definition BEFORE the dot-prefix filter.
+            # Labels like `.Lbranch_xxx:` start with '.' and would otherwise
+            # be swallowed as assembler directives.
             m = _LABEL_DEF.match(stripped)
             if m:
                 label_name = m.group(1)
                 if self._is_barrier_label(label_name,
                                           branch_targets, globally_visible):
+                    # Flush any pending prefix labels as pass-through before
+                    # starting the new block — they have no following instruction
+                    # in this block to attach to.
+                    _flush_pending_prefixes_as_passthrough()
                     _add_sentinel(label_name, line)
                 else:
-                    _route_pass(line)
+                    # Non-barrier label: buffer it to attach to the next
+                    # instruction as a prefix line.  It must stay positionally
+                    # anchored to that instruction but does not split the block.
+                    pending_prefixes.append(line)
+                continue
+
+            # Skip assembler directives (lines starting with '.').
+            if stripped.startswith("."):
+                # A directive after pending_prefixes means no instruction
+                # follows — flush prefixes as pass-through.
+                if pending_prefixes:
+                    _flush_pending_prefixes_as_passthrough()
+                _route_pass(line)
                 continue
 
             instr = parse_line(instr_index, line)
             if instr is None:
+                if pending_prefixes:
+                    _flush_pending_prefixes_as_passthrough()
                 _route_pass(line)
             else:
                 _add_instruction(instr)
 
+        # Flush any non-barrier labels that appeared after the last instruction.
+        _flush_pending_prefixes_as_passthrough()
         # Flush the final block.
         _flush_block()
 
