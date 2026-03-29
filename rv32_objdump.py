@@ -19,23 +19,25 @@ The converter performs a two-pass scan:
 Label naming convention
 -----------------------
 Generated label names encode both the hex address and the *kind* of the
-first reference that created them:
+first reference that created them.  All synthetic labels use the ``.L``
+prefix, following the GNU assembler convention for local/compiler-generated
+labels.  ``_classify_labels`` in ``rv32_core`` explicitly excludes ``.L``
+labels from the barrier set, so only named function-entry labels (which
+receive ``.globl`` directives) act as scheduling barriers.
 
-  ``_branch_XXXXXXXX``   – address is the target of a branch or jump
-                           instruction (beq, bne, blt, bge, bltu, bgeu,
-                           beqz, bnez, j, jal, jalr, c.j, c.jal, …).
-                           The scheduler treats these as block boundaries.
+  ``.Lbranch_XXXXXXXX``  – address is the target of a branch or jump
+                           instruction (beq, bne, …, j, jal, jalr, …).
+                           NOT a scheduler barrier — the dependency graph
+                           already enforces branch-last ordering via the
+                           ``is_branch`` flag.
 
-  ``_pcrel_XXXXXXXX``    – address appears only in a ``# ADDR <sym>``
+  ``.Lpcrel_XXXXXXXX``   – address appears only in a ``# ADDR <sym>``
                            side-channel comment on an auipc instruction
-                           (PC-relative data/symbol reference).  The
-                           scheduler does NOT need to split a block here;
-                           the label exists purely for human readability.
+                           (PC-relative data/symbol reference).
+                           Informational only; no scheduling effect.
 
-  ``_ref_XXXXXXXX``      – address appears in a ``# ADDR <sym>`` comment on
-                           any other instruction (e.g. lbu with an absolute
-                           comment address).  Same scheduling treatment as
-                           _pcrel: informational only.
+  ``.Lref_XXXXXXXX``     – address appears in a ``# ADDR <sym>`` comment
+                           on any other instruction.  Informational only.
 
 Named labels from objdump function/local headers (``ADDR <name>:``) are
 preserved verbatim when the name is a plain identifier (no ``+`` offset).
@@ -145,9 +147,19 @@ def _plain_name(label_text: str) -> Optional[str]:
 
 
 def _label_for(addr: int, kind: str) -> str:
-    """Return the synthetic label name for *addr* of the given *kind*."""
-    # kind is 'branch', 'pcrel', or 'ref'
-    return f"_{kind}_{addr:08x}"
+    """
+    Return the synthetic label name for *addr* of the given *kind*.
+
+    All synthetic labels use the ``.L`` prefix so that ``_classify_labels``
+    treats them as local compiler-generated temporaries and does NOT make
+    them scheduling barriers.  Only explicitly ``.globl``-declared labels
+    (the named function-entry headers) become barriers.
+
+    - ``.Lbranch_XXXXXXXX`` — intra-function branch / jump target
+    - ``.Lpcrel_XXXXXXXX``  — auipc PC-relative target (informational only)
+    - ``.Lref_XXXXXXXX``    — other hash-comment address (informational only)
+    """
+    return f".L{kind}_{addr:08x}"
 
 
 # ---------------------------------------------------------------------------

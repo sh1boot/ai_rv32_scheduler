@@ -639,8 +639,17 @@ def _classify_labels(source: str) -> tuple:
     Returns ``(branch_targets, globally_visible)`` — two frozensets of label
     name strings that must be treated as scheduling barriers.
 
-    Labels not in either set (e.g. ``.Lfunc_end*``, ``.Lpcrel_hi*``) are
-    pass-through text with no scheduling constraint.
+    Labels not in either set (e.g. ``.Lfunc_end*``, ``.Lpcrel_hi*``,
+    ``.Lbranch_*``) are pass-through text with no scheduling constraint.
+
+    **Local labels** (names starting with ``.L``) are explicitly excluded
+    from ``branch_targets`` even when they appear as branch operands.
+    Following the GNU assembler convention, ``.L``-prefixed names are
+    compiler-generated temporaries.  They are never entry points that could
+    be reached from outside the surrounding basic block sequence, so marking
+    them as barriers would fragment basic blocks unnecessarily.  The only
+    way a ``.L`` label ever becomes a barrier is if it is also declared
+    ``.globl`` / ``.weak`` (which is pathological but handled).
 
     Note: ``auipc``/``addi %pcrel_lo`` pairs are already protected by the
     RAW dependency on the register ``auipc`` writes, so ``.Lpcrel_hi*``
@@ -657,6 +666,7 @@ def _classify_labels(source: str) -> tuple:
             code = line.split("#")[0].split(";")[0].strip()
             tgt  = code.split()[-1].rstrip(",")
             if (tgt
+                    and not tgt.startswith(".L")   # local label — never a barrier
                     and not tgt.lstrip("-").isdigit()
                     and not tgt.startswith("%")
                     and "(" not in tgt
