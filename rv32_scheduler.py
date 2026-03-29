@@ -478,6 +478,11 @@ _TEMPORARIES  = frozenset(f"x{i}" for i in (5, 6, 7, 28, 29, 30, 31))
 # Registers that must never be rename targets (x0, ra, sp, gp, tp)
 _RESERVED     = frozenset({"x0", "x1", "x2", "x3", "x4"})
 
+# ABI return-value registers: a0 (x10) and a1 (x11) are live-out at any ret.
+_ABI_RETURN_REGS = frozenset({"x10", "x11"})
+# ABI argument registers: a0–a7 (x10–x17) are live-in at every function entry.
+_ABI_ARG_REGS    = frozenset(f"x{i}" for i in range(10, 18))
+
 def _reg_family(reg: str) -> str:
     """Return 'int', 'fp', or 'vec' depending on register prefix."""
     if reg.startswith("x"):
@@ -491,6 +496,8 @@ def rename_destinations(
     graph: DepGraph,
     pair_score: PairScoreFn,
     max_trials: int = 5_000,
+    live_out: frozenset = frozenset(),
+    live_in:  frozenset = frozenset(),
 ) -> list:
     """
     Improve the pair score by renaming destination registers in two phases.
@@ -499,6 +506,16 @@ def rename_destinations(
     both phases.  When the budget is exhausted the best schedule found so far
     is returned.  This bounds latency for large blocks where the rename search
     space is too large to explore fully.
+
+    *live_out* is the set of registers that are architecturally live after the
+    last instruction of the block (e.g. ``{x10, x11}`` at a ``ret``).  The
+    renamer will not rename any def whose register is in this set if its value
+    reaches the end of the block.
+
+    *live_in* is the set of registers that are architecturally live on entry to
+    the block (e.g. ``a0–a7`` at a function entry point).  These registers are
+    added to the live set at position 0 so the renamer never picks them as free
+    rename targets even if the block happens not to read them.
 
     Phase 1 — Divergent rename (free-register targeting)
     ----------------------------------------------------
@@ -555,13 +572,21 @@ def rename_destinations(
     # ------------------------------------------------------------------
     def _build_live_table() -> list:
         t = [None] * (n + 1)
-        t[n] = set()
+        # Seed the exit liveness with the ABI live-out set so the renamer
+        # treats those registers as live even if not read within the block.
+        t[n] = set(live_out)
         for pos in range(n - 1, -1, -1):
             instr = scheduled[pos]
             live = set(t[pos + 1])
             for r in instr.defs: live.discard(r)
             for r in instr.uses: live.add(r)
             t[pos] = live
+        # Inject ABI live-in registers at position 0.  These are registers
+        # whose values are provided by the caller and must not be renamed away
+        # even if this block never reads them (e.g. a function that tail-calls
+        # immediately without using all its arguments).
+        if live_in:
+            t[0] = t[0] | live_in
         return t
 
     def _build_free_table() -> list:
@@ -981,13 +1006,14 @@ _VISIBILITY_DIRS = re.compile(
 _LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
 
 def _process_block(
-    pass_lines:     list,
-    instructions:   list,
-    sentinel_texts: dict,
-    pair_score:     "PairScoreFn",
-    rename:         bool,
+    pass_lines:        list,
+    instructions:      list,
+    sentinel_texts:    dict,
+    pair_score:        "PairScoreFn",
+    rename:            bool,
     out,
-    verbose:        bool = False,
+    verbose:           bool = False,
+    is_function_entry: bool = False,
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -1009,6 +1035,11 @@ def _process_block(
         in the output).
     pair_score, rename, out, verbose
         As for ``AssemblyScheduler.process()``.
+    is_function_entry
+        True when this block begins immediately after a globally-visible label
+        (a function entry point).  When set, the ABI argument registers
+        ``a0–a7`` (``x10–x17``) are treated as live-in so the renamer never
+        picks them as free rename targets.
     """
     # Flush leading pass-through text.
     for line in pass_lines:
@@ -1039,7 +1070,28 @@ def _process_block(
         pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
 
     if rename:
-        real_scheduled = rename_destinations(real_scheduled, graph, pair_score)
+        # Determine ABI-mandated live-out and live-in sets for this block.
+        #
+        # live_out: if the last real instruction is a ret, the return-value
+        #   registers a0/a1 (x10/x11) must be treated as live even if not
+        #   read within the block.  Without this the renamer could rename a
+        #   def of a0 to a temp, silently corrupting the return value.
+        #
+        # live_in: if this block is a function entry, a0–a7 (x10–x17) are
+        #   live-in per the RISC-V calling convention.  The renamer must not
+        #   pick them as free rename targets even if the block never reads them.
+        abi_live_out = (
+            _ABI_RETURN_REGS
+            if real_scheduled and real_scheduled[-1].mnemonic == "ret"
+            else frozenset()
+        )
+        abi_live_in = _ABI_ARG_REGS if is_function_entry else frozenset()
+
+        real_scheduled = rename_destinations(
+            real_scheduled, graph, pair_score,
+            live_out = abi_live_out,
+            live_in  = abi_live_in,
+        )
         if hasattr(pair_score, "_liveness_cell"):
             pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
 
@@ -1259,25 +1311,31 @@ class AssemblyScheduler:
         instructions:   list = []   # Instruction objects for the current block
         sentinel_texts: dict = {}   # {sentinel.index: [line, ...]} — label + intra-block pass-throughs
         last_sentinel_idx: "int | None" = None   # index of most recent sentinel in this block
+        # True when the block currently being accumulated begins at a globally-
+        # visible (function-entry) label.  Propagated to _process_block so the
+        # renamer can treat a0–a7 as live-in.
+        current_block_is_entry: bool = False
 
         def _flush_block():
             """Process and emit the accumulated block, then reset state."""
-            nonlocal last_sentinel_idx
+            nonlocal last_sentinel_idx, current_block_is_entry
             st = _process_block(
-                pass_lines     = pass_lines,
-                instructions   = instructions,
-                sentinel_texts = sentinel_texts,
-                pair_score     = pair_score,
-                rename         = rename,
-                out            = out,
-                verbose        = verbose,
+                pass_lines         = pass_lines,
+                instructions       = instructions,
+                sentinel_texts     = sentinel_texts,
+                pair_score         = pair_score,
+                rename             = rename,
+                out                = out,
+                verbose            = verbose,
+                is_function_entry  = current_block_is_entry,
             )
             all_stats.append(st)
             pass_lines.clear()
             trailing_pass.clear()
             instructions.clear()
             sentinel_texts.clear()
-            last_sentinel_idx = None
+            last_sentinel_idx      = None
+            current_block_is_entry = False
 
         def _route_pass(line: str) -> None:
             """
@@ -1303,17 +1361,24 @@ class AssemblyScheduler:
             Flush the current block, then start a new block with a barrier
             sentinel for *label_name*.  *source_line* is the original source
             text of the label definition, preserved for output.
+
+            When *label_name* is globally visible (a function entry point), the
+            output stream is flushed after the preceding block is emitted so
+            that each function's output is written promptly.  The new block is
+            marked as a function entry so the renamer treats a0–a7 as live-in.
             """
-            nonlocal instr_index, last_sentinel_idx
+            nonlocal instr_index, last_sentinel_idx, current_block_is_entry
+            is_entry = label_name in globally_visible
             # Flush: inter-block trailing_pass becomes next block's preamble.
             st = _process_block(
-                pass_lines     = pass_lines,
-                instructions   = instructions,
-                sentinel_texts = sentinel_texts,
-                pair_score     = pair_score,
-                rename         = rename,
-                out            = out,
-                verbose        = verbose,
+                pass_lines         = pass_lines,
+                instructions       = instructions,
+                sentinel_texts     = sentinel_texts,
+                pair_score         = pair_score,
+                rename             = rename,
+                out                = out,
+                verbose            = verbose,
+                is_function_entry  = current_block_is_entry,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1322,6 +1387,15 @@ class AssemblyScheduler:
             pass_lines.clear()
             pass_lines.extend(trailing_pass)
             trailing_pass.clear()
+
+            # Flush the output stream after completing a whole function so that
+            # each function's assembly is written to disk before we move on.
+            if is_entry:
+                out.flush()
+
+            # The new block that starts here is a function entry if its opening
+            # label is globally visible.
+            current_block_is_entry = is_entry
 
             sentinel = Instruction(index=instr_index, raw="", mnemonic=_SENTINEL_MN)
             sentinel.is_barrier = True

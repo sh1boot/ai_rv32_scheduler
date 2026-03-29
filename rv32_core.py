@@ -639,21 +639,26 @@ def _classify_labels(source: str) -> tuple:
     Returns ``(branch_targets, globally_visible)`` — two frozensets of label
     name strings that must be treated as scheduling barriers.
 
-    Labels not in either set (e.g. ``.Lfunc_end*``, ``.Lpcrel_hi*``,
-    ``.Lbranch_*``) are pass-through text with no scheduling constraint.
+    **branch_targets**: every label that appears as the operand of a branch or
+    jump instruction (``beq``, ``bne``, ``j``, ``jal``, etc.).  These mark
+    basic-block entry points: no instruction may be reordered past them.
+    This explicitly *includes* compiler-generated ``.L``-prefixed labels such
+    as ``.LBB0_1``, ``.Lloop``, ``.Ltmp3`` — they are the targets of
+    intra-function branches (loop back-edges, if/else arms, switch cases) and
+    are therefore genuine basic-block boundaries.
 
-    **Local labels** (names starting with ``.L``) are explicitly excluded
-    from ``branch_targets`` even when they appear as branch operands.
-    Following the GNU assembler convention, ``.L``-prefixed names are
-    compiler-generated temporaries.  They are never entry points that could
-    be reached from outside the surrounding basic block sequence, so marking
-    them as barriers would fragment basic blocks unnecessarily.  The only
-    way a ``.L`` label ever becomes a barrier is if it is also declared
-    ``.globl`` / ``.weak`` (which is pathological but handled).
+    **globally_visible**: labels declared with ``.globl``, ``.weak``, etc.
+    These are function entry points reachable from outside the translation
+    unit and are also scheduling barriers.
+
+    Labels that are *not* barriers are those referenced only in assembler
+    directive expressions — e.g. ``.Lfunc_end*`` in ``.size`` expressions and
+    ``.Lpcrel_hi*`` in ``%pcrel_lo()`` relocation operands.  These never
+    appear as branch operands so they are naturally excluded by this scan.
 
     Note: ``auipc``/``addi %pcrel_lo`` pairs are already protected by the
     RAW dependency on the register ``auipc`` writes, so ``.Lpcrel_hi*``
-    labels need not be barriers.
+    labels need not be barriers even if they did appear here.
     """
     branch_targets:   set = set()
     globally_visible: set = set()
@@ -666,7 +671,6 @@ def _classify_labels(source: str) -> tuple:
             code = line.split("#")[0].split(";")[0].strip()
             tgt  = code.split()[-1].rstrip(",")
             if (tgt
-                    and not tgt.startswith(".L")   # local label — never a barrier
                     and not tgt.lstrip("-").isdigit()
                     and not tgt.startswith("%")
                     and "(" not in tgt
