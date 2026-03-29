@@ -1868,10 +1868,11 @@ def _classify_labels(source: str) -> tuple:
     constraint because no instruction can ever transfer control to them.
 
     Note: ``.Lpcrel_hi*`` labels sit between ``auipc`` and the ``addi`` that
-    consumes ``%pcrel_lo()``.  Reordering across them would be unsafe, but
-    ``auipc`` is an unknown mnemonic and is already marked ``is_barrier=True``
-    by the parser, so the barrier is enforced without the label needing to be
-    one itself.
+    consumes ``%pcrel_lo()``.  Reordering those two would corrupt the
+    relocation, but the pair is already protected by a RAW dependency: ``auipc``
+    writes ``rd``, and the ``addi`` reads that same register as ``rs1``.  The
+    dependency graph enforces their ordering without the label needing to be a
+    barrier.
     """
     branch_targets: set = set()
     globally_visible: set = set()
@@ -2424,9 +2425,9 @@ class AssemblyScheduler:
 
         Note: ``.Lpcrel_hi*`` labels appear between an ``auipc`` and the
         ``addi`` that consumes ``%pcrel_lo()``.  Reordering those two would
-        corrupt the relocation, but ``auipc`` is an unknown mnemonic and is
-        already marked ``is_barrier=True`` by the parser — so the pair is
-        protected without the label needing to be a barrier itself.
+        corrupt the relocation, but the pair is already protected by a RAW
+        dependency on the register ``auipc`` writes — so the label does not
+        need to be a barrier itself.
         """
         return name in branch_targets or name in globally_visible
 
