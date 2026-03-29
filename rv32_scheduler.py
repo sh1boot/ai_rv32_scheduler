@@ -483,6 +483,29 @@ _ABI_RETURN_REGS = frozenset({"x10", "x11"})
 # ABI argument registers: a0–a7 (x10–x17) are live-in at every function entry.
 _ABI_ARG_REGS    = frozenset(f"x{i}" for i in range(10, 18))
 
+# Callee-saved integer registers: sp (x2), s0–s1 (x8–x9), s2–s11 (x18–x27).
+# The callee is obligated to preserve these, so the caller can rely on them
+# surviving any call instruction.
+_ABI_CALLEE_SAVED = frozenset(
+    {"x2", "x8", "x9"} | {f"x{i}" for i in range(18, 28)}
+)
+
+# Live-out at a direct or indirect call instruction (call / jal rd=x1 / jalr rd=x1):
+#   - All argument registers a0–a7 (x10–x17): the caller has loaded these with
+#     the arguments being passed; they must not be renamed away.
+#   - All callee-saved registers: these survive the call, so any def that reaches
+#     the call site and whose value is needed after return must not be renamed
+#     into a caller-saved register.
+_ABI_CALL_LIVE_OUT = _ABI_ARG_REGS | _ABI_CALLEE_SAVED
+
+# Live-in at the return site (the block that immediately follows a call):
+#   - Callee-saved registers (x2, x8–x9, x18–x27): restored by the callee.
+#   - ra (x1): restored by the callee (though typically not read again until
+#     the next ret, it is architecturally live).
+#   - Return value registers a0–a1 (x10–x11): written by the callee.
+#   Caller-saved temporaries (t0–t6, a2–a7) are clobbered and therefore dead.
+_ABI_RETURN_SITE_LIVE_IN = _ABI_CALLEE_SAVED | frozenset({"x1", "x10", "x11"})
+
 def _reg_family(reg: str) -> str:
     """Return 'int', 'fp', or 'vec' depending on register prefix."""
     if reg.startswith("x"):
@@ -1005,6 +1028,71 @@ _VISIBILITY_DIRS = re.compile(
 # Label definition: optional leading dot, word chars, colon.
 _LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
 
+# ---------------------------------------------------------------------------
+# ABI-based block boundary liveness
+# ---------------------------------------------------------------------------
+
+def _abi_liveness_for_terminal(real_scheduled: list) -> tuple:
+    """
+    Derive ABI-mandated liveness at a block boundary from its terminal
+    instruction, without requiring a full control-flow graph.
+
+    Returns ``(live_out, next_live_in)`` — both frozensets of canonical
+    register names (xN form).
+
+    ``live_out``
+        Registers that must be treated as live at the *end* of this block,
+        regardless of whether any instruction within the block reads them.
+        Passed as the ``live_out`` seed to ``rename_destinations`` so the
+        renamer does not clobber values that must survive past the boundary.
+
+    ``next_live_in``
+        Registers that are architecturally live at the *start* of the block
+        that follows this one (the return site, or the instruction after a
+        call).  Stored and forwarded as ``block_live_in`` when the next block
+        is processed.
+
+    Terminal classification
+    -----------------------
+    ``ret``
+        live_out  = {x10, x11}  (return values a0/a1 must not be renamed away)
+        next_live_in = {}        (no successor in this translation unit)
+
+    ``tail``
+        live_out  = {x10–x17}   (all argument regs forwarded to tail callee)
+        next_live_in = {}        (tail call has no local return site)
+
+    ``call`` / ``jal rd=x1`` / ``jalr rd=x1``  (direct or indirect call)
+        live_out  = _ABI_CALL_LIVE_OUT  (args + callee-saved)
+        next_live_in = _ABI_RETURN_SITE_LIVE_IN  (callee-saved + ra + a0/a1)
+
+    All other terminals (conditional branch, unconditional jump, fall-through)
+        live_out  = {}  (conservative; cross-block CFG analysis handles these)
+        next_live_in = {}
+    """
+    if not real_scheduled:
+        return frozenset(), frozenset()
+
+    last = real_scheduled[-1]
+    mn   = last.mnemonic
+
+    if mn == "ret":
+        return _ABI_RETURN_REGS, frozenset()
+
+    if mn == "tail":
+        return _ABI_ARG_REGS, frozenset()
+
+    # Direct call pseudo-instruction.
+    if mn == "call":
+        return _ABI_CALL_LIVE_OUT, _ABI_RETURN_SITE_LIVE_IN
+
+    # Raw jal/jalr: distinguish call (rd=x1) from jump (rd=x0/none).
+    if mn in ("jal", "jalr") and "x1" in last.defs:
+        return _ABI_CALL_LIVE_OUT, _ABI_RETURN_SITE_LIVE_IN
+
+    return frozenset(), frozenset()
+
+
 def _process_block(
     pass_lines:        list,
     instructions:      list,
@@ -1014,6 +1102,7 @@ def _process_block(
     out,
     verbose:           bool = False,
     is_function_entry: bool = False,
+    block_live_in:     frozenset = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -1038,8 +1127,13 @@ def _process_block(
     is_function_entry
         True when this block begins immediately after a globally-visible label
         (a function entry point).  When set, the ABI argument registers
-        ``a0–a7`` (``x10–x17``) are treated as live-in so the renamer never
-        picks them as free rename targets.
+        ``a0–a7`` (``x10–x17``) are added to the live-in set so the renamer
+        never picks them as free rename targets.
+    block_live_in
+        Additional registers known to be live on entry to this block from
+        cross-block ABI analysis.  Merged with any function-entry live-in.
+        Typically ``_ABI_RETURN_SITE_LIVE_IN`` when the preceding block ended
+        with a call instruction.
     """
     # Flush leading pass-through text.
     for line in pass_lines:
@@ -1070,22 +1164,13 @@ def _process_block(
         pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
 
     if rename:
-        # Determine ABI-mandated live-out and live-in sets for this block.
-        #
-        # live_out: if the last real instruction is a ret, the return-value
-        #   registers a0/a1 (x10/x11) must be treated as live even if not
-        #   read within the block.  Without this the renamer could rename a
-        #   def of a0 to a temp, silently corrupting the return value.
-        #
-        # live_in: if this block is a function entry, a0–a7 (x10–x17) are
-        #   live-in per the RISC-V calling convention.  The renamer must not
-        #   pick them as free rename targets even if the block never reads them.
-        abi_live_out = (
-            _ABI_RETURN_REGS
-            if real_scheduled and real_scheduled[-1].mnemonic == "ret"
-            else frozenset()
-        )
-        abi_live_in = _ABI_ARG_REGS if is_function_entry else frozenset()
+        # Determine ABI-mandated live-out and live-in sets for this block
+        # from the terminal instruction's calling-convention semantics.
+        abi_live_out, _ = _abi_liveness_for_terminal(real_scheduled)
+        abi_live_in     = _ABI_ARG_REGS if is_function_entry else frozenset()
+        # Merge with any cross-block live-in provided by the caller (e.g.
+        # the return-site live-in from the preceding call block).
+        abi_live_in = abi_live_in | block_live_in
 
         real_scheduled = rename_destinations(
             real_scheduled, graph, pair_score,
@@ -1315,10 +1400,15 @@ class AssemblyScheduler:
         # visible (function-entry) label.  Propagated to _process_block so the
         # renamer can treat a0–a7 as live-in.
         current_block_is_entry: bool = False
+        # ABI-derived live-in set for the block currently being accumulated,
+        # computed from the terminal instruction of the *preceding* block.
+        # Forwarded to _process_block so the renamer knows which registers
+        # survive a call at the preceding block boundary.
+        current_block_live_in: frozenset = frozenset()
 
         def _flush_block():
             """Process and emit the accumulated block, then reset state."""
-            nonlocal last_sentinel_idx, current_block_is_entry
+            nonlocal last_sentinel_idx, current_block_is_entry, current_block_live_in
             st = _process_block(
                 pass_lines         = pass_lines,
                 instructions       = instructions,
@@ -1328,6 +1418,7 @@ class AssemblyScheduler:
                 out                = out,
                 verbose            = verbose,
                 is_function_entry  = current_block_is_entry,
+                block_live_in      = current_block_live_in,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1336,6 +1427,7 @@ class AssemblyScheduler:
             sentinel_texts.clear()
             last_sentinel_idx      = None
             current_block_is_entry = False
+            current_block_live_in  = frozenset()
 
         def _route_pass(line: str) -> None:
             """
@@ -1366,10 +1458,20 @@ class AssemblyScheduler:
             output stream is flushed after the preceding block is emitted so
             that each function's output is written promptly.  The new block is
             marked as a function entry so the renamer treats a0–a7 as live-in.
+
+            The terminal instruction of the block being flushed is inspected to
+            derive the ABI live-in set for the incoming block (e.g. after a
+            ``call`` the return-site block inherits callee-saved + a0/a1).
             """
-            nonlocal instr_index, last_sentinel_idx, current_block_is_entry
+            nonlocal instr_index, last_sentinel_idx
+            nonlocal current_block_is_entry, current_block_live_in
             is_entry = label_name in globally_visible
-            # Flush: inter-block trailing_pass becomes next block's preamble.
+
+            # Compute next-block live-in from the terminal of the block we're
+            # about to flush, before the instructions list is cleared.
+            real_instrs = [i for i in instructions if i.mnemonic != _SENTINEL_MN]
+            _, next_live_in = _abi_liveness_for_terminal(real_instrs)
+
             st = _process_block(
                 pass_lines         = pass_lines,
                 instructions       = instructions,
@@ -1379,6 +1481,7 @@ class AssemblyScheduler:
                 out                = out,
                 verbose            = verbose,
                 is_function_entry  = current_block_is_entry,
+                block_live_in      = current_block_live_in,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1394,8 +1497,10 @@ class AssemblyScheduler:
                 out.flush()
 
             # The new block that starts here is a function entry if its opening
-            # label is globally visible.
+            # label is globally visible.  Its live-in comes from the ABI
+            # analysis of the preceding block's terminal instruction.
             current_block_is_entry = is_entry
+            current_block_live_in  = next_live_in
 
             sentinel = Instruction(index=instr_index, raw="", mnemonic=_SENTINEL_MN)
             sentinel.is_barrier = True
