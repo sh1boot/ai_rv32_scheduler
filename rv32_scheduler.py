@@ -1,890 +1,36 @@
+
 """
 rv32_scheduler.py
 
-Reads RV32 assembly, builds a dependency graph respecting:
-  - RAW / WAW / WAR register hazards (integer AND floating-point registers)
-  - Memory ordering (loads/stores preserve relative order)
-  - Atomic ordering (AMO instructions are treated as memory barriers)
-  - CSR hazards (reads/writes to the same CSR are ordered)
-  - Vector register hazards (v0-v31)
-
-Supported extensions
---------------------
-  I   Base integer
-  M   Multiply / divide
-  A   Atomics
-  F   Single-precision floating-point
-  D   Double-precision floating-point
-  Q   Quad-precision floating-point
-  C   Compressed instructions  (16-bit; decoded to canonical names)
-  Zicsr   CSR access instructions
-  Zifencei  fence.i
-  Zba / Zbb / Zbc / Zbs  Bit-manipulation (B-extension subsets)
-  V   Vector (RVV 1.0)
-
-The scheduler exposes a hook -- pair_score(instr_a, instr_b) -> float --
-that an external optimiser can override to bias instruction placement.
+RV32 instruction scheduler: reads assembly source (or objdump -d output),
+reorders instructions within basic blocks to maximise pairing opportunities,
+and emits the reordered assembly with PAIR+ annotations.
 
 Usage
 -----
-    python rv32_scheduler.py input.s            # print reordered assembly
-    python rv32_scheduler.py input.s -v         # also dump dep-graph to stderr
-    python rv32_scheduler.py -                  # read from stdin
+    python rv32_scheduler.py input.s
+    python rv32_scheduler.py input.s --scorer compact32
+    python rv32_scheduler.py input.s --scorer compact32 --opcode-tally
+    python rv32_scheduler.py input.s --no-rename -v
+    python rv32_scheduler.py --list-rules
+    python rv32_scheduler.py -          # read from stdin
 
-Python API
-----------
-    from rv32_scheduler import AssemblyScheduler, Instruction
-
-    def my_score(a: Instruction, b: Instruction) -> float:
-        if a.mnemonic == "fmul.s" and b.mnemonic == "fadd.s":
-            return 5.0
-        return 0.0
-
-    sched = AssemblyScheduler(open("loop.s").read())
-    print(sched.emit(pair_score=my_score))
+Also accepts objdump -d output directly:
+    objdump -d binary | python rv32_scheduler.py -
 """
-
-import re
-import sys
-import argparse
-from collections import defaultdict
+import re, io, sys, copy, argparse
+from collections import defaultdict, Counter
 from dataclasses import dataclass, field
-from typing import Optional, Callable
-
-# ---------------------------------------------------------------------------
-# Register name tables
-# ---------------------------------------------------------------------------
-
-_INT_ABI: dict = {
-    "zero": "x0", "ra": "x1", "sp": "x2", "gp": "x3", "tp": "x4",
-    "t0": "x5", "t1": "x6", "t2": "x7",
-    "s0": "x8", "fp": "x8", "s1": "x9",
-    "a0": "x10", "a1": "x11", "a2": "x12", "a3": "x13",
-    "a4": "x14", "a5": "x15", "a6": "x16", "a7": "x17",
-    "s2": "x18", "s3": "x19", "s4": "x20", "s5": "x21",
-    "s6": "x22", "s7": "x23", "s8": "x24", "s9": "x25",
-    "s10": "x26", "s11": "x27",
-    "t3": "x28", "t4": "x29", "t5": "x30", "t6": "x31",
-}
-
-_FP_ABI: dict = {
-    "ft0": "f0",  "ft1": "f1",  "ft2": "f2",  "ft3": "f3",
-    "ft4": "f4",  "ft5": "f5",  "ft6": "f6",  "ft7": "f7",
-    "fs0": "f8",  "fs1": "f9",
-    "fa0": "f10", "fa1": "f11",
-    "fa2": "f12", "fa3": "f13", "fa4": "f14", "fa5": "f15",
-    "fa6": "f16", "fa7": "f17",
-    "fs2": "f18", "fs3": "f19", "fs4": "f20", "fs5": "f21",
-    "fs6": "f22", "fs7": "f23", "fs8": "f24", "fs9": "f25",
-    "fs10": "f26", "fs11": "f27",
-    "ft8": "f28", "ft9": "f29", "ft10": "f30", "ft11": "f31",
-}
-
-
-def _normalise_reg(name: str) -> str:
-    s = name.lower().strip().rstrip(",").rstrip(")").strip()
-    if s in _INT_ABI:
-        return _INT_ABI[s]
-    if s in _FP_ABI:
-        return _FP_ABI[s]
-    return s
-
-
-def _is_reg_token(tok: str) -> bool:
-    t = tok.lower().strip().rstrip(",")
-    if t in _INT_ABI or t in _FP_ABI:
-        return True
-    return bool(re.match(r"^[xfv]\d{1,2}$", t))
-
-
-# ---------------------------------------------------------------------------
-# ISA opcode tables
-# ---------------------------------------------------------------------------
-# mnemonic -> (def_slot, (use_slot, ...))
-#
-# Slot keys: rd/fd/vd  rs1/rs2  fs1/fs2/fs3  vs1/vs2/vs3
-#            mem_base  csr  (imm/label slots are consumed but not tracked)
-
-_I = {
-    "add":   ("rd", ("rs1","rs2")), "sub":   ("rd", ("rs1","rs2")),
-    "sll":   ("rd", ("rs1","rs2")), "slt":   ("rd", ("rs1","rs2")),
-    "sltu":  ("rd", ("rs1","rs2")), "xor":   ("rd", ("rs1","rs2")),
-    "srl":   ("rd", ("rs1","rs2")), "sra":   ("rd", ("rs1","rs2")),
-    "or":    ("rd", ("rs1","rs2")), "and":   ("rd", ("rs1","rs2")),
-    "addi":  ("rd", ("rs1",)),      "slti":  ("rd", ("rs1",)),
-    "sltiu": ("rd", ("rs1",)),      "xori":  ("rd", ("rs1",)),
-    "ori":   ("rd", ("rs1",)),      "andi":  ("rd", ("rs1",)),
-    "slli":  ("rd", ("rs1",)),      "srli":  ("rd", ("rs1",)),
-    "srai":  ("rd", ("rs1",)),
-    "lui":   ("rd", ()),            "auipc": ("rd", ()),
-    "jal":   ("rd", ()),            "jalr":  ("rd", ("rs1",)),
-    "beq":   (None, ("rs1","rs2")), "bne":   (None, ("rs1","rs2")),
-    "blt":   (None, ("rs1","rs2")), "bge":   (None, ("rs1","rs2")),
-    "bltu":  (None, ("rs1","rs2")), "bgeu":  (None, ("rs1","rs2")),
-    "lb":    ("rd",  ("mem_base",)), "lh":   ("rd",  ("mem_base",)),
-    "lw":    ("rd",  ("mem_base",)), "lbu":  ("rd",  ("mem_base",)),
-    "lhu":   ("rd",  ("mem_base",)),
-    "sb":    (None, ("rs1","mem_base")),
-    "sh":    (None, ("rs1","mem_base")),
-    "sw":    (None, ("rs1","mem_base")),
-    # ── Pseudo-instructions ──────────────────────────────────────────────
-    # These are assembler aliases for base instructions.  They are decoded
-    # here so that the dependency analyser sees their actual register usage
-    # rather than treating them as barriers.
-    "beqz":  (None, ("rs1",)),      # beq  rs, x0, label
-    "bnez":  (None, ("rs1",)),      # bne  rs, x0, label
-    "blez":  (None, ("rs1",)),      # bge  x0, rs, label
-    "bgez":  (None, ("rs1",)),      # bge  rs, x0, label
-    "bltz":  (None, ("rs1",)),      # blt  rs, x0, label
-    "bgtz":  (None, ("rs1",)),      # blt  x0, rs, label
-    "mv":    ("rd",  ("rs1",)),     # addi rd, rs, 0
-    "not":   ("rd",  ("rs1",)),     # xori rd, rs, -1
-    "neg":   ("rd",  ("rs1",)),     # sub  rd, x0, rs
-    "negw":  ("rd",  ("rs1",)),     # subw rd, x0, rs
-    "seqz":  ("rd",  ("rs1",)),     # sltiu rd, rs, 1
-    "snez":  ("rd",  ("rs1",)),     # sltu  rd, x0, rs
-    "sltz":  ("rd",  ("rs1",)),     # slt   rd, rs, x0
-    "sgtz":  ("rd",  ("rs1",)),     # slt   rd, x0, rs
-    "sext.w":("rd",  ("rs1",)),     # addiw rd, rs, 0
-    "zext.b":("rd",  ("rs1",)),     # andi  rd, rs, 255
-    "nop":   (None,  ()),           # addi  x0, x0, 0
-    "ret":   (None,  ("rs1",)),     # jalr  x0, x1, 0  (uses ra)
-    "li":    ("rd",  ()),           # lui+addi or addi — dest only, imm is immediate
-    "la":    ("rd",  ()),           # auipc+addi — dest only
-    "j":     (None,  ()),           # jal x0, label
-    "jr":    (None,  ("rs1",)),     # jalr x0, rs, 0
-    "call":  ("rd",  ()),           # auipc+jalr — writes ra (x1); treated conservatively
-    "tail":  (None,  ()),           # auipc+jalr x0 — no dest
-}
-
-_M = {
-    "mul":    ("rd", ("rs1","rs2")), "mulh":   ("rd", ("rs1","rs2")),
-    "mulhsu": ("rd", ("rs1","rs2")), "mulhu":  ("rd", ("rs1","rs2")),
-    "div":    ("rd", ("rs1","rs2")), "divu":   ("rd", ("rs1","rs2")),
-    "rem":    ("rd", ("rs1","rs2")), "remu":   ("rd", ("rs1","rs2")),
-}
-
-_A = {
-    "lr.w":      ("rd", ("rs1",)),
-    "sc.w":      ("rd", ("rs1","rs2")),
-    "amoswap.w": ("rd", ("rs1","rs2")), "amoadd.w":  ("rd", ("rs1","rs2")),
-    "amoand.w":  ("rd", ("rs1","rs2")), "amoor.w":   ("rd", ("rs1","rs2")),
-    "amoxor.w":  ("rd", ("rs1","rs2")), "amomax.w":  ("rd", ("rs1","rs2")),
-    "amomin.w":  ("rd", ("rs1","rs2")), "amomaxu.w": ("rd", ("rs1","rs2")),
-    "amominu.w": ("rd", ("rs1","rs2")),
-}
-
-_F = {
-    "flw":      ("fd",  ("mem_base",)), "fsw":      (None, ("fs1","mem_base")),
-    "fadd.s":   ("fd",  ("fs1","fs2")), "fsub.s":   ("fd",  ("fs1","fs2")),
-    "fmul.s":   ("fd",  ("fs1","fs2")), "fdiv.s":   ("fd",  ("fs1","fs2")),
-    "fsqrt.s":  ("fd",  ("fs1",)),      "fmin.s":   ("fd",  ("fs1","fs2")),
-    "fmax.s":   ("fd",  ("fs1","fs2")),
-    "fmadd.s":  ("fd",  ("fs1","fs2","fs3")),
-    "fmsub.s":  ("fd",  ("fs1","fs2","fs3")),
-    "fnmsub.s": ("fd",  ("fs1","fs2","fs3")),
-    "fnmadd.s": ("fd",  ("fs1","fs2","fs3")),
-    "fsgnj.s":  ("fd",  ("fs1","fs2")), "fsgnjn.s": ("fd",  ("fs1","fs2")),
-    "fsgnjx.s": ("fd",  ("fs1","fs2")),
-    "fcvt.w.s":  ("rd", ("fs1",)),      "fcvt.wu.s": ("rd", ("fs1",)),
-    "fcvt.s.w":  ("fd", ("rs1",)),      "fcvt.s.wu": ("fd", ("rs1",)),
-    "fmv.x.w":  ("rd",  ("fs1",)),      "fmv.w.x":  ("fd",  ("rs1",)),
-    "feq.s":    ("rd",  ("fs1","fs2")), "flt.s":    ("rd",  ("fs1","fs2")),
-    "fle.s":    ("rd",  ("fs1","fs2")), "fclass.s": ("rd",  ("fs1",)),
-}
-
-_D = {
-    "fld":       ("fd",  ("mem_base",)), "fsd":       (None,  ("fs1","mem_base")),
-    "fadd.d":    ("fd",  ("fs1","fs2")), "fsub.d":    ("fd",  ("fs1","fs2")),
-    "fmul.d":    ("fd",  ("fs1","fs2")), "fdiv.d":    ("fd",  ("fs1","fs2")),
-    "fsqrt.d":   ("fd",  ("fs1",)),      "fmin.d":    ("fd",  ("fs1","fs2")),
-    "fmax.d":    ("fd",  ("fs1","fs2")),
-    "fmadd.d":   ("fd",  ("fs1","fs2","fs3")),
-    "fmsub.d":   ("fd",  ("fs1","fs2","fs3")),
-    "fnmsub.d":  ("fd",  ("fs1","fs2","fs3")),
-    "fnmadd.d":  ("fd",  ("fs1","fs2","fs3")),
-    "fsgnj.d":   ("fd",  ("fs1","fs2")), "fsgnjn.d":  ("fd",  ("fs1","fs2")),
-    "fsgnjx.d":  ("fd",  ("fs1","fs2")),
-    "fcvt.s.d":  ("fd",  ("fs1",)),      "fcvt.d.s":  ("fd",  ("fs1",)),
-    "fcvt.w.d":  ("rd",  ("fs1",)),      "fcvt.wu.d": ("rd",  ("fs1",)),
-    "fcvt.d.w":  ("fd",  ("rs1",)),      "fcvt.d.wu": ("fd",  ("rs1",)),
-    "fmv.x.d":   ("rd",  ("fs1",)),      "fmv.d.x":   ("fd",  ("rs1",)),
-    "feq.d":     ("rd",  ("fs1","fs2")), "flt.d":     ("rd",  ("fs1","fs2")),
-    "fle.d":     ("rd",  ("fs1","fs2")), "fclass.d":  ("rd",  ("fs1",)),
-}
-
-_Q = {
-    "flq":       ("fd",  ("mem_base",)), "fsq":       (None,  ("fs1","mem_base")),
-    "fadd.q":    ("fd",  ("fs1","fs2")), "fsub.q":    ("fd",  ("fs1","fs2")),
-    "fmul.q":    ("fd",  ("fs1","fs2")), "fdiv.q":    ("fd",  ("fs1","fs2")),
-    "fsqrt.q":   ("fd",  ("fs1",)),      "fmin.q":    ("fd",  ("fs1","fs2")),
-    "fmax.q":    ("fd",  ("fs1","fs2")),
-    "fmadd.q":   ("fd",  ("fs1","fs2","fs3")),
-    "fmsub.q":   ("fd",  ("fs1","fs2","fs3")),
-    "fnmsub.q":  ("fd",  ("fs1","fs2","fs3")),
-    "fnmadd.q":  ("fd",  ("fs1","fs2","fs3")),
-    "fsgnj.q":   ("fd",  ("fs1","fs2")), "fsgnjn.q":  ("fd",  ("fs1","fs2")),
-    "fsgnjx.q":  ("fd",  ("fs1","fs2")),
-    "fcvt.s.q":  ("fd",  ("fs1",)),      "fcvt.q.s":  ("fd",  ("fs1",)),
-    "fcvt.d.q":  ("fd",  ("fs1",)),      "fcvt.q.d":  ("fd",  ("fs1",)),
-    "fcvt.w.q":  ("rd",  ("fs1",)),      "fcvt.wu.q": ("rd",  ("fs1",)),
-    "fcvt.q.w":  ("fd",  ("rs1",)),      "fcvt.q.wu": ("fd",  ("rs1",)),
-    "feq.q":     ("rd",  ("fs1","fs2")), "flt.q":     ("rd",  ("fs1","fs2")),
-    "fle.q":     ("rd",  ("fs1","fs2")), "fclass.q":  ("rd",  ("fs1",)),
-}
-
-_ZICSR = {
-    "csrrw":  ("rd", ("rs1","csr")), "csrrs":  ("rd", ("rs1","csr")),
-    "csrrc":  ("rd", ("rs1","csr")),
-    "csrrwi": ("rd", ("csr",)),      "csrrsi": ("rd", ("csr",)),
-    "csrrci": ("rd", ("csr",)),
-}
-CSR_WRITERS = frozenset(_ZICSR)
-
-_B = {
-    "sh1add": ("rd", ("rs1","rs2")), "sh2add": ("rd", ("rs1","rs2")),
-    "sh3add": ("rd", ("rs1","rs2")),
-    "andn":   ("rd", ("rs1","rs2")), "orn":    ("rd", ("rs1","rs2")),
-    "xnor":   ("rd", ("rs1","rs2")),
-    "clz":    ("rd", ("rs1",)),      "ctz":    ("rd", ("rs1",)),
-    "cpop":   ("rd", ("rs1",)),
-    "max":    ("rd", ("rs1","rs2")), "maxu":   ("rd", ("rs1","rs2")),
-    "min":    ("rd", ("rs1","rs2")), "minu":   ("rd", ("rs1","rs2")),
-    "sext.b": ("rd", ("rs1",)),      "sext.h": ("rd", ("rs1",)),
-    "zext.h": ("rd", ("rs1",)),
-    "rol":    ("rd", ("rs1","rs2")), "ror":    ("rd", ("rs1","rs2")),
-    "rori":   ("rd", ("rs1",)),
-    "orc.b":  ("rd", ("rs1",)),      "rev8":   ("rd", ("rs1",)),
-    "clmul":  ("rd", ("rs1","rs2")), "clmulh": ("rd", ("rs1","rs2")),
-    "clmulr": ("rd", ("rs1","rs2")),
-    "bclr":   ("rd", ("rs1","rs2")), "bclri":  ("rd", ("rs1",)),
-    "bext":   ("rd", ("rs1","rs2")), "bexti":  ("rd", ("rs1",)),
-    "binv":   ("rd", ("rs1","rs2")), "binvi":  ("rd", ("rs1",)),
-    "bset":   ("rd", ("rs1","rs2")), "bseti":  ("rd", ("rs1",)),
-}
-
-_V = {
-    "vadd.vv": ("vd",("vs1","vs2")),  "vadd.vx": ("vd",("vs1","rs1")),
-    "vadd.vi": ("vd",("vs1",)),
-    "vsub.vv": ("vd",("vs1","vs2")),  "vsub.vx": ("vd",("vs1","rs1")),
-    "vrsub.vx":("vd",("vs1","rs1")),  "vrsub.vi":("vd",("vs1",)),
-    "vmul.vv": ("vd",("vs1","vs2")),  "vmul.vx": ("vd",("vs1","rs1")),
-    "vmulh.vv":("vd",("vs1","vs2")),  "vmulh.vx":("vd",("vs1","rs1")),
-    "vdiv.vv": ("vd",("vs1","vs2")),  "vdiv.vx": ("vd",("vs1","rs1")),
-    "vrem.vv": ("vd",("vs1","vs2")),  "vrem.vx": ("vd",("vs1","rs1")),
-    "vand.vv": ("vd",("vs1","vs2")),  "vand.vx": ("vd",("vs1","rs1")),
-    "vand.vi": ("vd",("vs1",)),
-    "vor.vv":  ("vd",("vs1","vs2")),  "vor.vx":  ("vd",("vs1","rs1")),
-    "vor.vi":  ("vd",("vs1",)),
-    "vxor.vv": ("vd",("vs1","vs2")),  "vxor.vx": ("vd",("vs1","rs1")),
-    "vxor.vi": ("vd",("vs1",)),
-    "vsll.vv": ("vd",("vs1","vs2")),  "vsll.vx": ("vd",("vs1","rs1")),
-    "vsll.vi": ("vd",("vs1",)),
-    "vsrl.vv": ("vd",("vs1","vs2")),  "vsrl.vx": ("vd",("vs1","rs1")),
-    "vsrl.vi": ("vd",("vs1",)),
-    "vsra.vv": ("vd",("vs1","vs2")),  "vsra.vx": ("vd",("vs1","rs1")),
-    "vsra.vi": ("vd",("vs1",)),
-    "vfadd.vv":("vd",("vs1","vs2")),  "vfadd.vf":("vd",("vs1","fs1")),
-    "vfsub.vv":("vd",("vs1","vs2")),  "vfsub.vf":("vd",("vs1","fs1")),
-    "vfmul.vv":("vd",("vs1","vs2")),  "vfmul.vf":("vd",("vs1","fs1")),
-    "vfdiv.vv":("vd",("vs1","vs2")),  "vfdiv.vf":("vd",("vs1","fs1")),
-    "vfsqrt.v":("vd",("vs1",)),
-    "vfmadd.vv":("vd",("vs1","vs2")), "vfmadd.vf":("vd",("vs1","fs1")),
-    "vfmsub.vv":("vd",("vs1","vs2")), "vfmsub.vf":("vd",("vs1","fs1")),
-    "vfnmadd.vv":("vd",("vs1","vs2")),"vfnmadd.vf":("vd",("vs1","fs1")),
-    "vfnmsub.vv":("vd",("vs1","vs2")),"vfnmsub.vf":("vd",("vs1","fs1")),
-    "vle8.v":  ("vd",("rs1",)),       "vle16.v": ("vd",("rs1",)),
-    "vle32.v": ("vd",("rs1",)),       "vle64.v": ("vd",("rs1",)),
-    "vse8.v":  (None,("vs1","rs1")),  "vse16.v": (None,("vs1","rs1")),
-    "vse32.v": (None,("vs1","rs1")),  "vse64.v": (None,("vs1","rs1")),
-    "vmv.v.v": ("vd",("vs1",)),       "vmv.v.x": ("vd",("rs1",)),
-    "vmv.v.i": ("vd",()),             "vmv.x.s": ("rd",("vs1",)),
-    "vmv.s.x": ("vd",("rs1",)),
-    "vsetvli": ("rd",("rs1",)),       "vsetivli":("rd",()),
-    "vsetvl":  ("rd",("rs1","rs2")),
-    "vredsum.vs":("vd",("vs1","vs2")),"vredmax.vs":("vd",("vs1","vs2")),
-    "vredmin.vs":("vd",("vs1","vs2")),"vredand.vs":("vd",("vs1","vs2")),
-    "vredor.vs": ("vd",("vs1","vs2")),"vredxor.vs":("vd",("vs1","vs2")),
-    "vfredsum.vs":("vd",("vs1","vs2")),"vfredmax.vs":("vd",("vs1","vs2")),
-    "vfredmin.vs":("vd",("vs1","vs2")),
-    "vmand.mm":("vd",("vs1","vs2")),  "vmor.mm": ("vd",("vs1","vs2")),
-    "vmxor.mm":("vd",("vs1","vs2")),  "vmnand.mm":("vd",("vs1","vs2")),
-    "vmnor.mm":("vd",("vs1","vs2")),  "vmxnor.mm":("vd",("vs1","vs2")),
-    "vmnot.m": ("vd",("vs1",)),
-    "vslideup.vx":   ("vd",("vs1","rs1")), "vslideup.vi":   ("vd",("vs1",)),
-    "vslidedown.vx": ("vd",("vs1","rs1")), "vslidedown.vi": ("vd",("vs1",)),
-    "vslide1up.vx":  ("vd",("vs1","rs1")), "vslide1down.vx":("vd",("vs1","rs1")),
-    "vmseq.vv":("vd",("vs1","vs2")),  "vmseq.vx":("vd",("vs1","rs1")),
-    "vmseq.vi":("vd",("vs1",)),       "vmsne.vv":("vd",("vs1","vs2")),
-    "vmsne.vx":("vd",("vs1","rs1")),  "vmsne.vi":("vd",("vs1",)),
-    "vmsltu.vv":("vd",("vs1","vs2")), "vmsltu.vx":("vd",("vs1","rs1")),
-    "vmslt.vv":("vd",("vs1","vs2")),  "vmslt.vx":("vd",("vs1","rs1")),
-    "vmsleu.vv":("vd",("vs1","vs2")), "vmsleu.vx":("vd",("vs1","rs1")),
-    "vmsle.vv":("vd",("vs1","vs2")),  "vmsle.vx":("vd",("vs1","rs1")),
-    "vmsgtu.vx":("vd",("vs1","rs1")), "vmsgt.vx":("vd",("vs1","rs1")),
-    "vfcvt.xu.f.v":("vd",("vs1",)),  "vfcvt.x.f.v":("vd",("vs1",)),
-    "vfcvt.f.xu.v":("vd",("vs1",)),  "vfcvt.f.x.v":("vd",("vs1",)),
-}
-
-ALL_TABLES: dict = {**_I, **_M, **_A, **_F, **_D, **_Q, **_ZICSR, **_B, **_V}
-
-BARRIERS = frozenset({
-    "fence", "fence.i", "ecall", "ebreak",
-    "vsetvli", "vsetivli", "vsetvl",
-})
-_AMO_PREFIXES = ("lr.", "sc.", "amo")
-_LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
-                    {k for k in _V if k.startswith("vle")})
-_STORES = frozenset({"sb","sh","sw","fsw","fsd","fsq"} |
-                    {k for k in _V if k.startswith("vse")})
-_AMO_SUFFIX_RE = re.compile(r"\.(aq|rl|aqrl)$")
-
-# C-extension: 2-operand compressed form where rd is also implicit rs1.
-# c.add rd, rs2  =>  add rd, rd, rs2
-_C_ALIASES: dict = {
-    "c.add":"add",    "c.addi":"addi",  "c.addi16sp":"addi",
-    "c.addi4spn":"addi", "c.and":"and", "c.andi":"andi",
-    "c.beqz":"beq",   "c.bnez":"bne",  "c.ebreak":"ebreak",
-    "c.j":"jal",      "c.jal":"jal",   "c.jalr":"jalr",   "c.jr":"jalr",
-    "c.li":"addi",    "c.lui":"lui",   "c.lw":"lw",       "c.lwsp":"lw",
-    "c.mv":"add",     "c.nop":"addi",  "c.or":"or",
-    "c.slli":"slli",  "c.srai":"srai", "c.srli":"srli",
-    "c.sub":"sub",    "c.sw":"sw",     "c.swsp":"sw",      "c.xor":"xor",
-}
-
-
-# ---------------------------------------------------------------------------
-# Instruction dataclass
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Instruction:
-    index:    int
-    raw:      str
-    mnemonic: str
-    operands:  list = field(default_factory=list)
-    defs:      list = field(default_factory=list)
-    uses:      list = field(default_factory=list)
-    csr_defs:  list = field(default_factory=list)
-    csr_uses:  list = field(default_factory=list)
-    is_load:    bool = False
-    is_store:   bool = False
-    is_amo:     bool = False
-    is_barrier: bool = False
-    is_branch:  bool = False   # conditional/unconditional branch or jump
-    # Cached decoded values — populated by parse_line, used by scorer rules
-    # to avoid re-parsing raw strings on every scorer call.
-    imm:        object = None  # int immediate if present, else None
-    mem:        object = None  # (offset:int, base:str) for load/store, else None
-    dual_arith_ok:       bool = False  # satisfies _dual_arith_ok() constraints
-    dual_arith_chain_ok: bool = False  # satisfies _dual_arith_ok(allow_chain_reg=True) and defs x31
-
-    def __repr__(self):
-        return f"I{self.index}:{self.mnemonic}"
-
-
-# ---------------------------------------------------------------------------
-# Operand decoder
-# ---------------------------------------------------------------------------
-
-def _mem_base(operand: str):
-    m = re.match(r"[^(]*\(([^)]+)\)", operand)
-    return _normalise_reg(m.group(1)) if m else None
-
-
-def _strip_vec_mask(operand: str):
-    s = operand.strip().rstrip(",")
-    return "v0" if s in ("v0.t", "v0") else None
-
-
-def _decode_operands(mnemonic, pat_def, pat_uses, ops):
-    defs, uses, csr_defs, csr_uses = [], [], [], []
-
-    mask_reg = None
-    if ops and _strip_vec_mask(ops[-1]) is not None:
-        mask_reg = _strip_vec_mask(ops[-1])
-        ops = ops[:-1]
-
-    it = iter(ops)
-    def nxt():
-        try: return next(it)
-        except StopIteration: return None
-
-    if pat_def is not None:
-        tok = nxt()
-        if tok is None:
-            return defs, uses, csr_defs, csr_uses
-        reg = _normalise_reg(tok)
-        if pat_def in ("rd","fd","vd") and reg != "x0":
-            defs.append(reg)
-
-    for slot in pat_uses:
-        tok = nxt()
-        if tok is None:
-            break
-        if slot == "mem_base":
-            base = _mem_base(tok)
-            if base: uses.append(base)
-        elif slot == "csr":
-            csr_id = f"csr:{tok.lower()}"
-            csr_uses.append(csr_id)
-            if mnemonic in CSR_WRITERS:
-                csr_defs.append(csr_id)
-        elif slot in ("rs1","rs2","fs1","fs2","fs3","vs1","vs2","vs3"):
-            uses.append(_normalise_reg(tok))
-
-    if mask_reg:
-        uses.append(mask_reg)
-    uses = [r for r in uses if r != "x0"]
-    return defs, uses, csr_defs, csr_uses
-
-
-# ---------------------------------------------------------------------------
-# Line parser
-# ---------------------------------------------------------------------------
-
-def parse_line(index: int, line: str):
-    stripped = line.strip()
-    if (not stripped
-            or stripped.startswith(("#",";","//"))
-            or stripped.startswith(".")
-            or re.match(r"^\w+\s*:", stripped)):
-        return None
-
-    code = re.split(r"[#;]", stripped)[0].strip()
-    if not code:
-        return None
-
-    tokens = code.split()
-    raw_mn = tokens[0].lower()
-
-    is_c_insn = raw_mn in _C_ALIASES
-    mnemonic  = _C_ALIASES.get(raw_mn, raw_mn)
-    mnemonic  = _AMO_SUFFIX_RE.sub("", mnemonic)
-
-    ops = [p.strip() for p in " ".join(tokens[1:]).split(",") if p.strip()]
-
-    # C-extension implicit rs1=rd expansion for 2-operand compressed forms
-    if is_c_insn and len(ops) == 2 and mnemonic in ALL_TABLES:
-        pat_def, pat_uses = ALL_TABLES[mnemonic]
-        if (pat_def in ("rd","fd")
-                and pat_uses and pat_uses[0] in ("rs1","fs1")):
-            ops = [ops[0], ops[0]] + ops[1:]
-
-    instr = Instruction(index=index, raw=line, mnemonic=mnemonic, operands=ops)
-    instr.is_load    = mnemonic in _LOADS
-    instr.is_store   = mnemonic in _STORES
-    instr.is_amo     = any(mnemonic.startswith(p) for p in _AMO_PREFIXES)
-    instr.is_barrier = mnemonic in BARRIERS or instr.is_amo
-
-    # Branches and jumps must be scheduled after all instructions that
-    # precede them in the original basic block.  They are NOT full barriers:
-    # they don't prevent reordering among instructions that follow them
-    # (there normally aren't any in a basic block).
-    _BRANCH_MNEMONICS = frozenset({
-        "beq", "bne", "blt", "bge", "bltu", "bgeu",
-        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
-        "jal", "jalr", "j", "jr",
-    })
-    instr.is_branch = mnemonic in _BRANCH_MNEMONICS
-
-    if mnemonic not in ALL_TABLES:
-        instr.is_barrier = True
-        instr.uses = [_normalise_reg(t.rstrip(",")) for t in tokens[1:]
-                      if _is_reg_token(t)]
-        return instr
-
-    pat_def, pat_uses = ALL_TABLES[mnemonic]
-    defs, uses, csr_defs, csr_uses = _decode_operands(mnemonic, pat_def, pat_uses, ops)
-    instr.defs, instr.uses = defs, uses
-    instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
-
-    # call/tail are multi-instruction pseudo-ops (auipc + jalr) that may
-    # clobber any caller-saved register and cross arbitrary call boundaries.
-    # ret is jalr x0, ra, 0 — ends a function, nothing meaningful after it.
-    # Treat all three as barriers so nothing reorders past them.
-    if mnemonic in ("call", "tail", "ret"):
-        instr.is_barrier = True
-
-    # ── Cache immediate and memory operand ───────────────────────────────
-    # Populate once at parse time so scorer rules don't have to re-parse
-    # raw strings (which involves regex) on every pair_score() call.
-    _IMM_RE  = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)$")
-    _MEM_RE  = re.compile(r"\s*(-?\d+)\s*\(([^)]+)\)")
-    # Immediate: last comma-separated token, if it's a plain integer literal
-    _code = re.split(r"[#;]", instr.raw)[0].strip()
-    _parts = _code.split(None, 1)
-    if len(_parts) >= 2:
-        _ops = [o.strip() for o in _parts[1].split(",")]
-        _last = _ops[-1].strip()
-        if _IMM_RE.fullmatch(_last):
-            try:
-                instr.imm = int(_last, 0)
-            except ValueError:
-                pass
-    # Memory operand: offset(base) form, present on loads and stores
-    if (instr.is_load or instr.is_store) and len(_parts) >= 2:
-        _ops2 = [o.strip() for o in _parts[1].split(",")]
-        # memory operand is the last operand for loads, second for stores
-        _mem_op = _ops2[-1]
-        _m = _MEM_RE.match(_mem_op)
-        if _m:
-            instr.mem = (int(_m.group(1)), _normalise_reg(_m.group(2).strip()))
-
-    # Pre-computation of dual-arith eligibility is deferred to
-    # _finalize_instruction() which is called right after this return.
-    # We can't call _dual_arith_ok here because it is defined later in the
-    # file, but Python resolves names at call time so calling via
-    # _finalize_instruction works fine.
-    _finalize_instruction(instr)
-    return instr
-
-
-def _finalize_instruction(instr: "Instruction") -> None:
-    """Populate fields that depend on functions defined after parse_line."""
-    instr.dual_arith_ok       = _dual_arith_ok(instr)
-    instr.dual_arith_chain_ok = (
-        _dual_arith_ok(instr, allow_chain_reg=True)
-        and bool(instr.defs) and instr.defs[0] == "x31"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Dependency graph
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DepGraph:
-    instructions: list
-    successors:   dict = field(default_factory=lambda: defaultdict(set))
-    predecessors: dict = field(default_factory=lambda: defaultdict(set))
-
-    def add_edge(self, before: int, after: int):
-        if before != after:
-            self.successors[before].add(after)
-            self.predecessors[after].add(before)
-
-    def in_degree(self) -> dict:
-        return {i.index: len(self.predecessors[i.index])
-                for i in self.instructions}
-
-
-def build_dep_graph(instructions: list) -> DepGraph:
-    graph = DepGraph(instructions=instructions)
-    last_writer: dict = {}
-    last_readers: dict = defaultdict(list)
-    last_csr_writer: dict = {}
-    last_csr_readers: dict = defaultdict(list)
-    mem_ops: list = []
-    last_barrier: int = -1
-
-    for instr in instructions:
-        idx = instr.index
-
-        if instr.is_barrier:
-            for prev in instructions:
-                if prev.index < idx:
-                    graph.add_edge(prev.index, idx)
-            last_barrier = idx
-            if instr.is_amo:
-                mem_ops.append(idx)
-
-        if instr.is_branch and not instr.is_barrier:
-            # Branch must come after every instruction that precedes it in
-            # the original sequence.  This prevents the scheduler from moving
-            # the branch earlier and skipping instructions that belong in the
-            # same basic block.  Unlike a full barrier, we do NOT set
-            # last_barrier, so instructions after the branch (if any) are not
-            # forced to follow it.
-            for prev in instructions:
-                if prev.index < idx:
-                    graph.add_edge(prev.index, idx)
-
-        if last_barrier >= 0 and last_barrier != idx:
-            graph.add_edge(last_barrier, idx)
-
-        for reg in instr.uses:
-            if reg in last_writer:
-                graph.add_edge(last_writer[reg], idx)
-        for reg in instr.defs:
-            for r in last_readers.get(reg, []):
-                graph.add_edge(r, idx)
-            if reg in last_writer:
-                graph.add_edge(last_writer[reg], idx)
-
-        for csr in instr.csr_uses:
-            if csr in last_csr_writer:
-                graph.add_edge(last_csr_writer[csr], idx)
-        for csr in instr.csr_defs:
-            for r in last_csr_readers.get(csr, []):
-                graph.add_edge(r, idx)
-            if csr in last_csr_writer:
-                graph.add_edge(last_csr_writer[csr], idx)
-
-        if (instr.is_load or instr.is_store) and not instr.is_amo:
-            if mem_ops:
-                graph.add_edge(mem_ops[-1], idx)
-            mem_ops.append(idx)
-
-        for reg in instr.defs:
-            last_writer[reg] = idx
-            last_readers[reg] = []
-        for reg in instr.uses:
-            last_readers[reg].append(idx)
-        for csr in instr.csr_defs:
-            last_csr_writer[csr] = idx
-            last_csr_readers[csr] = []
-        for csr in instr.csr_uses:
-            last_csr_readers[csr].append(idx)
-
-    return graph
-
-
-# ---------------------------------------------------------------------------
-# Liveness analysis
-# ---------------------------------------------------------------------------
-
-def compute_liveness(instructions: list) -> dict:
-    """
-    Perform a single backward pass over *instructions* (in original program
-    order) and return a dict mapping each instruction index to the set of
-    registers that are "last-used" by that instruction -- i.e. registers that
-    are read by the instruction and are not read again before being
-    overwritten (or before the end of the block).
-
-    A register is considered dead-after-use at instruction I when:
-      - I reads the register, AND
-      - No later instruction (in original order) reads it before the next
-        write to that register (or end-of-block).
-
-    The returned dict has the shape:
-        { instr_index: frozenset of register names }
-
-    Only tracks integer (x*) and floating-point (f*) architectural registers.
-    x0 is never reported as a last-use because it cannot hold a meaningful
-    value.
-
-    Example
-    -------
-        liveness = compute_liveness(graph.instructions)
-        for instr in scheduled:
-            dead = liveness[instr.index]
-            if dead:
-                print(f"  ; kills: {', '.join(sorted(dead))}")
-    """
-    # live_out[reg] = True  means the register is still needed by some
-    # later instruction.  We walk backward and clear it when we see a write.
-    live_out: dict = {}          # reg -> bool (currently live)
-    last_use: dict = {}          # instr_index -> set[reg]
-
-    for instr in reversed(instructions):
-        idx = instr.index
-        killed: set = set()
-
-        # Registers *defined* by this instruction become dead before this
-        # point (unless they're also used here, which can happen for e.g.
-        # c.add rd,rs2 where rd==rs1).
-        for reg in instr.defs:
-            live_out[reg] = False   # killed by this write
-
-        # Registers *used* by this instruction: if not already live from a
-        # later instruction, this is the last use.
-        for reg in instr.uses:
-            if reg == "x0":
-                continue
-            if not live_out.get(reg, False):
-                killed.add(reg)
-            live_out[reg] = True    # mark as live going upward
-
-        last_use[idx] = frozenset(killed)
-
-    return last_use
-
-
-# ---------------------------------------------------------------------------
-# Compressed-encoding eligibility
-# ---------------------------------------------------------------------------
-
-# RVC integer registers: x8-x15 (s0-s1, a0-a5)
-_CL_INT_REGS = frozenset(f"x{n}" for n in range(8, 16))
-# RVC float registers: f8-f15
-_CL_FP_REGS  = frozenset(f"f{n}" for n in range(8, 16))
-
-# Mnemonics that have a known 16-bit C-extension encoding on RV32C.
-# Derived from the RVC instruction listing (RISC-V ISA spec §12).
-# Note: we use the *canonical* (expanded) mnemonic, not the c.* prefix.
-_CAN_COMPRESS_MNEMONICS: frozenset = frozenset({
-    # CR format
-    "jalr",   # c.jr / c.jalr  (rd==x0 or rd!=x0, rs2==x0)
-    "add",    # c.add / c.mv
-    # CI format
-    "addi",   # c.addi / c.li / c.lui / c.addi16sp / c.addi4spn / c.nop
-    "lui",    # c.lui
-    "slli",   # c.slli
-    "lw",     # c.lwsp / c.lw
-    "flw",    # c.flwsp / c.flw   (F-extension)
-    "fld",    # c.fldsp / c.fld   (D-extension)
-    # CSS format
-    "sw",     # c.swsp / c.sw
-    "fsw",    # c.fswsp / c.fsw
-    "fsd",    # c.fsdsp / c.fsd
-    # CL/CS format -- subset of registers only
-    # (already covered by lw/sw/flw/fsw/fld/fsd above)
-    # CB / CJ format
-    "beq",    # c.beqz  (rs2 == x0)
-    "bne",    # c.bnez  (rs2 == x0)
-    "jal",    # c.jal / c.j
-    # CA format (CL register subset)
-    "sub",    # c.sub
-    "xor",    # c.xor
-    "or",     # c.or
-    "and",    # c.and
-    "srai",   # c.srai
-    "srli",   # c.srli
-    "andi",   # c.andi
-    # pseudo-instructions that assemble to compressed forms
-    "nop",    # c.nop
-    "ret",    # c.jr ra  ->  c.ret
-    "mv",     # c.mv
-})
-
-
-def can_compress(instr: "Instruction") -> bool:
-    """
-    Return True if *instr* is a candidate for a 16-bit RVC encoding.
-
-    This is a conservative static test: it checks the mnemonic and, where
-    the compressed form restricts the register set, the actual operand
-    registers.  It does NOT check immediate ranges (those are only known
-    after register allocation / final code-gen), so it may return True for
-    instructions that ultimately won't compress due to an out-of-range
-    immediate.
-
-    Checks performed
-    ----------------
-    * Mnemonic must appear in the RVC instruction set.
-    * For CA-format arithmetic (sub/xor/or/and/srai/srli/andi) both the
-      destination and the single source must be in the CL register set
-      (x8-x15).
-    * For CL/CS memory ops (lw/sw/flw/fsw/fld/fsd) using the 3-register
-      form, both rd/rs and the base must be in the CL register set.
-    * c.beqz / c.bnez require rs2 == x0.
-    * c.jr / c.jalr require rs2 == x0 (already true for jalr in the table,
-      but we accept either form).
-    * Loads/stores using the SP-based forms (lwsp/swsp etc.) are accepted
-      for any rd/rs when the base register is sp (x2).
-    """
-    mn = instr.mnemonic
-
-    if mn not in _CAN_COMPRESS_MNEMONICS:
-        return False
-
-    defs = instr.defs
-    uses = instr.uses
-
-    # CA-format: sub/xor/or/and require rd and rs2 in CL set
-    if mn in ("sub", "xor", "or", "and"):
-        rd  = defs[0] if defs else None
-        rs2 = uses[0] if uses else None
-        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS
-
-    # CB-format shifts: srai/srli/andi -- rd (==rs1) must be in CL set
-    if mn in ("srai", "srli", "andi"):
-        rd = defs[0] if defs else None
-        return rd in _CL_INT_REGS
-
-    # Branches: c.beqz / c.bnez require rs2 == x0
-    if mn in ("beq", "bne"):
-        # uses = [rs1, rs2]; c.beqz/c.bnez encode rs1 in CL set, rs2==x0
-        rs1 = uses[0] if len(uses) > 0 else None
-        rs2 = uses[1] if len(uses) > 1 else None
-        return rs1 in _CL_INT_REGS and rs2 == "x0"
-
-    # Memory ops: accept SP-relative (any rd) OR CL-register-only form
-    if mn in ("lw", "flw", "fld"):
-        base = uses[0] if uses else None
-        rd   = defs[0] if defs else None
-        if base == "x2":          # c.lwsp / c.flwsp / c.fldsp
-            return True
-        cl_regs = _CL_FP_REGS if mn in ("flw", "fld") else _CL_INT_REGS
-        return base in _CL_INT_REGS and rd in cl_regs
-
-    if mn in ("sw", "fsw", "fsd"):
-        # uses = [rs2_data, base]
-        base    = uses[1] if len(uses) > 1 else (uses[0] if uses else None)
-        rs2     = uses[0] if uses else None
-        if base == "x2":          # c.swsp / c.fswsp / c.fsdsp
-            return True
-        cl_regs = _CL_FP_REGS if mn in ("fsw", "fsd") else _CL_INT_REGS
-        return base in _CL_INT_REGS and rs2 in cl_regs
-
-    # jalr -> c.jr (rd==x0, rs2==x0) or c.jalr (rd==ra, rs2==x0)
-    if mn == "jalr":
-        return True   # standard jalr ra,rs1,0 and jr rs1 both compress
-
-    # add -> c.mv (rd!=x0, rs1==x0) or c.add (rd!=x0, rs1!=x0, rs2!=x0)
-    if mn == "add":
-        rd  = defs[0] if defs else None
-        return rd is not None and rd != "x0"
-
-    # addi covers c.addi, c.li, c.lui-adjacent, c.addi16sp, c.addi4spn, c.nop
-    # No register restriction beyond rd != x0 (c.nop is addi x0,x0,0)
-    if mn == "addi":
-        return True
-
-    # slli: rd (==rs1) can be any non-zero register; shamt must be 1-31
-    # (we can't check shamt here, so accept all)
-    if mn == "slli":
-        rd = defs[0] if defs else None
-        return rd is not None and rd != "x0"
-
-    # lui: rd must not be x0 or x2
-    if mn == "lui":
-        rd = defs[0] if defs else None
-        return rd is not None and rd not in ("x0", "x2")
-
-    # jal: c.jal (RV32 only, rd==ra) or c.j (rd==x0)
-    if mn == "jal":
-        return True
-
-    # ret / nop / mv: always compress
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Default pair-score: prefer pairs where both instructions can be compressed
-# ---------------------------------------------------------------------------
-
-def _compress_pair_score(a: "Instruction", b: "Instruction") -> float:
-    """
-    Default scoring function.
-
-    Returns 1.0 when both *a* and *b* are candidates for RVC 16-bit
-    encoding (so an optimiser can pack two compressed instructions into a
-    single 32-bit word), -1.0 when only *b* is not compressible (nudging
-    the scheduler to prefer a compressible candidate instead), and 0.0
-    otherwise.
-    """
-    a_ok = can_compress(a)
-    b_ok = can_compress(b)
-    if a_ok and b_ok:
-        return 1.0
-    if a_ok and not b_ok:
-        return -1.0
-    return 0.0
-
-
-def _rvc_describe_pair(a: "Instruction", b: "Instruction") -> str:
-    return "rvc" if (can_compress(a) and can_compress(b)) else ""
-
-_compress_pair_score._describe_pair = _rvc_describe_pair
-
-
-# ---------------------------------------------------------------------------
-# Pair scoring helpers
-# ---------------------------------------------------------------------------
-
-PairScoreFn = Callable[["Instruction", "Instruction"], float]
+from typing import Callable
+
+from rv32_core import (
+    Instruction, DepGraph, parse_line, build_dep_graph, compute_liveness,
+    _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF,
+    _is_objdump, _objdump_line, _classify_labels, _classify_labels_objdump,
+)
+from rv32_scorers import (
+    PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
+)
 
 
 @dataclass
@@ -972,6 +118,19 @@ class PairStats:
     singleton_tally:        dict   # {(mn_a, mn_b): count} — unpaired adjacent pairs
     unpaired_opcode_tally:  dict   # {mnemonic: count} — flat singleton opcode counts
 
+    @classmethod
+    def empty(cls) -> "PairStats":
+        """Return a zero PairStats for a block with no instructions."""
+        return cls(
+            total_instrs=0, paired_instrs=0, unpaired_instrs=0,
+            possible_pairs=0, successful_pairs=0,
+            rule_counts={}, rule_shadow={}, rule_missed={},
+            rvc_eligible=0,
+            estimated_bytes=0, baseline_bytes=0,
+            saving_bytes=0, saving_pct=0.0,
+            singleton_tally={}, unpaired_opcode_tally={},
+        )
+
     def summary_lines(self, opcode_tally: bool = False) -> list:
         """Return comment lines suitable for appending to assembly output.
 
@@ -1047,12 +206,11 @@ class PairStats:
         reflects the true overall saving.  possible_pairs is summed from
         per-block values (each block contributes floor(block_size/2)).
         """
-        def _merge_dicts(dicts):
-            out: dict = {}
-            for d in dicts:
-                for k, v in d.items():
-                    out[k] = out.get(k, 0) + v
-            return out
+        def _merge_dicts(attr):
+            c: Counter = Counter()
+            for s in stats:
+                c.update(getattr(s, attr))
+            return dict(c)
 
         total_instrs     = sum(s.total_instrs     for s in stats)
         paired_instrs    = sum(s.paired_instrs     for s in stats)
@@ -1072,18 +230,16 @@ class PairStats:
             unpaired_instrs  = unpaired_instrs,
             possible_pairs   = possible_pairs,
             successful_pairs = successful_pairs,
-            rule_counts      = _merge_dicts(s.rule_counts for s in stats),
-            rule_shadow      = _merge_dicts(s.rule_shadow for s in stats),
-            rule_missed      = _merge_dicts(s.rule_missed for s in stats),
+            rule_counts      = _merge_dicts("rule_counts"),
+            rule_shadow      = _merge_dicts("rule_shadow"),
+            rule_missed      = _merge_dicts("rule_missed"),
             rvc_eligible     = rvc_eligible,
             estimated_bytes  = estimated_bytes,
             baseline_bytes   = baseline_bytes,
             saving_bytes     = saving_bytes,
             saving_pct       = saving_pct,
-            singleton_tally        = _merge_dicts(
-                                        s.singleton_tally for s in stats),
-            unpaired_opcode_tally  = _merge_dicts(
-                                        s.unpaired_opcode_tally for s in stats),
+            singleton_tally        = _merge_dicts("singleton_tally"),
+            unpaired_opcode_tally  = _merge_dicts("unpaired_opcode_tally"),
         )
 
 
@@ -1326,6 +482,10 @@ def _bnb_schedule(
 # special or hardwired).
 _ALL_INT_REGS = frozenset(f"x{n}" for n in range(1, 32))
 _ALL_FP_REGS  = frozenset(f"f{n}" for n in range(0, 32))
+# ABI temporaries: t0-t2 (x5-x7) and t3-t6 (x28-x31)
+_TEMPORARIES  = frozenset(f"x{i}" for i in (5, 6, 7, 28, 29, 30, 31))
+# Registers that must never be rename targets (x0, ra, sp, gp, tp)
+_RESERVED     = frozenset({"x0", "x1", "x2", "x3", "x4"})
 
 
 def _reg_family(reg: str) -> str:
@@ -1391,18 +551,9 @@ def rename_destinations(
 
     Returns the (possibly modified) scheduled list.
     """
-    import copy
-
     scheduled = [copy.copy(i) for i in scheduled]
     n = len(scheduled)
     trials_remaining: list = [max_trials]   # mutable counter shared by helpers
-
-    # ABI temporaries: t0-t2 (x5-x7) and t3-t6 (x28-x31)
-    _TEMPORARIES = frozenset(
-        {f"x{i}" for i in (5, 6, 7, 28, 29, 30, 31)}
-    )
-    # Registers that must never be rename targets
-    _RESERVED = frozenset({"x0", "x1", "x2", "x3", "x4"})
 
     # ------------------------------------------------------------------
     # Precomputed tables rebuilt once per outer iteration (O(N) each).
@@ -1809,6 +960,7 @@ def _undo_rename(scheduled: list, undo: list):
         instr.raw  = old_raw
 
 
+
 # ---------------------------------------------------------------------------
 # Tally helpers (module-level so they can be used by the streaming processor)
 # ---------------------------------------------------------------------------
@@ -1884,12 +1036,19 @@ def _classify_labels(source: str) -> tuple:
             globally_visible.add(m.group(1).split("@")[0])  # strip @plt etc.
             continue
 
-        # Branch / jump targets — last token before any comment
+        # Branch / jump targets — last token before any comment.
+        # Reject tokens that are: plain integers, relocation expressions
+        # (%pcrel_hi etc.), register-indirect forms (offset(reg)), or bare
+        # register names.  What remains must be a label name.
         if _BRANCH_LIKE.match(line):
             code = line.split("#")[0].split(";")[0].strip()
             tgt = code.split()[-1].rstrip(",")
-            # Only record it if it looks like a label (not a register or plain number)
-            if tgt and not tgt.lstrip("-").isdigit() and not tgt.startswith("%"):
+            if (tgt
+                    and not tgt.lstrip("-").isdigit()
+                    and not tgt.startswith("%")
+                    and "(" not in tgt
+                    and tgt not in _INT_ABI
+                    and not re.match(r"^[xf]\d+$", tgt)):
                 branch_targets.add(tgt)
 
     return frozenset(branch_targets), frozenset(globally_visible)
@@ -1911,8 +1070,6 @@ _OBJDUMP_LABEL = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$")
 _OBJDUMP_DATA  = re.compile(r"^[0-9a-f]+:\s+(?:[0-9a-f]{8}\s+){2,}")
 # Trailing  <name>  or  <name+0xOFFSET>  annotation on branch operands.
 _ANGLE_ANNOT   = re.compile(r"\s+<[^>]+>")
-# Operand that is a bare hex address (objdump branch target before annotation).
-_HEX_ADDR_OP   = re.compile(r"^[0-9a-f]+$")
 
 
 def _is_objdump(source: str) -> bool:
@@ -2028,180 +1185,11 @@ def _classify_labels_objdump(source: str) -> tuple:
 
 
 def _process_block(
-    pass_lines:   list,        # pass-through text lines that precede this block
-    instructions: list,        # Instruction objects for this block (no sentinels)
-    pair_score:   "PairScoreFn",
-    rename:       bool,
-    opcode_tally: bool,
-    out,                       # file-like object; lines written here immediately
-    verbose:      bool = False,
-) -> "PairStats":
-    """
-    Schedule, annotate, and emit one basic block.
-
-    *pass_lines* are flushed to *out* before the first instruction line.
-    Returns a ``PairStats`` covering this block; the caller accumulates these
-    across blocks.
-
-    All state (DepGraph, liveness, scheduled list) is local to this call and
-    is released when it returns, keeping peak memory proportional to the
-    largest single block rather than the whole file.
-    """
-    # Flush pass-through text (directives, blanks, comments, label lines).
-    for line in pass_lines:
-        print(line, file=out)
-
-    if not instructions:
-        return PairStats(
-            total_instrs=0, paired_instrs=0, unpaired_instrs=0,
-            possible_pairs=0, successful_pairs=0,
-            rule_counts={}, rule_shadow={}, rule_missed={},
-            rvc_eligible=0,
-            estimated_bytes=0, baseline_bytes=0,
-            saving_bytes=0, saving_pct=0.0,
-            singleton_tally={}, unpaired_opcode_tally={},
-        )
-
-    graph = build_dep_graph(instructions)
-
-    if verbose:
-        liveness_v = compute_liveness(instructions)
-        for instr in graph.instructions:
-            succs    = sorted(graph.successors[instr.index])
-            dead     = sorted(liveness_v.get(instr.index, set()))
-            compress = can_compress(instr)
-            print(f"# I{instr.index:3d}  {instr.mnemonic:18s}"
-                  f"  defs={instr.defs}  uses={instr.uses}"
-                  f"  last_use={dead}  rvc={compress}"
-                  f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
-
-    scheduled = _bnb_schedule(graph, pair_score)
-
-    # Sentinels (label barriers) have no register effects; strip them before
-    # liveness analysis, renaming, and pair scoring.
-    real_scheduled = [i for i in scheduled if i.mnemonic != "__label__"]
-
-    if hasattr(pair_score, "_liveness_cell"):
-        pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
-
-    if rename:
-        real_scheduled = rename_destinations(real_scheduled, graph, pair_score)
-        if hasattr(pair_score, "_liveness_cell"):
-            pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
-
-    # Map original instruction index -> position in scheduled (with sentinels)
-    # so pass-through text anchored to sentinels is interleaved correctly.
-    sched_pos = {instr.index: p for p, instr in enumerate(scheduled)}
-    # Map original instruction index -> position in real_scheduled (no sentinels)
-    # so PAIR+ annotations address the correct slot.
-    real_pos  = {instr.index: p for p, instr in enumerate(real_scheduled)}
-
-    # Greedy-advance walk: annotate pairs and accumulate statistics.
-    total_instrs = len(real_scheduled)
-    successful   = 0
-
-    rule_counts:          dict = {}
-    rule_shadow:          dict = {}
-    rule_missed:          dict = {}
-    singleton_tally:      dict = {}
-    unpaired_opcode_tally: dict = {}
-
-    pair_start_set: set = set()
-    pair_rules:     dict = {}
-
-    rule_list     = getattr(pair_score, "_rule_list", None)
-    describe_fn   = getattr(pair_score, "_describe_pair", None)
-    liveness_snap = (pair_score._liveness_cell[0]
-                     if hasattr(pair_score, "_liveness_cell") else {})
-
-    i = 0
-    while i < total_instrs:
-        if i + 1 < total_instrs:
-            a_s, b_s    = real_scheduled[i], real_scheduled[i + 1]
-            slot_scores = pair_score(a_s, b_s) > 0
-
-            if rule_list is not None:
-                matching_rules = [rn for rn, rf in rule_list
-                                  if rf(a_s, b_s, liveness_snap)]
-                if matching_rules:
-                    winner = matching_rules[0]
-                    if slot_scores:
-                        pair_start_set.add(i)
-                        pair_rules[i] = winner
-                        successful += 1
-                        rule_counts[winner] = rule_counts.get(winner, 0) + 1
-                        for rn in matching_rules[1:]:
-                            rule_shadow[rn] = rule_shadow.get(rn, 0) + 1
-                        i += 2
-                        continue
-                    else:
-                        rule_missed[winner] = rule_missed.get(winner, 0) + 1
-            else:
-                if slot_scores:
-                    pair_start_set.add(i)
-                    rule = describe_fn(a_s, b_s) if describe_fn else ""
-                    pair_rules[i] = rule
-                    successful += 1
-                    rule_counts[rule] = rule_counts.get(rule, 0) + 1
-                    i += 2
-                    continue
-
-        # Singleton at position i.
-        mn_a = _tally_label(real_scheduled[i])
-        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
-        key  = (mn_a, mn_b)
-        singleton_tally[key]         = singleton_tally.get(key, 0) + 1
-        unpaired_opcode_tally[mn_a]  = unpaired_opcode_tally.get(mn_a, 0) + 1
-        i += 1
-
-    # Emit annotated instruction lines, interleaving any pass-through text
-    # (blank lines, comments, directives) that was anchored to sentinels.
-    # We walk `scheduled` (which still contains sentinels) so the anchor
-    # positions are correct, but only emit text for real instructions.
-    #
-    # Pass-through text accumulated between real instructions in the original
-    # source may have been associated with a sentinel that now sits at a
-    # different position after scheduling.  We re-anchor it to the sentinel's
-    # scheduled position so it appears at the right point in the output.
-    before_sched_pos: dict = defaultdict(list)
-    pending_pass: list = []
-    # We need to reconstruct the before_pos mapping.  The original ordering
-    # of (pass_through, sentinel) pairs in the block is implicit: each
-    # sentinel was inserted immediately after the label line that produced it,
-    # so any pass-through text accumulated before a sentinel belongs before
-    # that sentinel in the scheduled output.
-    # We use a sentinel-index list built during block construction.
-    # However, _process_block doesn't receive that mapping directly.
-    # Instead we recover it from `scheduled`: sentinels appear in their
-    # original relative order even after scheduling (they are barriers and
-    # cannot move), so we just drain pending_pass into before_sched_pos as
-    # we encounter each sentinel.
-    #
-    # Since all text lines inside a block were already flushed via pass_lines
-    # above (pass_lines covers directives/blanks/comments but NOT label lines
-    # that became sentinels), we need to handle label-line pass-throughs here.
-    # The block builder keeps label text in a separate list (sentinel_texts)
-    # indexed by sentinel index so we can re-emit them in scheduled order.
-    # That list is passed in as `sentinel_texts`.
-    #
-    # For simplicity: label text lines are held in a parallel list
-    # `sentinel_texts` keyed by the sentinel's original instruction index.
-    # The block builder is responsible for populating this; for now we
-    # emit them positionally (before the sentinel's scheduled position).
-    #
-    # Since _process_block is always called with sentinel_texts, we handle
-    # this below via a keyword argument added in the real signature.
-    raise NotImplementedError("Use _process_block_full — see below")
-
-
-# Real implementation — replaces the stub above.
-def _process_block(                              # noqa: F811  (intentional re-def)
     pass_lines:     list,
     instructions:   list,
-    sentinel_texts: dict,       # {sentinel_instr_index: label_line_str}
+    sentinel_texts: dict,
     pair_score:     "PairScoreFn",
     rename:         bool,
-    opcode_tally:   bool,
     out,
     verbose:        bool = False,
 ) -> "PairStats":
@@ -2217,34 +1205,28 @@ def _process_block(                              # noqa: F811  (intentional re-d
     instructions
         Instruction objects for this block, including ``__label__`` sentinels.
     sentinel_texts
-        Maps each sentinel's original instruction index to the label source
-        line that generated it.  Used to re-emit label lines at the correct
-        position after scheduling (sentinels are barriers so they never move,
-        but we still need the text to appear in the output).
-    pair_score, rename, opcode_tally, out, verbose
-        As for the old ``AssemblyScheduler.emit()``.
+        Maps each sentinel's original instruction index to a list of source
+        lines that begin with the label line itself, followed by any intra-block
+        directives/comments between the label and the first real instruction.
+        Used to re-emit label lines at the correct position after scheduling
+        (sentinels are barriers so they never move, but their text must appear
+        in the output).
+    pair_score, rename, out, verbose
+        As for ``AssemblyScheduler.process()``.
     """
     # Flush leading pass-through text.
     for line in pass_lines:
         print(line, file=out)
 
     if not instructions:
-        return PairStats(
-            total_instrs=0, paired_instrs=0, unpaired_instrs=0,
-            possible_pairs=0, successful_pairs=0,
-            rule_counts={}, rule_shadow={}, rule_missed={},
-            rvc_eligible=0,
-            estimated_bytes=0, baseline_bytes=0,
-            saving_bytes=0, saving_pct=0.0,
-            singleton_tally={}, unpaired_opcode_tally={},
-        )
+        return PairStats.empty()
 
     graph = build_dep_graph(instructions)
 
     if verbose:
-        lv = compute_liveness([i for i in instructions if i.mnemonic != "__label__"])
+        lv = compute_liveness([i for i in instructions if i.mnemonic != _SENTINEL_MN])
         for instr in graph.instructions:
-            if instr.mnemonic == "__label__":
+            if instr.mnemonic == _SENTINEL_MN:
                 continue
             succs    = sorted(graph.successors[instr.index])
             dead     = sorted(lv.get(instr.index, set()))
@@ -2255,7 +1237,7 @@ def _process_block(                              # noqa: F811  (intentional re-d
                   f"  -> {[f'I{s}' for s in succs]}", file=sys.stderr)
 
     scheduled      = _bnb_schedule(graph, pair_score)
-    real_scheduled = [i for i in scheduled if i.mnemonic != "__label__"]
+    real_scheduled = [i for i in scheduled if i.mnemonic != _SENTINEL_MN]
 
     if hasattr(pair_score, "_liveness_cell"):
         pair_score._liveness_cell[0] = compute_liveness(real_scheduled)
@@ -2271,11 +1253,11 @@ def _process_block(                              # noqa: F811  (intentional re-d
     total_instrs = len(real_scheduled)
     successful   = 0
 
-    rule_counts:           dict = {}
-    rule_shadow:           dict = {}
-    rule_missed:           dict = {}
-    singleton_tally:       dict = {}
-    unpaired_opcode_tally: dict = {}
+    rule_counts:           Counter = Counter()
+    rule_shadow:           Counter = Counter()
+    rule_missed:           Counter = Counter()
+    singleton_tally:       Counter = Counter()
+    unpaired_opcode_tally: Counter = Counter()
 
     pair_start_set: set  = set()
     pair_rules:     dict = {}
@@ -2300,28 +1282,28 @@ def _process_block(                              # noqa: F811  (intentional re-d
                         pair_start_set.add(i)
                         pair_rules[i] = winner
                         successful += 1
-                        rule_counts[winner] = rule_counts.get(winner, 0) + 1
+                        rule_counts[winner] += 1
                         for rn in matching_rules[1:]:
-                            rule_shadow[rn] = rule_shadow.get(rn, 0) + 1
+                            rule_shadow[rn] += 1
                         i += 2
                         continue
                     else:
-                        rule_missed[winner] = rule_missed.get(winner, 0) + 1
+                        rule_missed[winner] += 1
             else:
                 if slot_scores:
                     pair_start_set.add(i)
                     rule = describe_fn(a_s, b_s) if describe_fn else ""
                     pair_rules[i] = rule
                     successful += 1
-                    rule_counts[rule] = rule_counts.get(rule, 0) + 1
+                    rule_counts[rule] += 1
                     i += 2
                     continue
 
         mn_a = _tally_label(real_scheduled[i])
         mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
         key  = (mn_a, mn_b)
-        singleton_tally[key]          = singleton_tally.get(key, 0) + 1
-        unpaired_opcode_tally[mn_a]   = unpaired_opcode_tally.get(mn_a, 0) + 1
+        singleton_tally[key]        += 1
+        unpaired_opcode_tally[mn_a] += 1
         i += 1
 
     # ── Emit annotated output ─────────────────────────────────────────────
@@ -2330,7 +1312,7 @@ def _process_block(                              # noqa: F811  (intentional re-d
     # For each sentinel we emit its label line; for each real instruction we
     # emit the instruction text with PAIR+ annotation if applicable.
     for instr in scheduled:
-        if instr.mnemonic == "__label__":
+        if instr.mnemonic == _SENTINEL_MN:
             for label_line in sentinel_texts.get(instr.index, []):
                 print(label_line, file=out)
         else:
@@ -2497,7 +1479,6 @@ class AssemblyScheduler:
                 sentinel_texts = sentinel_texts,
                 pair_score     = pair_score,
                 rename         = rename,
-                opcode_tally   = opcode_tally,
                 out            = out,
                 verbose        = verbose,
             )
@@ -2508,196 +1489,118 @@ class AssemblyScheduler:
             sentinel_texts.clear()
             last_sentinel_idx = None
 
-        _LABEL_RE = re.compile(r"^\s*(\.?\w+)\s*:")
+        def _route_pass(line: str) -> None:
+            """
+            Place a pass-through line in the correct bucket.
+
+            Lines that arrive before any real instruction in the current block
+            are attached to the most recent sentinel (so they print after the
+            label line, not before it).  Lines that arrive after at least one
+            real instruction have been seen go to trailing_pass (they are
+            inter-block gap, carried forward as the next block's preamble).
+            Lines before any sentinel go to pass_lines (file preamble).
+            """
+            has_real = any(i.mnemonic != _SENTINEL_MN for i in instructions)
+            if not has_real and last_sentinel_idx is not None:
+                sentinel_texts[last_sentinel_idx].append(line)
+            elif has_real:
+                trailing_pass.append(line)
+            else:
+                pass_lines.append(line)
+
+        def _add_sentinel(label_name: str, source_line: str) -> None:
+            """
+            Flush the current block, then start a new block with a barrier
+            sentinel for *label_name*.  *source_line* is the original source
+            text of the label definition, preserved for output.
+            """
+            nonlocal instr_index, last_sentinel_idx
+            # Flush: inter-block trailing_pass becomes next block's preamble.
+            st = _process_block(
+                pass_lines     = pass_lines,
+                instructions   = instructions,
+                sentinel_texts = sentinel_texts,
+                pair_score     = pair_score,
+                rename         = rename,
+                out            = out,
+                verbose        = verbose,
+            )
+            all_stats.append(st)
+            instructions.clear()
+            sentinel_texts.clear()
+            last_sentinel_idx = None
+            pass_lines.clear()
+            pass_lines.extend(trailing_pass)
+            trailing_pass.clear()
+
+            sentinel = Instruction(index=instr_index, raw="", mnemonic=_SENTINEL_MN)
+            sentinel.is_barrier = True
+            sentinel_texts[instr_index] = [source_line]
+            last_sentinel_idx = instr_index
+            instr_index += 1
+            instructions.append(sentinel)
+
+        def _add_instruction(instr: "Instruction") -> None:
+            """Add a real instruction, draining trailing_pass first."""
+            nonlocal instr_index
+            if trailing_pass:
+                if last_sentinel_idx is not None:
+                    sentinel_texts[last_sentinel_idx].extend(trailing_pass)
+                else:
+                    pass_lines.extend(trailing_pass)
+                trailing_pass.clear()
+            # instr.index was already set by parse_line(instr_index, ...)
+            instr_index += 1
+            instructions.append(instr)
+
+
 
         for line in self.source.splitlines():
-            # For objdump input, normalise the line before classification.
-            # _objdump_line returns ('label', name), ('instr', canonical), or
-            # ('pass', original).  We then re-enter the existing logic using
-            # the normalised text so all downstream code is format-agnostic.
             if objdump:
                 kind, text = _objdump_line(line)
                 if kind == 'pass':
-                    # Blank, section header, ellipsis, data row, etc.
-                    has_real = any(i.mnemonic != "__label__" for i in instructions)
-                    if not has_real and last_sentinel_idx is not None:
-                        sentinel_texts[last_sentinel_idx].append(line)
-                    elif has_real:
-                        trailing_pass.append(line)
-                    else:
-                        pass_lines.append(line)
+                    _route_pass(line)
                     continue
                 elif kind == 'label':
-                    label_name = text   # already extracted bare name
-                    # Fall through to the barrier-or-passthrough decision below,
-                    # but skip the regex match — we already have the name.
+                    label_name = text
                     if self._is_barrier_label(label_name,
                                               branch_targets, globally_visible):
-                        st = _process_block(
-                            pass_lines     = pass_lines,
-                            instructions   = instructions,
-                            sentinel_texts = sentinel_texts,
-                            pair_score     = pair_score,
-                            rename         = rename,
-                            opcode_tally   = opcode_tally,
-                            out            = out,
-                            verbose        = verbose,
-                        )
-                        all_stats.append(st)
-                        instructions.clear()
-                        sentinel_texts.clear()
-                        last_sentinel_idx = None
-                        pass_lines.clear()
-                        pass_lines.extend(trailing_pass)
-                        trailing_pass.clear()
-                        sentinel = Instruction(
-                            index    = instr_index,
-                            raw      = "",
-                            mnemonic = "__label__",
-                        )
-                        sentinel.is_barrier = True
-                        sentinel_texts[instr_index] = [line]
-                        last_sentinel_idx = instr_index
-                        instr_index += 1
-                        instructions.append(sentinel)
+                        _add_sentinel(label_name, line)
                     else:
-                        has_real = any(i.mnemonic != "__label__" for i in instructions)
-                        if not has_real and last_sentinel_idx is not None:
-                            sentinel_texts[last_sentinel_idx].append(line)
-                        elif has_real:
-                            trailing_pass.append(line)
-                        else:
-                            pass_lines.append(line)
+                        _route_pass(line)
                     continue
-                else:
-                    # kind == 'instr': text is the canonical assembly string.
-                    # Parse it, then store the *original* line as raw so the
-                    # emitted output preserves the objdump address/encoding prefix.
+                else:  # kind == 'instr'
                     instr = parse_line(instr_index, text)
                     if instr is None:
-                        has_real = any(i.mnemonic != "__label__" for i in instructions)
-                        if not has_real and last_sentinel_idx is not None:
-                            sentinel_texts[last_sentinel_idx].append(line)
-                        elif has_real:
-                            trailing_pass.append(line)
-                        else:
-                            pass_lines.append(line)
+                        _route_pass(line)
                     else:
-                        if trailing_pass:
-                            if last_sentinel_idx is not None:
-                                sentinel_texts[last_sentinel_idx].extend(trailing_pass)
-                            else:
-                                pass_lines.extend(trailing_pass)
-                            trailing_pass.clear()
                         instr.raw = line   # preserve original objdump line
-                        instr_index += 1
-                        instructions.append(instr)
+                        _add_instruction(instr)
                     continue
 
-        for line in self.source.splitlines():
+            # Plain assembly path.
             stripped = line.strip()
-
-            is_blank_or_comment = (
-                not stripped
-                or stripped.startswith(("#", ";", "//"))
-            )
-            is_directive = stripped.startswith(".")
-
-            if is_blank_or_comment or is_directive:
-                has_real = any(i.mnemonic != "__label__" for i in instructions)
-                if not has_real and last_sentinel_idx is not None:
-                    # Between the opening sentinel and the first real
-                    # instruction — CFI directives, comment lines, etc.
-                    # Attach to the sentinel so they print immediately after
-                    # the label line, not before it.
-                    sentinel_texts[last_sentinel_idx].append(line)
-                elif has_real:
-                    # After the last real instruction — inter-block gap.
-                    trailing_pass.append(line)
-                else:
-                    # Before any sentinel or instruction — file preamble.
-                    pass_lines.append(line)
+            if (not stripped
+                    or stripped.startswith(("#", ";", "//"))
+                    or stripped.startswith(".")):
+                _route_pass(line)
                 continue
 
-            m = _LABEL_RE.match(stripped)
+            m = _LABEL_DEF.match(stripped)
             if m:
                 label_name = m.group(1)
                 if self._is_barrier_label(label_name,
                                           branch_targets, globally_visible):
-                    # Flush the current block.  trailing_pass lines are the
-                    # inter-block gap and become the new block's pass_lines.
-                    st = _process_block(
-                        pass_lines     = pass_lines,
-                        instructions   = instructions,
-                        sentinel_texts = sentinel_texts,
-                        pair_score     = pair_score,
-                        rename         = rename,
-                        opcode_tally   = opcode_tally,
-                        out            = out,
-                        verbose        = verbose,
-                    )
-                    all_stats.append(st)
-                    instructions.clear()
-                    sentinel_texts.clear()
-                    last_sentinel_idx = None
-                    pass_lines.clear()
-                    pass_lines.extend(trailing_pass)
-                    trailing_pass.clear()
-
-                    # The barrier label itself becomes the first sentinel of
-                    # the new block.
-                    sentinel = Instruction(
-                        index    = instr_index,
-                        raw      = "",
-                        mnemonic = "__label__",
-                    )
-                    sentinel.is_barrier = True
-                    sentinel_texts[instr_index] = [line]
-                    last_sentinel_idx = instr_index
-                    instr_index += 1
-                    instructions.append(sentinel)
+                    _add_sentinel(label_name, line)
                 else:
-                    # Non-barrier label: pass-through text only, no sentinel.
-                    # Route the same way as directives: attach to the current
-                    # sentinel if we haven't seen a real instruction yet,
-                    # otherwise treat as trailing (inter-block) text.
-                    has_real = any(i.mnemonic != "__label__" for i in instructions)
-                    if not has_real and last_sentinel_idx is not None:
-                        sentinel_texts[last_sentinel_idx].append(line)
-                    elif has_real:
-                        trailing_pass.append(line)
-                    else:
-                        pass_lines.append(line)
+                    _route_pass(line)
                 continue
 
             instr = parse_line(instr_index, line)
             if instr is None:
-                # Unrecognised line inside the instruction stream — treat like
-                # a directive: attach to sentinel or trailing_pass as appropriate.
-                has_real = any(i.mnemonic != "__label__" for i in instructions)
-                if not has_real and last_sentinel_idx is not None:
-                    sentinel_texts[last_sentinel_idx].append(line)
-                elif has_real:
-                    trailing_pass.append(line)
-                else:
-                    pass_lines.append(line)
+                _route_pass(line)
             else:
-                # Real instruction: any trailing_pass lines accumulated since
-                # the last instruction belong before this one in the output.
-                # Flush them into the current sentinel's text list if no real
-                # instruction has been seen yet, otherwise just append to
-                # pass_lines (they'll be emitted in document order by the
-                # existing pass_lines flush at the top of _process_block).
-                # In practice trailing_pass is non-empty here only for unusual
-                # cases (directives sandwiched between instructions).
-                if trailing_pass:
-                    if last_sentinel_idx is not None:
-                        sentinel_texts[last_sentinel_idx].extend(trailing_pass)
-                    else:
-                        pass_lines.extend(trailing_pass)
-                    trailing_pass.clear()
-                instr_index += 1
-                instructions.append(instr)
+                _add_instruction(instr)
 
         # Flush the final block.
         _flush_block()
@@ -2725,7 +1628,6 @@ class AssemblyScheduler:
         This is a convenience wrapper around ``process()`` that captures
         output in memory.  Prefer ``process(out=…)`` for large files.
         """
-        import io
         buf = io.StringIO()
         self.process(pair_score=pair_score, rename=rename,
                      opcode_tally=opcode_tally, out=buf, verbose=verbose)
@@ -2887,9 +1789,6 @@ def _rule_pre_increment(a: "Instruction", b: "Instruction",
     The arithmetic result register must be the base register of the memory
     operation.  For stores, the data register must differ from rd.
     """
-    _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
-    _MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
-
     if a.mnemonic not in _ADDR_ARITH or b.mnemonic not in _MEM_OPS:
         return False
     if not a.defs:
@@ -2916,9 +1815,6 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
     The arithmetic's first source must be the memory op's base register.
     For loads, the arithmetic destination must not alias the load destination.
     """
-    _MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
-    _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
-
     if a.mnemonic not in _MEM_OPS or b.mnemonic not in _ADDR_ARITH:
         return False
     base = a.uses[-1] if a.uses else None
@@ -2993,10 +1889,24 @@ _REG4 = frozenset(f"x{n}" for n in range(16))
 # t6 is the implicit chain register for dual_arith_chain
 _CHAIN_REG = "x31"
 
+# Mnemonics for the immediate-form dual-arith instructions that carry a
+# 5-bit signed immediate (−16..+15).
+_IMM_FORMS = frozenset({"addi", "addiw", "andi"})
 
-def _parse_immediate(instr: "Instruction") -> "int | None":
-    """Return the cached immediate parsed at parse_line time, or None."""
-    return instr.imm
+# Address-arithmetic mnemonics used by pre_increment / post_increment rules.
+_ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+
+# Memory-operation mnemonics (integer loads and stores, no vector/FP).
+_MEM_OPS = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
+
+# Branches and jumps that may only appear in the B (second) slot of a compact32
+# pair — they cannot be the A instruction because nothing useful can follow them.
+_COMPACT32_BRANCH_MN = frozenset({
+    "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez",
+    "jal", "jalr",
+})
+
 
 
 def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
@@ -3032,7 +1942,7 @@ def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
         reg_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
         if not reg_ok:
             return False
-        imm = _parse_immediate(instr)
+        imm = instr.imm
         if imm is None:
             return False
         # Must be a positive multiple of 4 in 4..124
@@ -3057,9 +1967,8 @@ def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
             return False
 
     # ── Immediate range: 5 signed bits → −16..+15 ─────────────────────────
-    imm_forms = frozenset({"addi", "addiw", "andi"})
-    if mn in imm_forms:
-        imm = _parse_immediate(instr)
+    if mn in _IMM_FORMS:
+        imm = instr.imm
         if imm is None:
             return False
         if imm < -16 or imm > 15:
@@ -3130,8 +2039,8 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
         return False
 
     # B's immediate must fit in 5 signed bits
-    if b.mnemonic in frozenset({"addi", "addiw", "andi"}):
-        imm = _parse_immediate(b)
+    if b.mnemonic in _IMM_FORMS:
+        imm = b.imm
         if imm is None or imm < -16 or imm > 15:
             return False
 
@@ -3190,6 +2099,27 @@ def _rule_arith_branch(a: "Instruction", b: "Instruction",
     return True
 
 
+_DUAL_MOVE_MN = frozenset({"mv", "li"})
+
+
+def _dual_move_ok(instr: "Instruction") -> bool:
+    """Return True if *instr* is eligible as one slot of a dual_move pair."""
+    if instr.mnemonic not in _DUAL_MOVE_MN:
+        return False
+    rd = instr.defs[0] if instr.defs else None
+    if rd is None or rd not in _REG4:
+        return False
+    if instr.mnemonic == "mv":
+        rs = instr.uses[0] if instr.uses else None
+        if rs is None or rs not in _REG4:
+            return False
+    else:  # li
+        imm = instr.imm
+        if imm is None or imm < -16 or imm > 15:
+            return False
+    return True
+
+
 def _rule_dual_move(a: "Instruction", b: "Instruction",
                     liveness: dict) -> bool:
     """
@@ -3225,35 +2155,11 @@ def _rule_dual_move(a: "Instruction", b: "Instruction",
         mv   x10, x11        # copy pair
         mv   x12, x13
     """
-    _DUAL_MOVE_MN = frozenset({"mv", "li"})
-
-    def _ok(instr: "Instruction") -> bool:
-        if instr.mnemonic not in _DUAL_MOVE_MN:
-            return False
-        rd = instr.defs[0] if instr.defs else None
-        if rd is None or rd not in _REG4:
-            return False
-        if instr.mnemonic == "mv":
-            rs = instr.uses[0] if instr.uses else None
-            if rs is None or rs not in _REG4:
-                return False
-        else:  # li
-            imm = instr.imm
-            if imm is None or imm < -16 or imm > 15:
-                return False
-        return True
-
-    if not (_ok(a) and _ok(b)):
+    if not (_dual_move_ok(a) and _dual_move_ok(b)):
         return False
-
     # Distinct destinations — encoding two writes to the same register
     # in a single compact word is pointless and likely unrepresentable.
-    rd_a = a.defs[0]
-    rd_b = b.defs[0]
-    if rd_a == rd_b:
-        return False
-
-    return True
+    return a.defs[0] != b.defs[0]
 
 
 # Registry: (display_name, rule_function)
@@ -3299,24 +2205,11 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
     # into cell[0] after renaming; the closure always reads cell[0].
     cell: list = [liveness]
 
-    # Branches (instructions that transfer control) may only appear in the
-    # second slot of a compact32 pair.  Enforced here so no individual rule
-    # needs to repeat the check.
-    _BRANCH_MN = frozenset({
-        "beq", "bne", "blt", "bge", "bltu", "bgeu",
-        "beqz", "bnez",                        # pseudo-instructions
-        "jal", "jalr",                         # unconditional jumps
-    })
-
     # Per-rule A-side guards: a cheap boolean per instruction that must be True
     # before calling the full (more expensive) rule function.  This avoids
     # executing any rule body when instruction A clearly can't satisfy it.
-    _LOAD_MN  = frozenset({"lw", "lh", "lb", "lhu", "lbu"})
-    _STORE_MN = frozenset({"sw", "sh", "sb"})
-    _ARITH_ADDR = frozenset({"add", "addi", "sub",
-                              "sh1add", "sh2add", "sh3add"})
-    _MEM_OP_MN  = _LOAD_MN | _STORE_MN
-
+    # Uses module-level constants: _COMPACT32_BRANCH_MN, _ADDR_ARITH, _MEM_OPS,
+    # _DUAL_MOVE_MN.
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         """Return the set of rule names for which instruction A could match."""
         eligible = set()
@@ -3328,14 +2221,14 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("adjacent_load_pair")
         if a.mnemonic == "sw":
             eligible.add("adjacent_store_pair")
-        if a.mnemonic in _ARITH_ADDR:
+        if a.mnemonic in _ADDR_ARITH:
             eligible.add("pre_increment")
-        if a.mnemonic in _MEM_OP_MN:
+        if a.mnemonic in _MEM_OPS:
             eligible.add("post_increment")
         if a.dual_arith_ok:
             eligible.add("dual_arith")
             eligible.add("arith_branch")
-        if a.mnemonic in ("mv", "li"):
+        if a.mnemonic in _DUAL_MOVE_MN:
             eligible.add("dual_move")
         return frozenset(eligible)
 
@@ -3350,7 +2243,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         return _elig_cache[idx]
 
     def _score(a: "Instruction", b: "Instruction") -> float:
-        if a.mnemonic in _BRANCH_MN:
+        if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0   # branches only allowed in the second slot
         elig = _get_eligible(a)
         if not elig:
@@ -3362,7 +2255,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
 
     def _describe(a: "Instruction", b: "Instruction") -> str:
         """Return the name of the first matching rule, or empty string."""
-        if a.mnemonic in _BRANCH_MN:
+        if a.mnemonic in _COMPACT32_BRANCH_MN:
             return ""
         elig = _get_eligible(a)
         for name, rule in COMPACT32_RULES:
@@ -3389,40 +2282,25 @@ def _describe_pair(a: "Instruction", b: "Instruction",
 
 
 # ---------------------------------------------------------------------------
-# Scorer registry — maps CLI name -> factory or direct function
+# Scorer registry — maps CLI name -> (factory_fn, description)
 # ---------------------------------------------------------------------------
 #
-# Each entry is (name, description, factory_or_fn) where factory_or_fn is
-# either a plain PairScoreFn (takes a, b) or a callable that takes a
-# post-analysis AssemblyScheduler and returns a PairScoreFn.  The CLI
-# detects which kind it is by checking for the 'needs_sched' attribute.
-
-def _scorer_factory(needs_sched=False):
-    """Decorator that marks a factory as needing the scheduler object."""
-    def decorator(fn):
-        fn.needs_sched = needs_sched
-        return fn
-    return decorator
-
-
-@_scorer_factory(needs_sched=False)
-def _make_rvc(sched=None):
-    return _compress_pair_score
-
-
-@_scorer_factory(needs_sched=False)
-def _make_compact32(sched=None):
-    # Liveness starts empty; _process_block refreshes the cell before scoring.
-    return make_compact32_scorer({})
-
+# factory_fn is a zero-argument callable that returns a PairScoreFn.
+# To add a new scorer: add an entry here and it appears automatically in
+# --list-rules output and --scorer choices.
 
 SCORERS: dict = {
-    "rvc":       (_make_rvc,
-                  "Pair instructions that both have a 16-bit RVC encoding "
-                  "(default)"),
-    "compact32": (_make_compact32,
-                  "Pair instructions that can be fused into a compact 32-bit "
-                  "encoding (cmp+branch, adjacent loads/stores, …)"),
+    "rvc": (
+        lambda: _compress_pair_score,
+        "Pair instructions that both have a 16-bit RVC encoding (default)",
+    ),
+    "compact32": (
+        # Liveness starts empty; _process_block refreshes the cell before
+        # any scoring occurs, so the initial value never matters.
+        lambda: make_compact32_scorer({}),
+        "Pair instructions that can be fused into a compact 32-bit "
+        "encoding (cmp+branch, adjacent loads/stores, …)",
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -3474,9 +2352,6 @@ def main():
     sched = AssemblyScheduler(source)
 
     factory, _ = SCORERS[args.scorer]
-    # compact32 scorer needs a liveness snapshot to initialise its cell;
-    # we pass an empty dict here — _process_block refreshes it per block
-    # before any scoring occurs, so the initial value never matters.
     pair_score = factory()
 
     # Stream output directly to stdout; summary printed at end of process().

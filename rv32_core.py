@@ -8,6 +8,8 @@ Shared foundations for the RV32 scheduler toolchain:
   - Line parser (parse_line)
   - Dependency graph (build_dep_graph)
   - Liveness analysis (compute_liveness)
+  - Input-format detection (plain assembly vs objdump -d)
+  - Label classification (barrier vs pass-through)
 
 This module has no dependency on rv32_scorers or rv32_scheduler and may be
 imported on its own.
@@ -16,7 +18,6 @@ imported on its own.
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Register name tables
@@ -68,9 +69,6 @@ def _is_reg_token(tok: str) -> bool:
 # ISA opcode tables
 # ---------------------------------------------------------------------------
 # mnemonic -> (def_slot, (use_slot, ...))
-#
-# Slot keys: rd/fd/vd  rs1/rs2  fs1/fs2/fs3  vs1/vs2/vs3
-#            mem_base  csr  (imm/label slots are consumed but not tracked)
 
 _I = {
     "add":   ("rd", ("rs1","rs2")), "sub":   ("rd", ("rs1","rs2")),
@@ -95,30 +93,18 @@ _I = {
     "sh":    (None, ("rs1","mem_base")),
     "sw":    (None, ("rs1","mem_base")),
     # ── Pseudo-instructions ──────────────────────────────────────────────
-    "beqz":  (None, ("rs1",)),      # beq  rs, x0, label
-    "bnez":  (None, ("rs1",)),      # bne  rs, x0, label
-    "blez":  (None, ("rs1",)),      # bge  x0, rs, label
-    "bgez":  (None, ("rs1",)),      # bge  rs, x0, label
-    "bltz":  (None, ("rs1",)),      # blt  rs, x0, label
-    "bgtz":  (None, ("rs1",)),      # blt  x0, rs, label
-    "mv":    ("rd",  ("rs1",)),     # addi rd, rs, 0
-    "not":   ("rd",  ("rs1",)),     # xori rd, rs, -1
-    "neg":   ("rd",  ("rs1",)),     # sub  rd, x0, rs
-    "negw":  ("rd",  ("rs1",)),     # subw rd, x0, rs
-    "seqz":  ("rd",  ("rs1",)),     # sltiu rd, rs, 1
-    "snez":  ("rd",  ("rs1",)),     # sltu  rd, x0, rs
-    "sltz":  ("rd",  ("rs1",)),     # slt   rd, rs, x0
-    "sgtz":  ("rd",  ("rs1",)),     # slt   rd, x0, rs
-    "sext.w":("rd",  ("rs1",)),     # addiw rd, rs, 0
-    "zext.b":("rd",  ("rs1",)),     # andi  rd, rs, 255
-    "nop":   (None,  ()),           # addi  x0, x0, 0
-    "ret":   (None,  ("rs1",)),     # jalr  x0, x1, 0  (uses ra)
-    "li":    ("rd",  ()),           # lui+addi or addi — dest only
-    "la":    ("rd",  ()),           # auipc+addi — dest only
-    "j":     (None,  ()),           # jal x0, label
-    "jr":    (None,  ("rs1",)),     # jalr x0, rs, 0
-    "call":  ("rd",  ()),           # auipc+jalr — writes ra (x1)
-    "tail":  (None,  ()),           # auipc+jalr x0 — no dest
+    "beqz":  (None, ("rs1",)),      "bnez":  (None, ("rs1",)),
+    "blez":  (None, ("rs1",)),      "bgez":  (None, ("rs1",)),
+    "bltz":  (None, ("rs1",)),      "bgtz":  (None, ("rs1",)),
+    "mv":    ("rd",  ("rs1",)),     "not":   ("rd",  ("rs1",)),
+    "neg":   ("rd",  ("rs1",)),     "negw":  ("rd",  ("rs1",)),
+    "seqz":  ("rd",  ("rs1",)),     "snez":  ("rd",  ("rs1",)),
+    "sltz":  ("rd",  ("rs1",)),     "sgtz":  ("rd",  ("rs1",)),
+    "sext.w":("rd",  ("rs1",)),     "zext.b":("rd",  ("rs1",)),
+    "nop":   (None,  ()),           "ret":   (None,  ("rs1",)),
+    "li":    ("rd",  ()),           "la":    ("rd",  ()),
+    "j":     (None,  ()),           "jr":    (None,  ("rs1",)),
+    "call":  ("rd",  ()),           "tail":  (None,  ()),
 }
 
 _M = {
@@ -225,6 +211,7 @@ _B = {
     "bext":   ("rd", ("rs1","rs2")), "bexti":  ("rd", ("rs1",)),
     "binv":   ("rd", ("rs1","rs2")), "binvi":  ("rd", ("rs1",)),
     "bset":   ("rd", ("rs1","rs2")), "bseti":  ("rd", ("rs1",)),
+    "bic":    ("rd", ("rs1","rs2")),
 }
 
 _V = {
@@ -296,12 +283,22 @@ BARRIERS = frozenset({
     "fence", "fence.i", "ecall", "ebreak",
     "vsetvli", "vsetivli", "vsetvl",
 })
+_BRANCH_MNEMONICS = frozenset({
+    "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "jal", "jalr", "j", "jr",
+})
 _AMO_PREFIXES = ("lr.", "sc.", "amo")
 _LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
                     {k for k in _V if k.startswith("vle")})
 _STORES = frozenset({"sb","sh","sw","fsw","fsd","fsq"} |
                     {k for k in _V if k.startswith("vse")})
 _AMO_SUFFIX_RE = re.compile(r"\.(aq|rl|aqrl)$")
+
+# Regex for a plain integer immediate: optional minus, then decimal or 0x hex.
+_IMM_RE = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)$")
+# Regex for a memory operand in offset(base) form.
+_MEM_RE = re.compile(r"\s*(-?\d+)\s*\(([^)]+)\)")
 
 # C-extension: 2-operand compressed form where rd is also implicit rs1.
 _C_ALIASES: dict = {
@@ -320,6 +317,12 @@ _C_ALIASES: dict = {
 # Instruction dataclass
 # ---------------------------------------------------------------------------
 
+# Mnemonic used for synthetic label-barrier instructions inserted by the
+# streaming parser.  These are never emitted; they exist only to force the
+# dependency graph to draw full barriers at label boundaries.
+_SENTINEL_MN = "__label__"
+
+
 @dataclass
 class Instruction:
     index:    int
@@ -334,13 +337,11 @@ class Instruction:
     is_store:   bool = False
     is_amo:     bool = False
     is_barrier: bool = False
-    is_branch:  bool = False   # conditional/unconditional branch or jump
-    # Cached decoded values — populated by parse_line, used by scorer rules
-    # to avoid re-parsing raw strings on every scorer call.
+    is_branch:  bool = False
     imm:        object = None  # int immediate if present, else None
     mem:        object = None  # (offset:int, base:str) for load/store, else None
-    dual_arith_ok:       bool = False  # satisfies _dual_arith_ok() constraints
-    dual_arith_chain_ok: bool = False  # satisfies _dual_arith_ok(allow_chain_reg=True) and defs x31
+    dual_arith_ok:       bool = False
+    dual_arith_chain_ok: bool = False
 
     def __repr__(self):
         return f"I{self.index}:{self.mnemonic}"
@@ -427,7 +428,6 @@ def parse_line(index: int, line: str):
 
     ops = [p.strip() for p in " ".join(tokens[1:]).split(",") if p.strip()]
 
-    # C-extension implicit rs1=rd expansion for 2-operand compressed forms
     if is_c_insn and len(ops) == 2 and mnemonic in ALL_TABLES:
         pat_def, pat_uses = ALL_TABLES[mnemonic]
         if (pat_def in ("rd","fd")
@@ -439,13 +439,7 @@ def parse_line(index: int, line: str):
     instr.is_store   = mnemonic in _STORES
     instr.is_amo     = any(mnemonic.startswith(p) for p in _AMO_PREFIXES)
     instr.is_barrier = mnemonic in BARRIERS or instr.is_amo
-
-    _BRANCH_MNEMONICS = frozenset({
-        "beq", "bne", "blt", "bge", "bltu", "bgeu",
-        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
-        "jal", "jalr", "j", "jr",
-    })
-    instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+    instr.is_branch  = mnemonic in _BRANCH_MNEMONICS
 
     if mnemonic not in ALL_TABLES:
         instr.is_barrier = True
@@ -458,15 +452,10 @@ def parse_line(index: int, line: str):
     instr.defs, instr.uses = defs, uses
     instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
 
-    # call/tail/ret are multi-instruction pseudo-ops that cross call boundaries
-    # or end functions — treat as full barriers.
     if mnemonic in ("call", "tail", "ret"):
         instr.is_barrier = True
 
-    # Cache immediate and memory operand at parse time so scorer rules don't
-    # re-parse raw strings on every pair_score() call.
-    _IMM_RE  = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)$")
-    _MEM_RE  = re.compile(r"\s*(-?\d+)\s*\(([^)]+)\)")
+    # Cache immediate and memory operand at parse time.
     _code = re.split(r"[#;]", instr.raw)[0].strip()
     _parts = _code.split(None, 1)
     if len(_parts) >= 2:
@@ -479,120 +468,63 @@ def parse_line(index: int, line: str):
                 pass
     if (instr.is_load or instr.is_store) and len(_parts) >= 2:
         _ops2 = [o.strip() for o in _parts[1].split(",")]
-        _mem_op = _ops2[-1]
-        _m = _MEM_RE.match(_mem_op)
+        _m = _MEM_RE.match(_ops2[-1])
         if _m:
             instr.mem = (int(_m.group(1)), _normalise_reg(_m.group(2).strip()))
 
-    _finalize_instruction(instr)
-    return instr
-
-
-# ---------------------------------------------------------------------------
-# Dual-arith eligibility
-# ---------------------------------------------------------------------------
-#
-# These constants and the helper are defined here (rather than in
-# rv32_scorers) because they are cached onto Instruction at parse time via
-# _finalize_instruction.  Keeping them in core avoids any import cycle and
-# lets rv32_core stand alone.
-#
-# The dual-arith encoding packs two arithmetic ops into one 32-bit word.
-# Constraints (see rv32_scorers for the full rule descriptions):
-#   1. Mnemonic in _DUAL_ARITH_MN
-#   2. RSD form: rd == rs1 (or addi4spn special case)
-#   3. All register operands in x0..x15 (4-bit field)
-#   4. Immediate in −16..+15 (5-bit signed) for immediate forms
-#      Exception: addi rd, sp, imm with imm a non-zero multiple of 4, 4..124
-
-_DUAL_ARITH_MN = frozenset({
-    "addi", "addiw", "andi",           # immediate arithmetic
-    "add",  "addw",                     # register addition
-    "sub",  "subw",                     # register subtraction
-    "and",  "bic",  "andn",             # bitwise AND / AND-NOT (bic == andn)
-    "or",   "xor",                      # bitwise OR / XOR
-})
-
-# Registers encodable in 4 bits: x0..x15
-_REG4 = frozenset(f"x{n}" for n in range(16))
-
-# t6 is the implicit chain register for dual_arith_chain
-_CHAIN_REG = "x31"
-
-
-def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
-    """
-    Return True if *instr* satisfies all constraints for the dual-arith
-    encoding:
-      - Mnemonic is in _DUAL_ARITH_MN
-      - RSD: rd == rs1  (or addi4spn special case)
-      - All register operands in x0..x15  (relaxed for the chain register
-        when allow_chain_reg is True)
-      - Immediate fits in 5 signed bits if applicable
-
-    allow_chain_reg=True relaxes the register-range check for rd/rs1 when
-    the register is _CHAIN_REG (x31/t6).  Used for the A instruction in
-    dual_arith_chain (whose destination is t6).
-    """
-    mn = instr.mnemonic
-
-    if mn not in _DUAL_ARITH_MN:
-        return False
-
-    rd  = instr.defs[0] if instr.defs else None
-    rs1 = instr.uses[0] if instr.uses else None
-
-    if rd is None or rs1 is None:
-        return False
-
-    # ── addi4spn special case ──────────────────────────────────────────────
-    # addi rd, sp, imm where imm is a non-zero multiple of 4, 4..124.
-    # rs1 is sp (x2); rd may differ from rs1 for this form only.
-    if mn == "addi" and rs1 == "x2" and rd != "x2":
-        reg_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
-        if not reg_ok:
-            return False
-        imm = instr.imm
-        if imm is None:
-            return False
-        if imm <= 0 or imm % 4 != 0 or imm > 124:
-            return False
-        return True
-
-    # ── Standard RSD constraint: rd == rs1 ────────────────────────────────
-    if rd != rs1:
-        return False
-
-    # ── Register range ────────────────────────────────────────────────────
-    rsd = rd   # rd == rs1
-    rsd_ok = (rsd in _REG4) or (allow_chain_reg and rsd == _CHAIN_REG)
-    if not rsd_ok:
-        return False
-
-    # rs2 (second source for register-form ops) must always be in x0..x15
-    if len(instr.uses) >= 2:
-        rs2 = instr.uses[1]
-        if rs2 not in _REG4:
-            return False
-
-    # ── Immediate range: 5 signed bits → −16..+15 ─────────────────────────
-    if mn in ("addi", "addiw", "andi"):
-        imm = instr.imm
-        if imm is None:
-            return False
-        if imm < -16 or imm > 15:
-            return False
-
-    return True
-
-
-def _finalize_instruction(instr: "Instruction") -> None:
-    """Cache dual-arith eligibility flags onto *instr* at parse time."""
+    # Pre-compute dual-arith eligibility flags.
     instr.dual_arith_ok       = _dual_arith_ok(instr)
     instr.dual_arith_chain_ok = (
         _dual_arith_ok(instr, allow_chain_reg=True)
         and bool(instr.defs) and instr.defs[0] == "x31"
     )
+    return instr
+
+
+# ---------------------------------------------------------------------------
+# Dual-arith eligibility helpers (cached onto Instruction at parse time)
+# ---------------------------------------------------------------------------
+
+_DUAL_ARITH_MN = frozenset({
+    "addi", "addiw", "andi",
+    "add",  "addw",
+    "sub",  "subw",
+    "and",  "bic",  "andn",
+    "or",   "xor",
+})
+_REG4      = frozenset(f"x{n}" for n in range(16))
+_CHAIN_REG = "x31"
+_IMM_FORMS = frozenset({"addi", "addiw", "andi"})
+
+
+def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
+    mn  = instr.mnemonic
+    if mn not in _DUAL_ARITH_MN:
+        return False
+    rd  = instr.defs[0] if instr.defs else None
+    rs1 = instr.uses[0] if instr.uses else None
+    if rd is None or rs1 is None:
+        return False
+    if mn == "addi" and rs1 == "x2" and rd != "x2":
+        reg_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
+        if not reg_ok:
+            return False
+        imm = instr.imm
+        if imm is None or imm <= 0 or imm % 4 != 0 or imm > 124:
+            return False
+        return True
+    if rd != rs1:
+        return False
+    rsd_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
+    if not rsd_ok:
+        return False
+    if len(instr.uses) >= 2 and instr.uses[1] not in _REG4:
+        return False
+    if mn in _IMM_FORMS:
+        imm = instr.imm
+        if imm is None or imm < -16 or imm > 15:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +558,6 @@ def build_dep_graph(instructions: list) -> DepGraph:
 
     for instr in instructions:
         idx = instr.index
-
         if instr.is_barrier:
             for prev in instructions:
                 if prev.index < idx:
@@ -634,19 +565,12 @@ def build_dep_graph(instructions: list) -> DepGraph:
             last_barrier = idx
             if instr.is_amo:
                 mem_ops.append(idx)
-
         if instr.is_branch and not instr.is_barrier:
-            # Branch must come after every instruction that precedes it in
-            # the original sequence.  Unlike a full barrier, does NOT set
-            # last_barrier, so instructions after the branch (if any) are
-            # not forced to follow it.
             for prev in instructions:
                 if prev.index < idx:
                     graph.add_edge(prev.index, idx)
-
         if last_barrier >= 0 and last_barrier != idx:
             graph.add_edge(last_barrier, idx)
-
         for reg in instr.uses:
             if reg in last_writer:
                 graph.add_edge(last_writer[reg], idx)
@@ -655,7 +579,6 @@ def build_dep_graph(instructions: list) -> DepGraph:
                 graph.add_edge(r, idx)
             if reg in last_writer:
                 graph.add_edge(last_writer[reg], idx)
-
         for csr in instr.csr_uses:
             if csr in last_csr_writer:
                 graph.add_edge(last_csr_writer[csr], idx)
@@ -664,12 +587,10 @@ def build_dep_graph(instructions: list) -> DepGraph:
                 graph.add_edge(r, idx)
             if csr in last_csr_writer:
                 graph.add_edge(last_csr_writer[csr], idx)
-
         if (instr.is_load or instr.is_store) and not instr.is_amo:
             if mem_ops:
                 graph.add_edge(mem_ops[-1], idx)
             mem_ops.append(idx)
-
         for reg in instr.defs:
             last_writer[reg] = idx
             last_readers[reg] = []
@@ -690,31 +611,152 @@ def build_dep_graph(instructions: list) -> DepGraph:
 
 def compute_liveness(instructions: list) -> dict:
     """
-    Perform a single backward pass over *instructions* (in original program
-    order) and return a dict mapping each instruction index to the set of
-    registers that are "last-used" by that instruction — i.e. registers that
-    are read by the instruction and are not read again before being
-    overwritten (or before the end of the block).
-
-    Returns { instr_index: frozenset of register names }.
+    Backward pass over *instructions*; returns
+    { instr_index: frozenset[register] } where each frozenset is the set of
+    registers whose last use is at that instruction.
     """
     live_out: dict = {}
     last_use: dict = {}
-
     for instr in reversed(instructions):
         idx = instr.index
         killed: set = set()
-
         for reg in instr.defs:
             live_out[reg] = False
-
         for reg in instr.uses:
             if reg == "x0":
                 continue
             if not live_out.get(reg, False):
                 killed.add(reg)
             live_out[reg] = True
-
         last_use[idx] = frozenset(killed)
-
     return last_use
+
+
+# ---------------------------------------------------------------------------
+# Input-format detection and label classification
+# ---------------------------------------------------------------------------
+
+# Label definition: optional leading dot, word chars, colon.
+_LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
+# Branches and jumps whose last operand is a label target.
+_BRANCH_LIKE = re.compile(
+    r"^\s+(?:beq|bne|blt|bge|bltu|bgeu|beqz|bnez|blez|bgez|bltz|bgtz"
+    r"|jal|jalr|j|jr|call|tail)\s",
+)
+# ELF visibility directives.
+_VISIBILITY_DIRS = re.compile(
+    r"^\s+\.(?:globl|global|weak|protected|hidden|internal)\s+(\S+)",
+)
+
+# objdump -d line patterns
+_OBJDUMP_INSTR = re.compile(
+    r"^([0-9a-f]+):\s+"
+    r"(?:[0-9a-f]{2,8}\s+)+"
+    r"(\S.*)$"
+)
+_OBJDUMP_LABEL = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$")
+_OBJDUMP_DATA  = re.compile(r"^[0-9a-f]+:\s+(?:[0-9a-f]{8}\s+){2,}")
+_ANGLE_ANNOT   = re.compile(r"\s+<[^>]+>")
+
+
+def _is_objdump(source: str) -> bool:
+    """Return True when *source* looks like ``objdump -d`` output."""
+    for line in source.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "file format" in s or s.startswith("Disassembly of section"):
+            return True
+        return False
+    return False
+
+
+def _objdump_line(line: str) -> tuple:
+    """
+    Classify and normalise one line of objdump output.
+
+    Returns ``(kind, text)`` where kind is ``'label'``, ``'instr'``,
+    or ``'pass'``.  For ``'instr'``, *text* is the canonical assembly
+    string (address/encoding stripped, ``<n>`` annotations removed).
+    For ``'label'``, *text* is the bare label name.
+    """
+    stripped = line.rstrip()
+    if not stripped.strip():
+        return ('pass', line)
+    m = _OBJDUMP_LABEL.match(stripped)
+    if m:
+        name = m.group(2)
+        if "+" in name or " " in name:
+            return ('pass', line)
+        return ('label', name)
+    if _OBJDUMP_DATA.match(stripped):
+        return ('pass', line)
+    m = _OBJDUMP_INSTR.match(stripped)
+    if m:
+        rest = m.group(2)
+        rest = rest.split(" # ")[0].split("\t# ")[0]
+        rest = _ANGLE_ANNOT.sub("", rest)
+        parts = rest.split(None, 1)
+        if not parts:
+            return ('pass', line)
+        canonical = "\t" + parts[0]
+        if len(parts) > 1:
+            canonical += "\t" + parts[1]
+        return ('instr', canonical)
+    return ('pass', line)
+
+
+def _classify_labels(source: str) -> tuple:
+    """
+    Single-pass pre-scan of plain assembly source.
+
+    Returns ``(branch_targets, globally_visible)`` — two frozensets of label
+    name strings that must be treated as scheduling barriers.
+
+    Labels not in either set (e.g. ``.Lfunc_end*``, ``.Lpcrel_hi*``) are
+    pass-through text with no scheduling constraint.
+
+    Note: ``auipc``/``addi %pcrel_lo`` pairs are already protected by the
+    RAW dependency on the register ``auipc`` writes, so ``.Lpcrel_hi*``
+    labels need not be barriers.
+    """
+    branch_targets:   set = set()
+    globally_visible: set = set()
+    for line in source.splitlines():
+        m = _VISIBILITY_DIRS.match(line)
+        if m:
+            globally_visible.add(m.group(1).split("@")[0])
+            continue
+        if _BRANCH_LIKE.match(line):
+            code = line.split("#")[0].split(";")[0].strip()
+            tgt  = code.split()[-1].rstrip(",")
+            if (tgt
+                    and not tgt.lstrip("-").isdigit()
+                    and not tgt.startswith("%")
+                    and "(" not in tgt
+                    and tgt not in _INT_ABI
+                    and not re.match(r"^[xf]\d+$", tgt)):
+                branch_targets.add(tgt)
+    return frozenset(branch_targets), frozenset(globally_visible)
+
+
+def _classify_labels_objdump(source: str) -> tuple:
+    """
+    Like ``_classify_labels`` but for objdump disassembly format.
+
+    All bare function-entry labels (``ADDR <name>:``) are globally visible.
+    Branch targets are extracted from ``<name>`` annotations on branch lines.
+    """
+    branch_targets:   set = set()
+    globally_visible: set = set()
+    for line in source.splitlines():
+        m = _OBJDUMP_LABEL.match(line.rstrip())
+        if m:
+            name = m.group(2)
+            if "+" not in name and " " not in name:
+                globally_visible.add(name)
+            continue
+        if _BRANCH_LIKE.match(line):
+            for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
+                branch_targets.add(annot)
+    return frozenset(branch_targets), frozenset(globally_visible)
