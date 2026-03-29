@@ -2,7 +2,7 @@
 """
 rv32_scheduler.py
 
-RV32 instruction scheduler: reads assembly source (or objdump -d output),
+RV32 instruction scheduler: reads assembly source,
 reorders instructions within basic blocks to maximise pairing opportunities,
 and emits the reordered assembly with PAIR+ annotations.
 
@@ -15,8 +15,6 @@ Usage
     python rv32_scheduler.py --list-rules
     python rv32_scheduler.py -          # read from stdin
 
-Also accepts objdump -d output directly:
-    objdump -d binary | python rv32_scheduler.py -
 """
 import re, io, sys, copy, argparse
 from collections import defaultdict, Counter
@@ -25,13 +23,12 @@ from typing import Callable
 
 from rv32_core import (
     Instruction, DepGraph, parse_line, build_dep_graph, compute_liveness,
-    _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF, _BRANCH_AND_CALL_MN,
-    _is_objdump, _objdump_line, _classify_labels, _classify_labels_objdump,
+    _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF,
+    _classify_labels,
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
 )
-
 
 @dataclass
 class PairStats:
@@ -194,7 +191,6 @@ class PairStats:
 
         return lines
 
-
     @classmethod
     def merge(cls, stats: "list[PairStats]") -> "PairStats":
         """
@@ -242,7 +238,6 @@ class PairStats:
             unpaired_opcode_tally  = _merge_dicts("unpaired_opcode_tally"),
         )
 
-
 def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
     """
     Count successful pairs using the greedy-advance model.
@@ -267,7 +262,6 @@ def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
             i += 1
     return count
 
-
 # ---------------------------------------------------------------------------
 # Branch-and-bound optimal scheduler
 # ---------------------------------------------------------------------------
@@ -282,7 +276,6 @@ def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
 # tree exhausts all equivalent orderings rather than stopping at the first.
 # Windowing bounds the search to a local region where this cannot happen.
 _BNB_WINDOW = 16
-
 
 def _bnb_schedule_window(
     instructions: list,
@@ -438,7 +431,6 @@ def _bnb_schedule_window(
         )
     return best[0]
 
-
 def _bnb_schedule(
     graph: DepGraph,
     pair_score: PairScoreFn,
@@ -473,7 +465,6 @@ def _bnb_schedule(
         pos += len(window)
     return result
 
-
 # ---------------------------------------------------------------------------
 # Destination-register renaming
 # ---------------------------------------------------------------------------
@@ -487,7 +478,6 @@ _TEMPORARIES  = frozenset(f"x{i}" for i in (5, 6, 7, 28, 29, 30, 31))
 # Registers that must never be rename targets (x0, ra, sp, gp, tp)
 _RESERVED     = frozenset({"x0", "x1", "x2", "x3", "x4"})
 
-
 def _reg_family(reg: str) -> str:
     """Return 'int', 'fp', or 'vec' depending on register prefix."""
     if reg.startswith("x"):
@@ -495,7 +485,6 @@ def _reg_family(reg: str) -> str:
     if reg.startswith("f"):
         return "fp"
     return "vec"
-
 
 def rename_destinations(
     scheduled: list,
@@ -915,7 +904,6 @@ def rename_destinations(
 
     return scheduled
 
-
 def _apply_rename(scheduled: list, start: int, end: int,
                   old_reg: str, new_reg: str) -> list:
     """
@@ -950,7 +938,6 @@ def _apply_rename(scheduled: list, start: int, end: int,
         undo.append((pos, old_defs, old_uses, old_raw))
     return undo
 
-
 def _undo_rename(scheduled: list, undo: list):
     """Reverse an ``_apply_rename`` using the undo list it returned."""
     for pos, old_defs, old_uses, old_raw in undo:
@@ -958,8 +945,6 @@ def _undo_rename(scheduled: list, undo: list):
         instr.defs = old_defs
         instr.uses = old_uses
         instr.raw  = old_raw
-
-
 
 # ---------------------------------------------------------------------------
 # Tally helpers (module-level so they can be used by the streaming processor)
@@ -979,7 +964,6 @@ def _tally_label(instr: "Instruction") -> str:
         return f"{instr.mnemonic}(sp)"
     return instr.mnemonic
 
-
 # ---------------------------------------------------------------------------
 # Label classification pre-pass
 # ---------------------------------------------------------------------------
@@ -995,8 +979,6 @@ _VISIBILITY_DIRS = re.compile(
 )
 # Label definition: optional leading dot, word chars, colon.
 _LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
-
-
 
 def _process_block(
     pass_lines:     list,
@@ -1166,7 +1148,6 @@ def _process_block(
         unpaired_opcode_tally  = unpaired_opcode_tally,
     )
 
-
 # ---------------------------------------------------------------------------
 # High-level API
 # ---------------------------------------------------------------------------
@@ -1265,13 +1246,8 @@ class AssemblyScheduler:
         if out is None:
             out = sys.stdout
 
-        # Detect input format and select the appropriate label classifier.
-        objdump = _is_objdump(self.source)
-        if objdump:
-            branch_targets, globally_visible = _classify_labels_objdump(self.source)
-        else:
-            branch_targets, globally_visible = _classify_labels(self.source)
-
+        # Classify labels for barrier/non-barrier scheduling decisions.
+        branch_targets, globally_visible = _classify_labels(self.source)
         # Streaming parse: accumulate one block at a time and hand it off.
         # A block boundary is any barrier label (branch target or globally
         # visible symbol).  Non-barrier labels are folded in as pass-through
@@ -1367,31 +1343,7 @@ class AssemblyScheduler:
             instr_index += 1
             instructions.append(instr)
 
-
-
         for line in self.source.splitlines():
-            if objdump:
-                kind, text = _objdump_line(line)
-                if kind == 'pass':
-                    _route_pass(line)
-                    continue
-                elif kind == 'label':
-                    label_name = text
-                    if self._is_barrier_label(label_name,
-                                              branch_targets, globally_visible):
-                        _add_sentinel(label_name, line)
-                    else:
-                        _route_pass(line)
-                    continue
-                else:  # kind == 'instr'
-                    instr = parse_line(instr_index, text)
-                    if instr is None:
-                        _route_pass(line)
-                    else:
-                        instr.raw = line   # preserve original objdump line
-                        _add_instruction(instr)
-                    continue
-
             # Plain assembly path.
             stripped = line.strip()
             if (not stripped
@@ -1446,8 +1398,6 @@ class AssemblyScheduler:
         self.process(pair_score=pair_score, rename=rename,
                      opcode_tally=opcode_tally, out=buf, verbose=verbose)
         return buf.getvalue().rstrip("\n")
-
-
 
 # ---------------------------------------------------------------------------
 
@@ -1538,7 +1488,6 @@ def main():
         if args.opcode_tally:
             for line in st._opcode_tally_lines():
                 print(line, file=sys.stderr)
-
 
 if __name__ == "__main__":
     main()

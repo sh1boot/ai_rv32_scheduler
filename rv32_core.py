@@ -8,7 +8,6 @@ Shared foundations for the RV32 scheduler toolchain:
   - Line parser (parse_line)
   - Dependency graph (build_dep_graph)
   - Liveness analysis (compute_liveness)
-  - Input-format detection (plain assembly vs objdump -d)
   - Label classification (barrier vs pass-through)
 
 This module has no dependency on rv32_scorers or rv32_scheduler and may be
@@ -48,7 +47,6 @@ _FP_ABI: dict = {
     "ft8": "f28", "ft9": "f29", "ft10": "f30", "ft11": "f31",
 }
 
-
 def _normalise_reg(name: str) -> str:
     s = name.lower().strip().rstrip(",").rstrip(")").strip()
     if s in _INT_ABI:
@@ -57,13 +55,11 @@ def _normalise_reg(name: str) -> str:
         return _FP_ABI[s]
     return s
 
-
 def _is_reg_token(tok: str) -> bool:
     t = tok.lower().strip().rstrip(",")
     if t in _INT_ABI or t in _FP_ABI:
         return True
     return bool(re.match(r"^[xfv]\d{1,2}$", t))
-
 
 # ---------------------------------------------------------------------------
 # ISA opcode tables
@@ -288,9 +284,6 @@ _BRANCH_MNEMONICS = frozenset({
     "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
     "jal", "jalr", "j", "jr",
 })
-# Superset of _BRANCH_MNEMONICS that also includes call/tail — used when
-# classifying branch targets in label pre-scan passes.
-_BRANCH_AND_CALL_MN = _BRANCH_MNEMONICS | frozenset({"call", "tail"})
 _AMO_PREFIXES = ("lr.", "sc.", "amo")
 _LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
                     {k for k in _V if k.startswith("vle")})
@@ -315,7 +308,6 @@ _C_ALIASES: dict = {
     "c.sub":"sub",    "c.sw":"sw",     "c.swsp":"sw",      "c.xor":"xor",
 }
 
-
 # ---------------------------------------------------------------------------
 # Instruction dataclass
 # ---------------------------------------------------------------------------
@@ -324,7 +316,6 @@ _C_ALIASES: dict = {
 # streaming parser.  These are never emitted; they exist only to force the
 # dependency graph to draw full barriers at label boundaries.
 _SENTINEL_MN = "__label__"
-
 
 @dataclass
 class Instruction:
@@ -349,7 +340,6 @@ class Instruction:
     def __repr__(self):
         return f"I{self.index}:{self.mnemonic}"
 
-
 # ---------------------------------------------------------------------------
 # Operand decoder
 # ---------------------------------------------------------------------------
@@ -358,11 +348,9 @@ def _mem_base(operand: str):
     m = re.match(r"[^(]*\(([^)]+)\)", operand)
     return _normalise_reg(m.group(1)) if m else None
 
-
 def _strip_vec_mask(operand: str):
     s = operand.strip().rstrip(",")
     return "v0" if s in ("v0.t", "v0") else None
-
 
 def _decode_operands(mnemonic, pat_def, pat_uses, ops):
     defs, uses, csr_defs, csr_uses = [], [], [], []
@@ -404,7 +392,6 @@ def _decode_operands(mnemonic, pat_def, pat_uses, ops):
         uses.append(mask_reg)
     uses = [r for r in uses if r != "x0"]
     return defs, uses, csr_defs, csr_uses
-
 
 # ---------------------------------------------------------------------------
 # Line parser
@@ -483,7 +470,6 @@ def parse_line(index: int, line: str):
     )
     return instr
 
-
 # ---------------------------------------------------------------------------
 # Dual-arith eligibility helpers (cached onto Instruction at parse time)
 # ---------------------------------------------------------------------------
@@ -498,7 +484,6 @@ _DUAL_ARITH_MN = frozenset({
 _REG4      = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
 _IMM_FORMS = frozenset({"addi", "addiw", "andi"})
-
 
 def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
     mn  = instr.mnemonic
@@ -529,7 +514,6 @@ def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
             return False
     return True
 
-
 # ---------------------------------------------------------------------------
 # Dependency graph
 # ---------------------------------------------------------------------------
@@ -548,7 +532,6 @@ class DepGraph:
     def in_degree(self) -> dict:
         return {i.index: len(self.predecessors[i.index])
                 for i in self.instructions}
-
 
 def build_dep_graph(instructions: list) -> DepGraph:
     graph = DepGraph(instructions=instructions)
@@ -607,7 +590,6 @@ def build_dep_graph(instructions: list) -> DepGraph:
 
     return graph
 
-
 # ---------------------------------------------------------------------------
 # Liveness analysis
 # ---------------------------------------------------------------------------
@@ -634,7 +616,6 @@ def compute_liveness(instructions: list) -> dict:
         last_use[idx] = frozenset(killed)
     return last_use
 
-
 # ---------------------------------------------------------------------------
 # Input-format detection and label classification
 # ---------------------------------------------------------------------------
@@ -650,82 +631,6 @@ _BRANCH_LIKE = re.compile(
 _VISIBILITY_DIRS = re.compile(
     r"^\s+\.(?:globl|global|weak|protected|hidden|internal)\s+(\S+)",
 )
-
-# objdump -d line patterns
-_OBJDUMP_INSTR = re.compile(
-    r"^([0-9a-f]+):\s+"
-    r"(?:[0-9a-f]{2,8}\s+)+"
-    r"(\S.*)$"
-)
-_OBJDUMP_LABEL = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$")
-_OBJDUMP_DATA  = re.compile(r"^[0-9a-f]+:\s+(?:[0-9a-f]{8}\s+){2,}")
-_ANGLE_ANNOT   = re.compile(r"\s+<[^>]+>")
-
-
-def _is_objdump(source: str) -> bool:
-    """
-    Return True when *source* looks like ``objdump -d`` output.
-
-    Accepts both full objdump files (which begin with a "file format" banner
-    or "Disassembly of section" header) and mid-file slices that start
-    directly with a function label or instruction line.  Up to 8 non-blank
-    lines are scanned so that a few leading blank/comment lines don't fool
-    the detector.
-    """
-    checked = 0
-    for line in source.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        # Full-file objdump headers
-        if "file format" in s or s.startswith("Disassembly of section"):
-            return True
-        # Function label:  "deadbeef <name>:"
-        if _OBJDUMP_LABEL.match(line.rstrip()):
-            return True
-        # Instruction line: "deadbeef:  hexword(s)  mnemonic"
-        if _OBJDUMP_INSTR.match(line.rstrip()):
-            return True
-        checked += 1
-        if checked >= 8:
-            break
-    return False
-
-
-def _objdump_line(line: str) -> tuple:
-    """
-    Classify and normalise one line of objdump output.
-
-    Returns ``(kind, text)`` where kind is ``'label'``, ``'instr'``,
-    or ``'pass'``.  For ``'instr'``, *text* is the canonical assembly
-    string (address/encoding stripped, ``<n>`` annotations removed).
-    For ``'label'``, *text* is the bare label name.
-    """
-    stripped = line.rstrip()
-    if not stripped.strip():
-        return ('pass', line)
-    m = _OBJDUMP_LABEL.match(stripped)
-    if m:
-        name = m.group(2)
-        if "+" in name or " " in name:
-            return ('pass', line)
-        return ('label', name)
-    if _OBJDUMP_DATA.match(stripped):
-        return ('pass', line)
-    m = _OBJDUMP_INSTR.match(stripped)
-    if m:
-        rest = m.group(2)
-        rest = rest.split(" # ")[0].split("\t# ")[0]
-        rest = _ANGLE_ANNOT.sub("", rest)
-        parts = rest.split(None, 1)
-        if not parts:
-            return ('pass', line)
-        canonical = "\t" + parts[0]
-        if len(parts) > 1:
-            canonical += "\t" + parts[1]
-        return ('instr', canonical)
-    return ('pass', line)
-
 
 def _classify_labels(source: str) -> tuple:
     """
@@ -760,37 +665,3 @@ def _classify_labels(source: str) -> tuple:
                 branch_targets.add(tgt)
     return frozenset(branch_targets), frozenset(globally_visible)
 
-
-def _classify_labels_objdump(source: str) -> tuple:
-    """
-    Like ``_classify_labels`` but for objdump disassembly format.
-
-    All bare function-entry labels (``ADDR <n>:``) are globally visible.
-    Branch targets are extracted from ``<n>`` annotations on branch/jump
-    instruction lines.  Uses ``_OBJDUMP_INSTR`` to match instruction lines
-    (not ``_BRANCH_LIKE``, which only matches plain-assembly indentation).
-    """
-    branch_targets:   set = set()
-    globally_visible: set = set()
-    for line in source.splitlines():
-        m = _OBJDUMP_LABEL.match(line.rstrip())
-        if m:
-            name = m.group(2)
-            if "+" not in name and " " not in name:
-                globally_visible.add(name)
-            continue
-        # Objdump instruction line: extract mnemonic and check for branch.
-        m = _OBJDUMP_INSTR.match(line.rstrip())
-        if m:
-            rest = m.group(2)
-            rest = rest.split(" # ")[0].split("\t# ")[0]
-            mn   = rest.split()[0] if rest.split() else ""
-            if mn in _BRANCH_AND_CALL_MN:
-                for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
-                    branch_targets.add(annot)
-            continue
-        # Plain-assembly fallback for non-objdump lines.
-        if _BRANCH_LIKE.match(line):
-            for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
-                branch_targets.add(annot)
-    return frozenset(branch_targets), frozenset(globally_visible)
