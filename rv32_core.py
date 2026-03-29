@@ -288,6 +288,9 @@ _BRANCH_MNEMONICS = frozenset({
     "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
     "jal", "jalr", "j", "jr",
 })
+# Superset of _BRANCH_MNEMONICS that also includes call/tail — used when
+# classifying branch targets in label pre-scan passes.
+_BRANCH_AND_CALL_MN = _BRANCH_MNEMONICS | frozenset({"call", "tail"})
 _AMO_PREFIXES = ("lr.", "sc.", "amo")
 _LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
                     {k for k in _V if k.startswith("vle")})
@@ -660,14 +663,32 @@ _ANGLE_ANNOT   = re.compile(r"\s+<[^>]+>")
 
 
 def _is_objdump(source: str) -> bool:
-    """Return True when *source* looks like ``objdump -d`` output."""
+    """
+    Return True when *source* looks like ``objdump -d`` output.
+
+    Accepts both full objdump files (which begin with a "file format" banner
+    or "Disassembly of section" header) and mid-file slices that start
+    directly with a function label or instruction line.  Up to 8 non-blank
+    lines are scanned so that a few leading blank/comment lines don't fool
+    the detector.
+    """
+    checked = 0
     for line in source.splitlines():
         s = line.strip()
         if not s:
             continue
+        # Full-file objdump headers
         if "file format" in s or s.startswith("Disassembly of section"):
             return True
-        return False
+        # Function label:  "deadbeef <name>:"
+        if _OBJDUMP_LABEL.match(line.rstrip()):
+            return True
+        # Instruction line: "deadbeef:  hexword(s)  mnemonic"
+        if _OBJDUMP_INSTR.match(line.rstrip()):
+            return True
+        checked += 1
+        if checked >= 8:
+            break
     return False
 
 
@@ -744,8 +765,10 @@ def _classify_labels_objdump(source: str) -> tuple:
     """
     Like ``_classify_labels`` but for objdump disassembly format.
 
-    All bare function-entry labels (``ADDR <name>:``) are globally visible.
-    Branch targets are extracted from ``<name>`` annotations on branch lines.
+    All bare function-entry labels (``ADDR <n>:``) are globally visible.
+    Branch targets are extracted from ``<n>`` annotations on branch/jump
+    instruction lines.  Uses ``_OBJDUMP_INSTR`` to match instruction lines
+    (not ``_BRANCH_LIKE``, which only matches plain-assembly indentation).
     """
     branch_targets:   set = set()
     globally_visible: set = set()
@@ -756,6 +779,17 @@ def _classify_labels_objdump(source: str) -> tuple:
             if "+" not in name and " " not in name:
                 globally_visible.add(name)
             continue
+        # Objdump instruction line: extract mnemonic and check for branch.
+        m = _OBJDUMP_INSTR.match(line.rstrip())
+        if m:
+            rest = m.group(2)
+            rest = rest.split(" # ")[0].split("\t# ")[0]
+            mn   = rest.split()[0] if rest.split() else ""
+            if mn in _BRANCH_AND_CALL_MN:
+                for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
+                    branch_targets.add(annot)
+            continue
+        # Plain-assembly fallback for non-objdump lines.
         if _BRANCH_LIKE.match(line):
             for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
                 branch_targets.add(annot)

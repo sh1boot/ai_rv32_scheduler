@@ -25,7 +25,7 @@ from typing import Callable
 
 from rv32_core import (
     Instruction, DepGraph, parse_line, build_dep_graph, compute_liveness,
-    _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF,
+    _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF, _BRANCH_AND_CALL_MN,
     _is_objdump, _objdump_line, _classify_labels, _classify_labels_objdump,
 )
 from rv32_scorers import (
@@ -1076,18 +1076,26 @@ def _is_objdump(source: str) -> bool:
     """
     Return True when *source* looks like ``objdump -d`` output.
 
-    Detection heuristic: the first non-blank, non-comment line contains
-    ``file format`` (the standard objdump file-format header), or the
-    second non-blank line is ``Disassembly of section``.
+    Accepts both full objdump files (which begin with a "file format" banner
+    or "Disassembly of section" header) and mid-file slices that start
+    directly with a function label or instruction line.  Up to 8 non-blank
+    lines are scanned so that a few leading blank/comment lines don't fool
+    the detector.
     """
+    checked = 0
     for line in source.splitlines():
         s = line.strip()
         if not s:
             continue
         if "file format" in s or s.startswith("Disassembly of section"):
             return True
-        # First substantive line that looks like code, not a header → not objdump
-        return False
+        if _OBJDUMP_LABEL.match(line.rstrip()):
+            return True
+        if _OBJDUMP_INSTR.match(line.rstrip()):
+            return True
+        checked += 1
+        if checked >= 8:
+            break
     return False
 
 
@@ -1157,32 +1165,39 @@ def _classify_labels_objdump(source: str) -> tuple:
 
     In objdump output there are no ``.globl`` directives, so
     ``globally_visible`` is derived from function-entry labels: a label is
-    a function entry if it appears as ``ADDR <name>:`` at a line by itself
+    a function entry if it appears as ``ADDR <n>:`` at a line by itself
     (not as ``ADDR <name+offset>:`` which is an intra-function hint label).
 
-    ``branch_targets`` is derived from the ``<name>`` annotations that
-    objdump attaches to branch/jump target addresses.  Every name that
-    appears inside angle brackets on a branch line is a barrier.
+    ``branch_targets`` is derived from the ``<n>`` annotations that
+    objdump attaches to branch/jump target addresses.  Uses
+    ``_OBJDUMP_INSTR`` to detect instruction lines rather than
+    ``_BRANCH_LIKE``, which only matches plain-assembly indentation and
+    would miss objdump lines that begin with a hex address.
     """
     branch_targets:   set = set()
     globally_visible: set = set()
 
     for line in source.splitlines():
-        # Function-entry label → globally visible (treated as barrier)
         m = _OBJDUMP_LABEL.match(line.rstrip())
         if m:
             name = m.group(2)
             if "+" not in name and " " not in name:
                 globally_visible.add(name)
             continue
-
-        # Branch targets: extract <name> annotations from branch/jump lines
+        m = _OBJDUMP_INSTR.match(line.rstrip())
+        if m:
+            rest = m.group(2)
+            rest = rest.split(" # ")[0].split("\t# ")[0]
+            mn   = rest.split()[0] if rest.split() else ""
+            if mn in _BRANCH_AND_CALL_MN:
+                for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
+                    branch_targets.add(annot)
+            continue
         if _BRANCH_LIKE.match(line):
             for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
                 branch_targets.add(annot)
 
     return frozenset(branch_targets), frozenset(globally_visible)
-
 
 def _process_block(
     pass_lines:     list,
