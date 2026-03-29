@@ -926,23 +926,28 @@ class PairStats:
         Reference ceiling: floor(rvc_eligible / 2) is the maximum achievable
         RVC pairs if every eligible instruction could be matched with another.
 
-    singleton_tally : {(mnemonic_a, mnemonic_b): int}
+    singleton_tally : {(label_a, label_b): int}
         For every position i where instruction i ended up as a singleton and
-        i+1 exists, record (i.mnemonic, (i+1).mnemonic).  This is exactly
-        the (a, b) pair the scorer tested and rejected.  Sorted by count
-        descending, this reveals which opcode combinations are most often
-        adjacent but unpairable — the highest-count entries are the best
-        candidates for new pairing rules.
+        i+1 exists, record (label(i), label(i+1)).  This is exactly the (a, b)
+        pair the scorer tested and rejected.  Sorted by count descending, this
+        reveals which opcode combinations are most often adjacent but unpairable
+        — the highest-count entries are the best candidates for new pairing rules.
+
+        Labels are the instruction mnemonic, except that loads and stores with
+        sp (x2) as their base register use the qualified form ``mnemonic(sp)``
+        (e.g. ``lw(sp)``, ``sw(sp)``).  Stack-relative accesses are subject to
+        different pairing constraints than heap/data accesses and benefit from
+        being counted separately.
 
         Note: the last instruction in the sequence (no successor) contributes
-        a (mnemonic, "") entry — i.e. it is counted as a singleton with an
-        empty partner mnemonic, since there is no adjacent instruction to
-        compare against.
+        a (label, "") entry — i.e. it is counted as a singleton with an empty
+        partner label, since there is no adjacent instruction to compare against.
 
-    unpaired_opcode_tally : {mnemonic: int}
-        Flat count of instructions that ended up unpaired, keyed by mnemonic.
-        Useful for "which opcodes most often miss pairing" without worrying
-        about the pairing partner.
+    unpaired_opcode_tally : {label: int}
+        Flat count of instructions that ended up unpaired, keyed by the same
+        qualified label used in singleton_tally (``lw(sp)`` etc. for
+        stack-relative accesses, plain mnemonic otherwise).  Useful for "which
+        opcodes most often miss pairing" without worrying about the partner.
 
     Size estimate
     -------------
@@ -1967,11 +1972,22 @@ class AssemblyScheduler:
             # No pair formed at position i: singleton.
             # Record the (a, b) opcode combination that failed to pair, using
             # the same adjacent instruction the scorer examined.  When i is the
-            # last instruction, record ("", "") as the partner mnemonic.
-            mn_a = real_scheduled[i].mnemonic
-            mn_b = real_scheduled[i + 1].mnemonic if i + 1 < total_instrs else ""
+            # last instruction, use "" as the partner label.
+            #
+            # Loads and stores with sp (x2) as their base register are given a
+            # qualified label  "lw(sp)"  rather than plain "lw", because a
+            # stack-relative access that fails to pair is a very different signal
+            # from a heap/data access that fails — they are subject to different
+            # rules and constraints.
+            def _tally_label(instr: "Instruction") -> str:
+                if instr.mem is not None and instr.mem[1] == "x2":
+                    return f"{instr.mnemonic}(sp)"
+                return instr.mnemonic
+
+            mn_a = _tally_label(real_scheduled[i])
+            mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
             key = (mn_a, mn_b)
-            singleton_tally[key]       = singleton_tally.get(key, 0) + 1
+            singleton_tally[key]        = singleton_tally.get(key, 0) + 1
             unpaired_opcode_tally[mn_a] = unpaired_opcode_tally.get(mn_a, 0) + 1
             i += 1
 
