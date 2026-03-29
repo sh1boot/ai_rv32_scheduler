@@ -679,3 +679,243 @@ def _classify_labels(source: str) -> tuple:
                 branch_targets.add(tgt)
     return frozenset(branch_targets), frozenset(globally_visible)
 
+
+# ---------------------------------------------------------------------------
+# CFG construction and whole-function liveness analysis
+# ---------------------------------------------------------------------------
+
+# Unconditional jumps — their only successor is the branch target.
+_UNCOND_JUMPS = frozenset({"j", "jal", "jalr", "jr"})
+# Conditional branches — successors are the branch target AND the fall-through.
+_COND_BRANCHES = frozenset({
+    "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+})
+
+def build_cfg_liveness(
+    source:          str,
+    branch_targets:  frozenset,
+    globally_visible: frozenset,
+) -> "dict[str, frozenset]":
+    """
+    Two-pass analysis of *source* that returns a mapping
+    ``{block_label: live_out_frozenset}`` for every basic block.
+
+    The live-out set of a block is the union of the live-in sets of all its
+    successors, propagated to a fixpoint.  Seeded from ABI calling-convention
+    rules at function boundaries and call/ret instructions.
+
+    The result is consumed by ``AssemblyScheduler.process()`` to provide
+    accurate ``live_out`` seeds to ``rename_destinations``, replacing the
+    conservative empty-set assumption for blocks that end in conditional
+    branches or fall-throughs.
+
+    Block identity
+    --------------
+    Each block is keyed by its opening barrier label (a string).  The
+    implicit entry block before the first barrier label in the file uses the
+    synthetic key ``_CFG_ENTRY``.
+
+    Successor rules
+    ---------------
+    ``ret`` / ``tail``           → no successors (function exit)
+    ``call`` / ``jal rd=x1``     → [next_label]  (return site; callee opaque)
+    ``jalr rd=x1``               → [next_label]  (indirect call; same)
+    ``j target`` / ``jal x0``    → [target]       (unconditional jump)
+    ``jalr x0`` / ``jr``         → []             (indirect jump; unknown)
+    conditional branch           → [target, next_label]  (both edges)
+    implicit fall-through        → [next_label]
+
+    ABI seeds
+    ---------
+    ``ret``  blocks: live_out ⊇ {a0, a1}
+    ``tail`` blocks: live_out ⊇ {a0–a7}
+    ``call`` blocks: live_out ⊇ args ∪ callee-saved  (caller must have loaded args)
+    function-entry blocks: live_in ⊇ {a0–a7}  (applied to live_out via backward pass)
+
+    Complexity
+    ----------
+    O(B × I) where B = number of blocks and I = iterations to fixpoint
+    (typically 2–5 for natural loops).  Each block's use/def sets are
+    computed once from ``parse_line`` during the first pass.
+    """
+    _CFG_ENTRY = "__cfg_entry__"
+
+    # ── Pass 1: parse blocks, collect use/def, record terminal instructions ──
+
+    # block_order  : list of label strings in source order
+    # block_use    : {label: set of registers read before written in block}
+    # block_def    : {label: set of registers written in block}
+    # block_term   : {label: Instruction | None} — last real instruction
+    # block_next   : {label: str | None} — label of the immediately following block
+
+    block_order: list = []
+    block_use:   dict = {}
+    block_def:   dict = {}
+    block_term:  dict = {}
+    block_next:  dict = {}     # populated in a second loop once order is known
+
+    cur_label    = _CFG_ENTRY
+    cur_use:  set = set()
+    cur_def:  set = set()
+    cur_term      = None
+
+    def _is_barrier(name: str) -> bool:
+        return name in branch_targets or name in globally_visible
+
+    def _commit_block(label: str) -> None:
+        block_order.append(label)
+        block_use[label]  = frozenset(cur_use)
+        block_def[label]  = frozenset(cur_def)
+        block_term[label] = cur_term
+
+    # Start with the implicit entry block.
+    block_order.clear()
+
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";", "//")):
+            continue
+
+        # Check for a label definition *before* the dot-prefix filter so that
+        # compiler-generated labels like ``.Lelse:`` are not discarded as
+        # assembler directives.
+        m = _LABEL_DEF.match(stripped)
+        if m:
+            name = m.group(1)
+            if _is_barrier(name):
+                _commit_block(cur_label)
+                cur_label = name
+                cur_use   = set()
+                cur_def   = set()
+                cur_term  = None
+            continue
+
+        # Skip assembler directives (lines starting with '.') and blank/comment.
+        if stripped.startswith("."):
+            continue
+
+        instr = parse_line(0, line)
+        if instr is None:
+            continue
+
+        # Update use/def for liveness: a register is in use[B] if it is read
+        # before being written within B; it is in def[B] if written anywhere.
+        for reg in instr.uses:
+            if reg != "x0" and reg not in cur_def:
+                cur_use.add(reg)
+        for reg in instr.defs:
+            cur_def.add(reg)
+
+        cur_term = instr
+
+    # Commit the last block.
+    _commit_block(cur_label)
+
+    # Populate block_next: each block's immediate textual successor.
+    for i, lbl in enumerate(block_order):
+        block_next[lbl] = block_order[i + 1] if i + 1 < len(block_order) else None
+
+    # ── Build successor lists from terminal instructions ──────────────────
+
+    def _successors(label: str) -> list:
+        """Return the list of successor block labels for *label*."""
+        term = block_term[label]
+        nxt  = block_next[label]   # textual fall-through (may be None)
+
+        if term is None:
+            # Empty block — falls through.
+            return [nxt] if nxt else []
+
+        mn = term.mnemonic
+
+        # Function exits: no successors within this translation unit.
+        if mn in ("ret", "tail"):
+            return []
+
+        # Calls: return site is the fall-through block.
+        if mn == "call":
+            return [nxt] if nxt else []
+        if mn in ("jal", "jalr") and "x1" in term.defs:
+            return [nxt] if nxt else []
+
+        # Unconditional jumps: sole successor is the explicit target.
+        if mn == "j":
+            tgt = term.operands[0] if term.operands else None
+            return [tgt] if tgt and tgt in block_use else []
+        if mn == "jal" and not term.defs:
+            # jal x0, target — pure jump
+            tgt = term.operands[-1] if term.operands else None
+            return [tgt] if tgt and tgt in block_use else []
+        if mn in ("jalr", "jr") and not term.defs:
+            # Indirect jump to unknown target.
+            return []
+
+        # Conditional branches: target + fall-through.
+        if mn in _COND_BRANCHES:
+            tgt = term.operands[-1] if term.operands else None
+            succs = []
+            if tgt and tgt in block_use:
+                succs.append(tgt)
+            if nxt:
+                succs.append(nxt)
+            return succs
+
+        # Default: fall-through.
+        return [nxt] if nxt else []
+
+    succs: dict = {lbl: _successors(lbl) for lbl in block_order}
+
+    # ── ABI seeds for live_out ─────────────────────────────────────────────
+    # These come from _abi_liveness_for_terminal semantics, re-derived here
+    # from the terminal mnemonic directly to avoid importing rv32_scheduler.
+
+    # Callee-saved: sp (x2), s0-s1 (x8-x9), s2-s11 (x18-x27).
+    _callee_saved = frozenset(
+        {"x2", "x8", "x9"} | {f"x{i}" for i in range(18, 28)}
+    )
+    _arg_regs     = frozenset(f"x{i}" for i in range(10, 18))
+    _ret_regs     = frozenset({"x10", "x11"})
+    _call_live_out = _arg_regs | _callee_saved
+
+    def _abi_seed(label: str) -> frozenset:
+        term = block_term[label]
+        if term is None:
+            return frozenset()
+        mn = term.mnemonic
+        if mn == "ret":
+            return _ret_regs
+        if mn == "tail":
+            return _arg_regs
+        if mn in ("call",) or (mn in ("jal", "jalr") and "x1" in term.defs):
+            return _call_live_out
+        return frozenset()
+
+    # ── Iterative backward dataflow to fixpoint ───────────────────────────
+    #
+    # live_out[B] = abi_seed[B]  ∪  ∪{ live_in[S] for S in succs[B] }
+    # live_in[B]  = use[B]       ∪  (live_out[B] − def[B])
+    #
+    # Iterate in reverse source order (approximate reverse-post-order)
+    # until no live_out set changes.
+
+    live_out: dict = {lbl: _abi_seed(lbl) for lbl in block_order}
+
+    MAX_ITER = 32   # far more than enough for any realistic CFG
+    for _ in range(MAX_ITER):
+        changed = False
+        for lbl in reversed(block_order):
+            # Compute new live_out as ABI seed ∪ live_in of each successor.
+            new_lo = _abi_seed(lbl)
+            for s in succs[lbl]:
+                if s in live_out:
+                    # live_in[s] = use[s] ∪ (live_out[s] − def[s])
+                    s_live_in = block_use[s] | (live_out[s] - block_def[s])
+                    new_lo = new_lo | s_live_in
+            if new_lo != live_out[lbl]:
+                live_out[lbl] = new_lo
+                changed = True
+        if not changed:
+            break
+
+    return live_out

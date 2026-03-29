@@ -24,7 +24,7 @@ from typing import Callable
 from rv32_core import (
     Instruction, DepGraph, parse_line, build_dep_graph, compute_liveness,
     _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF,
-    _classify_labels,
+    _classify_labels, build_cfg_liveness,
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
@@ -1103,6 +1103,7 @@ def _process_block(
     verbose:           bool = False,
     is_function_entry: bool = False,
     block_live_in:     frozenset = frozenset(),
+    cfg_live_out:      frozenset = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -1134,6 +1135,11 @@ def _process_block(
         cross-block ABI analysis.  Merged with any function-entry live-in.
         Typically ``_ABI_RETURN_SITE_LIVE_IN`` when the preceding block ended
         with a call instruction.
+    cfg_live_out
+        The live-out set for this block computed by the whole-function CFG
+        liveness pre-pass (``build_cfg_liveness``).  Merged with the ABI
+        terminal seed so the renamer has an accurate picture of which
+        registers are read by successor blocks.
     """
     # Flush leading pass-through text.
     for line in pass_lines:
@@ -1167,14 +1173,20 @@ def _process_block(
         # Determine ABI-mandated live-out and live-in sets for this block
         # from the terminal instruction's calling-convention semantics.
         abi_live_out, _ = _abi_liveness_for_terminal(real_scheduled)
-        abi_live_in     = _ABI_ARG_REGS if is_function_entry else frozenset()
+        # Merge with the CFG-computed live-out: cfg_live_out captures what
+        # successor blocks actually read, giving a tighter picture than the
+        # ABI terminal alone for blocks ending in conditional branches or
+        # fall-throughs.  Union is safe: we never mark a live register dead.
+        combined_live_out = abi_live_out | cfg_live_out
+
+        abi_live_in = _ABI_ARG_REGS if is_function_entry else frozenset()
         # Merge with any cross-block live-in provided by the caller (e.g.
         # the return-site live-in from the preceding call block).
         abi_live_in = abi_live_in | block_live_in
 
         real_scheduled = rename_destinations(
             real_scheduled, graph, pair_score,
-            live_out = abi_live_out,
+            live_out = combined_live_out,
             live_in  = abi_live_in,
         )
         if hasattr(pair_score, "_liveness_cell"):
@@ -1385,6 +1397,15 @@ class AssemblyScheduler:
 
         # Classify labels for barrier/non-barrier scheduling decisions.
         branch_targets, globally_visible = _classify_labels(self.source)
+
+        # Whole-function CFG liveness pre-pass.  Computes live_out for every
+        # basic block in a single O(N) parse + a few dataflow iterations, so
+        # the renamer has an accurate exit-liveness seed for blocks that end in
+        # conditional branches or fall-throughs — not just ret/call/tail.
+        cfg_live_out_table: dict = build_cfg_liveness(
+            self.source, branch_targets, globally_visible
+        )
+
         # Streaming parse: accumulate one block at a time and hand it off.
         # A block boundary is any barrier label (branch target or globally
         # visible symbol).  Non-barrier labels are folded in as pass-through
@@ -1396,19 +1417,23 @@ class AssemblyScheduler:
         instructions:   list = []   # Instruction objects for the current block
         sentinel_texts: dict = {}   # {sentinel.index: [line, ...]} — label + intra-block pass-throughs
         last_sentinel_idx: "int | None" = None   # index of most recent sentinel in this block
+        # Label of the block currently being accumulated (used to look up its
+        # CFG live-out from cfg_live_out_table).
+        current_block_label:    str      = "__cfg_entry__"
         # True when the block currently being accumulated begins at a globally-
         # visible (function-entry) label.  Propagated to _process_block so the
         # renamer can treat a0–a7 as live-in.
-        current_block_is_entry: bool = False
+        current_block_is_entry: bool     = False
         # ABI-derived live-in set for the block currently being accumulated,
         # computed from the terminal instruction of the *preceding* block.
         # Forwarded to _process_block so the renamer knows which registers
         # survive a call at the preceding block boundary.
-        current_block_live_in: frozenset = frozenset()
+        current_block_live_in:  frozenset = frozenset()
 
         def _flush_block():
             """Process and emit the accumulated block, then reset state."""
-            nonlocal last_sentinel_idx, current_block_is_entry, current_block_live_in
+            nonlocal last_sentinel_idx, current_block_is_entry
+            nonlocal current_block_live_in, current_block_label
             st = _process_block(
                 pass_lines         = pass_lines,
                 instructions       = instructions,
@@ -1419,6 +1444,8 @@ class AssemblyScheduler:
                 verbose            = verbose,
                 is_function_entry  = current_block_is_entry,
                 block_live_in      = current_block_live_in,
+                cfg_live_out       = cfg_live_out_table.get(current_block_label,
+                                                            frozenset()),
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1428,6 +1455,7 @@ class AssemblyScheduler:
             last_sentinel_idx      = None
             current_block_is_entry = False
             current_block_live_in  = frozenset()
+            current_block_label    = "__cfg_entry__"
 
         def _route_pass(line: str) -> None:
             """
@@ -1464,7 +1492,7 @@ class AssemblyScheduler:
             ``call`` the return-site block inherits callee-saved + a0/a1).
             """
             nonlocal instr_index, last_sentinel_idx
-            nonlocal current_block_is_entry, current_block_live_in
+            nonlocal current_block_is_entry, current_block_live_in, current_block_label
             is_entry = label_name in globally_visible
 
             # Compute next-block live-in from the terminal of the block we're
@@ -1482,6 +1510,8 @@ class AssemblyScheduler:
                 verbose            = verbose,
                 is_function_entry  = current_block_is_entry,
                 block_live_in      = current_block_live_in,
+                cfg_live_out       = cfg_live_out_table.get(current_block_label,
+                                                            frozenset()),
             )
             all_stats.append(st)
             instructions.clear()
@@ -1501,6 +1531,7 @@ class AssemblyScheduler:
             # analysis of the preceding block's terminal instruction.
             current_block_is_entry = is_entry
             current_block_live_in  = next_live_in
+            current_block_label    = label_name
 
             sentinel = Instruction(index=instr_index, raw="", mnemonic=_SENTINEL_MN)
             sentinel.is_barrier = True
