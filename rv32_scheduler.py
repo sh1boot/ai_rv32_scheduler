@@ -1895,8 +1895,136 @@ def _classify_labels(source: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Per-block processor
+# objdump disassembly input support
 # ---------------------------------------------------------------------------
+
+# objdump instruction line: hex-address colon, one or more hex words, then mnemonic
+_OBJDUMP_INSTR = re.compile(
+    r"^([0-9a-f]+):\s+"        # address:
+    r"(?:[0-9a-f]{2,8}\s+)+"   # one or more hex encoding words
+    r"(\S.*)$"                  # mnemonic and operands (captured)
+)
+# objdump label line: hex-address <name>:
+_OBJDUMP_LABEL = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$")
+# objdump data line: address + multiple hex words + optional ASCII (no mnemonic starting with a letter)
+_OBJDUMP_DATA  = re.compile(r"^[0-9a-f]+:\s+(?:[0-9a-f]{8}\s+){2,}")
+# Trailing  <name>  or  <name+0xOFFSET>  annotation on branch operands.
+_ANGLE_ANNOT   = re.compile(r"\s+<[^>]+>")
+# Operand that is a bare hex address (objdump branch target before annotation).
+_HEX_ADDR_OP   = re.compile(r"^[0-9a-f]+$")
+
+
+def _is_objdump(source: str) -> bool:
+    """
+    Return True when *source* looks like ``objdump -d`` output.
+
+    Detection heuristic: the first non-blank, non-comment line contains
+    ``file format`` (the standard objdump file-format header), or the
+    second non-blank line is ``Disassembly of section``.
+    """
+    for line in source.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "file format" in s or s.startswith("Disassembly of section"):
+            return True
+        # First substantive line that looks like code, not a header → not objdump
+        return False
+    return False
+
+
+def _objdump_line(line: str) -> tuple:
+    """
+    Classify and normalise one line of objdump output.
+
+    Returns ``(kind, text)`` where kind is one of:
+      ``'label'``   — label definition; text is the bare label name (e.g. ``_start``)
+      ``'instr'``   — instruction; text is the canonical assembly line ready
+                      for ``parse_line``, with address/encoding stripped and
+                      ``<name>`` branch annotations removed
+      ``'pass'``    — pass-through; text is the original line unchanged
+
+    Angle-bracket annotations on operands (``80000034 <bss_done>``) are
+    stripped, leaving the bare hex address (``80000034``).  This is the
+    address the branch will actually jump to, and it is what ``parse_line``
+    would see as a label reference in plain assembly.  The dependency graph
+    does not need the symbolic name — it only needs to know the instruction
+    is a branch.
+    """
+    stripped = line.rstrip()
+
+    # Blank line
+    if not stripped.strip():
+        return ('pass', line)
+
+    # Label: "80000000 <_start>:"
+    m = _OBJDUMP_LABEL.match(stripped)
+    if m:
+        name = m.group(2)
+        # objdump uses "name+0xoffset" for labels inside functions — these
+        # are not real label definitions, just display hints.  Drop them.
+        if "+" in name or " " in name:
+            return ('pass', line)
+        return ('label', name)
+
+    # Data rows: multiple hex words with no mnemonic letter
+    if _OBJDUMP_DATA.match(stripped):
+        return ('pass', line)
+
+    # Instruction line
+    m = _OBJDUMP_INSTR.match(stripped)
+    if m:
+        rest = m.group(2)   # "mv\ts0,a0" or "bgeu\tt0,t1,80000034 <bss_done>"
+        # Strip inline comments that objdump adds after  #
+        rest = rest.split(" # ")[0].split("\t# ")[0]
+        # Remove <name> and <name+offset> annotations from operands
+        rest = _ANGLE_ANNOT.sub("", rest)
+        # Normalise multiple spaces/tabs between mnemonic and operands to a
+        # single tab so parse_line sees a familiar format
+        parts = rest.split(None, 1)
+        if not parts:
+            return ('pass', line)
+        canonical = "\t" + parts[0]
+        if len(parts) > 1:
+            canonical += "\t" + parts[1]
+        return ('instr', canonical)
+
+    # Ellipsis padding, section headers, file-format line, etc.
+    return ('pass', line)
+
+
+def _classify_labels_objdump(source: str) -> tuple:
+    """
+    Like ``_classify_labels`` but for objdump disassembly format.
+
+    In objdump output there are no ``.globl`` directives, so
+    ``globally_visible`` is derived from function-entry labels: a label is
+    a function entry if it appears as ``ADDR <name>:`` at a line by itself
+    (not as ``ADDR <name+offset>:`` which is an intra-function hint label).
+
+    ``branch_targets`` is derived from the ``<name>`` annotations that
+    objdump attaches to branch/jump target addresses.  Every name that
+    appears inside angle brackets on a branch line is a barrier.
+    """
+    branch_targets:   set = set()
+    globally_visible: set = set()
+
+    for line in source.splitlines():
+        # Function-entry label → globally visible (treated as barrier)
+        m = _OBJDUMP_LABEL.match(line.rstrip())
+        if m:
+            name = m.group(2)
+            if "+" not in name and " " not in name:
+                globally_visible.add(name)
+            continue
+
+        # Branch targets: extract <name> annotations from branch/jump lines
+        if _BRANCH_LIKE.match(line):
+            for annot in re.findall(r"<([^>+]+)(?:\+[^>]*)?>", line):
+                branch_targets.add(annot)
+
+    return frozenset(branch_targets), frozenset(globally_visible)
+
 
 def _process_block(
     pass_lines:   list,        # pass-through text lines that precede this block
@@ -2340,8 +2468,12 @@ class AssemblyScheduler:
         if out is None:
             out = sys.stdout
 
-        # Pre-pass: classify labels without creating Instruction objects.
-        branch_targets, globally_visible = _classify_labels(self.source)
+        # Detect input format and select the appropriate label classifier.
+        objdump = _is_objdump(self.source)
+        if objdump:
+            branch_targets, globally_visible = _classify_labels_objdump(self.source)
+        else:
+            branch_targets, globally_visible = _classify_labels(self.source)
 
         # Streaming parse: accumulate one block at a time and hand it off.
         # A block boundary is any barrier label (branch target or globally
@@ -2376,6 +2508,90 @@ class AssemblyScheduler:
             last_sentinel_idx = None
 
         _LABEL_RE = re.compile(r"^\s*(\.?\w+)\s*:")
+
+        for line in self.source.splitlines():
+            # For objdump input, normalise the line before classification.
+            # _objdump_line returns ('label', name), ('instr', canonical), or
+            # ('pass', original).  We then re-enter the existing logic using
+            # the normalised text so all downstream code is format-agnostic.
+            if objdump:
+                kind, text = _objdump_line(line)
+                if kind == 'pass':
+                    # Blank, section header, ellipsis, data row, etc.
+                    has_real = any(i.mnemonic != "__label__" for i in instructions)
+                    if not has_real and last_sentinel_idx is not None:
+                        sentinel_texts[last_sentinel_idx].append(line)
+                    elif has_real:
+                        trailing_pass.append(line)
+                    else:
+                        pass_lines.append(line)
+                    continue
+                elif kind == 'label':
+                    label_name = text   # already extracted bare name
+                    # Fall through to the barrier-or-passthrough decision below,
+                    # but skip the regex match — we already have the name.
+                    if self._is_barrier_label(label_name,
+                                              branch_targets, globally_visible):
+                        st = _process_block(
+                            pass_lines     = pass_lines,
+                            instructions   = instructions,
+                            sentinel_texts = sentinel_texts,
+                            pair_score     = pair_score,
+                            rename         = rename,
+                            opcode_tally   = opcode_tally,
+                            out            = out,
+                            verbose        = verbose,
+                        )
+                        all_stats.append(st)
+                        instructions.clear()
+                        sentinel_texts.clear()
+                        last_sentinel_idx = None
+                        pass_lines.clear()
+                        pass_lines.extend(trailing_pass)
+                        trailing_pass.clear()
+                        sentinel = Instruction(
+                            index    = instr_index,
+                            raw      = "",
+                            mnemonic = "__label__",
+                        )
+                        sentinel.is_barrier = True
+                        sentinel_texts[instr_index] = [line]
+                        last_sentinel_idx = instr_index
+                        instr_index += 1
+                        instructions.append(sentinel)
+                    else:
+                        has_real = any(i.mnemonic != "__label__" for i in instructions)
+                        if not has_real and last_sentinel_idx is not None:
+                            sentinel_texts[last_sentinel_idx].append(line)
+                        elif has_real:
+                            trailing_pass.append(line)
+                        else:
+                            pass_lines.append(line)
+                    continue
+                else:
+                    # kind == 'instr': text is the canonical assembly string.
+                    # Parse it, then store the *original* line as raw so the
+                    # emitted output preserves the objdump address/encoding prefix.
+                    instr = parse_line(instr_index, text)
+                    if instr is None:
+                        has_real = any(i.mnemonic != "__label__" for i in instructions)
+                        if not has_real and last_sentinel_idx is not None:
+                            sentinel_texts[last_sentinel_idx].append(line)
+                        elif has_real:
+                            trailing_pass.append(line)
+                        else:
+                            pass_lines.append(line)
+                    else:
+                        if trailing_pass:
+                            if last_sentinel_idx is not None:
+                                sentinel_texts[last_sentinel_idx].extend(trailing_pass)
+                            else:
+                                pass_lines.extend(trailing_pass)
+                            trailing_pass.clear()
+                        instr.raw = line   # preserve original objdump line
+                        instr_index += 1
+                        instructions.append(instr)
+                    continue
 
         for line in self.source.splitlines():
             stripped = line.strip()
