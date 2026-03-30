@@ -175,26 +175,27 @@ _DUAL_MOVE_MN = frozenset({"mv", "li"})
 
 def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool:
     """
-    Single-bit test + conditional branch on x31 (t6).
+    Single-bit test + conditional branch (bit-branch form).
 
     Matches:
-        andi  x31, rs, imm       (imm is a positive power of two)
-        beqz / bnez  x31, label  (x31 dead after)
+        andi  rd, rs, imm        (imm is a positive power of two; rd != rs)
+        beqz / bnez  rd, label   (rd dead after B)
 
-    The immediate must have exactly one bit set, so the andi isolates a
-    single bit from rs.  The compact encoding can represent this as a bit
-    index (log2(imm)) rather than a full 12-bit immediate, making it more
-    space-efficient than the general cmp_branch form.
+    The immediate must have exactly one bit set, so the andi isolates a single
+    bit from rs.  The compact encoding represents it as a bit index rather than
+    a full 12-bit immediate.  rd must differ from rs (chain form — rs preserved)
+    and will be renamed to x31 by the renamer if liveness confirms it is safe.
 
-    Canonical examples:
-        andi  x31, a0, 4      # test bit 2
-        beqz  x31, .skip      # branch if bit 2 was clear
+    Canonical examples (pre-rename):
+        andi  a0, s6, 4      # test bit 2; a0 → x31 after rename
+        beqz  a0, .skip
 
-        andi  x31, t1, 256    # test bit 8
-        bnez  x31, .found     # branch if bit 8 was set
+        andi  a1, t1, 256    # test bit 8; a1 → x31 after rename
+        bnez  a1, .found
     """
-    if not a.defs or a.defs[0] != "x31":
+    if not a.defs:
         return False
+    rd = a.defs[0]
     if a.mnemonic != "andi":
         return False
     imm = a.imm
@@ -202,11 +203,14 @@ def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool
         return False
     if imm & (imm - 1):           # not a power of two
         return False
+    # Chain form: rd must differ from rs1 so the source is preserved.
+    if a.uses and a.uses[0] == rd:
+        return False
     if b.mnemonic not in ("beqz", "bnez"):
         return False
-    if "x31" not in b.uses:
+    if rd not in b.uses:
         return False
-    if "x31" not in liveness.get(b.index, frozenset()):
+    if rd not in liveness.get(b.index, frozenset()):
         return False
     return True
 
@@ -214,33 +218,44 @@ def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool
 def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
                            liveness: dict) -> bool:
     """
-    Compare into x31 (t6) + conditional branch reading x31 (x31 dead after).
+    Compare + conditional branch where the compare result register is dead
+    after the branch (chain form).
 
     Matches:
-        <cmp-op>  x31, rs, ...    (any _CMP_MNEMONICS mnemonic)
-        beqz / bnez  x31, label   (x31 dead after B)
+        <cmp-op>  rd, rs, ...    (any _CMP_MNEMONICS mnemonic; rd != rs1)
+        beqz / bnez  rd, label   (rd dead after B)
 
-    x31 is the implicit chain register: it carries the flag from A to B and
-    is not live past B.  The source register rs is *preserved* — A does not
-    overwrite it.  Use this rule when the value in rs is still needed on
-    the taken or fall-through path after the branch.
+    rd must differ from rs1 — this is the key distinction from cmp_branch_rsd:
+    the source register is *preserved* because rd overwrites a different slot.
+    The compact encoding uses x31 as an implicit chain register, so rd must be
+    (or be renameable to) x31.  The renamer will rename rd → x31 if this rule
+    scores the pair and liveness confirms the rename is safe.
 
-    Canonical examples:
-        sltiu  x31, a0, 1    # x31 = (a0 == 0); a0 still live
-        bnez   x31, .done
+    The liveness check — rd dead after B — serves double duty: it confirms the
+    rename is safe (nothing reads rd past B) AND is required by the encoding
+    (x31 is a scratch register that must not be live across the pair).
 
-        seqz   x31, t1       # x31 = (t1 == 0); t1 still live
-        beqz   x31, .loop
+    Canonical examples (pre-rename):
+        andi   a0, s6, 1     # rd=a0, rs1=s6 (rd != rs1) → rename a0 → x31
+        bne    a0, zero, .L
+
+        sltiu  a1, a0, 1     # rd=a1, rs1=a0 (rd != rs1) → rename a1 → x31
+        bnez   a1, .done
     """
-    if not a.defs or a.defs[0] != "x31":
+    if not a.defs:
         return False
+    rd = a.defs[0]
     if a.mnemonic not in _CMP_MNEMONICS:
+        return False
+    # Chain form: rd must differ from rs1 so the source is preserved.
+    # If rd == rs1 this is cmp_branch_rsd territory instead.
+    if a.uses and a.uses[0] == rd:
         return False
     if b.mnemonic not in _BRANCH_ZERO:
         return False
-    if "x31" not in b.uses:
+    if rd not in b.uses:
         return False
-    if "x31" not in liveness.get(b.index, frozenset()):
+    if rd not in liveness.get(b.index, frozenset()):
         return False
     return True
 
@@ -507,19 +522,22 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
+        if a.defs and a.mnemonic in _CMP_MNEMONICS:
+            rd = a.defs[0]
+            rsd = a.uses and a.uses[0] == rd
+            if rsd:
+                # RSD form (rd == rs1): eligible for cmp_branch_rsd only.
+                eligible.add("cmp_branch_rsd")
+            else:
+                # Non-RSD form (rd != rs1): eligible for cmp_branch_chain.
+                # The renamer will rename rd → x31 if liveness permits.
+                eligible.add("cmp_branch_chain")
+                if (a.mnemonic == "andi" and a.imm is not None
+                        and a.imm > 0 and not (a.imm & (a.imm - 1))):
+                    eligible.add("bit_branch")
         if a.defs and a.defs[0] == "x31":
-            eligible.add("cmp_branch_chain")
-            if a.mnemonic == "andi" and a.imm is not None and a.imm > 0 and not (a.imm & (a.imm - 1)):
-                eligible.add("bit_branch")
             if a.dual_arith_chain_ok:
                 eligible.add("dual_arith_chain")
-        if a.defs and a.mnemonic in _CMP_MNEMONICS:
-            # cmp_branch_rsd requires rd == rs1 (RSD form).  Only add to
-            # eligible when this structural pre-condition holds, so we don't
-            # mask cmp_branch_chain for instructions that write x31 but whose
-            # source register is different from their destination.
-            if a.uses and a.uses[0] == a.defs[0]:
-                eligible.add("cmp_branch_rsd")
         if a.mnemonic == "lw":
             eligible.add("adjacent_load_pair")
         if a.mnemonic == "sw":
