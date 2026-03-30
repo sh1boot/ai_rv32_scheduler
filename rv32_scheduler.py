@@ -1807,35 +1807,10 @@ def main():
 
     if sched.last_stats is not None:
         st = sched.last_stats
-        print(f"\n# --- report ---", file=sys.stderr)
-        print(f"# scorer:       {args.scorer}", file=sys.stderr)
-        print(f"# instructions: {st.total_instrs}", file=sys.stderr)
-        print(f"# paired:       {st.paired_instrs}  ({st.successful_pairs} pairs)", file=sys.stderr)
-        print(f"# unpaired:     {st.unpaired_instrs}", file=sys.stderr)
-        all_rules = sorted(
-            set(st.rule_counts) | set(st.rule_shadow) | set(st.rule_missed),
-            key=lambda r: -st.rule_counts.get(r, 0)
-        )
-        if all_rules:
-            print("# rule breakdown:", file=sys.stderr)
-            for rule in all_rules:
-                label  = rule if rule else "(unnamed)"
-                won    = st.rule_counts.get(rule, 0)
-                shadow = st.rule_shadow.get(rule, 0)
-                missed = st.rule_missed.get(rule, 0)
-                parts  = [f"{won:4d} won"]
-                if shadow: parts.append(f"{shadow:3d} shadowed")
-                if missed: parts.append(f"{missed:3d} missed")
-                print(f"#   {label:30s} {'  '.join(parts)}", file=sys.stderr)
-        if st.rvc_eligible:
-            print(f"# rvc eligible: {st.rvc_eligible} instructions"
-                  f"  (ceiling {st.rvc_eligible // 2} rvc pairs)", file=sys.stderr)
-        print(f"# size estimate: {st.estimated_bytes} bytes"
-              f"  (baseline {st.baseline_bytes},"
-              f" saving {st.saving_bytes} = {st.saving_pct:.1f}%)", file=sys.stderr)
-        if args.opcode_tally:
-            for line in st._opcode_tally_lines():
-                print(line, file=sys.stderr)
+        src_label = args.input if args.input != "-" else "<stdin>"
+        print(f"\n# --- report: {args.scorer}  {src_label} ---", file=sys.stderr)
+        for line in st.summary_lines(opcode_tally=args.opcode_tally):
+            print(line, file=sys.stderr)
 
 if __name__ == "__main__":
     main()
