@@ -79,9 +79,17 @@ _RE_LABEL_HDR = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$", re.IGNORECASE)
 #   "ADDR:  HEXBYTES  mnemonic  operands"
 # Group 1 = hex address, group 2 = hex encoding bytes (no spaces),
 # group 3 = everything after the hex encoding (mnemonic + operands + comment).
+#
+# The hex bytes column and the mnemonic column are separated by at least two
+# spaces (or a tab) in objdump output.  Individual hex byte groups within the
+# encoding field are separated by a single space.  Requiring \s{2,} as the
+# terminator prevents all-hex mnemonics like "add" from being consumed as an
+# extra hex group when only one space separates them from the last hex byte.
 _RE_INSTR = re.compile(
-    r"^([0-9a-f]+):\s+"          # address
-    r"((?:[0-9a-f]{2,8}\s+)+)"   # hex-byte groups (captured)
+    r"^([0-9a-f]+):\s+"           # address
+    r"((?:[0-9a-f]{2,8} )*"       # hex-byte groups separated by single spaces
+    r"[0-9a-f]{2,8})"             # last hex-byte group (no trailing space)
+    r"\s{2,}"                     # 2+ spaces separating encoding from mnemonic
     r"(\S.*)$",                   # mnemonic + operands (+ optional comment)
     re.IGNORECASE,
 )
