@@ -447,20 +447,40 @@ def parse_line(index: int, line: str):
     instr.defs, instr.uses = defs, uses
     instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
 
+    # Normalise pseudo-instructions that are encodings of a standard instruction
+    # with a fixed immediate.  Downstream analysis (dual-arith eligibility, cmp
+    # rules, can_compress) keys on the canonical mnemonic and the imm field, so
+    # the pseudo must be translated before those checks run.
+    #
+    # zext.b rd, rs  ==  andi rd, rs, 0xff
+    # The immediate 255 is outside the 5-bit signed dual-arith range, so this
+    # instruction will not satisfy dual_arith_ok, but it *will* be visible to
+    # _CMP_MNEMONICS rules (cmp_branch_rsd/chain) and to can_compress (andi is
+    # rvc-eligible).  The raw source line is preserved unchanged in instr.raw.
+    if mnemonic == "zext.b":
+        instr.mnemonic = "andi"
+        instr.imm      = 0xff
+        mnemonic       = "andi"
+
     if mnemonic in ("call", "tail", "ret"):
         instr.is_barrier = True
 
     # Cache immediate and memory operand at parse time.
-    _code = re.split(r"[#;]", instr.raw)[0].strip()
-    _parts = _code.split(None, 1)
-    if len(_parts) >= 2:
-        _ops = [o.strip() for o in _parts[1].split(",")]
-        _last = _ops[-1].strip()
-        if _IMM_RE.fullmatch(_last):
-            try:
-                instr.imm = int(_last, 0)
-            except ValueError:
-                pass
+    # Skip the imm scan if a normalisation step already set instr.imm.
+    if instr.imm is None:
+        _code = re.split(r"[#;]", instr.raw)[0].strip()
+        _parts = _code.split(None, 1)
+        if len(_parts) >= 2:
+            _ops = [o.strip() for o in _parts[1].split(",")]
+            _last = _ops[-1].strip()
+            if _IMM_RE.fullmatch(_last):
+                try:
+                    instr.imm = int(_last, 0)
+                except ValueError:
+                    pass
+    else:
+        _code = re.split(r"[#;]", instr.raw)[0].strip()
+        _parts = _code.split(None, 1)
     if (instr.is_load or instr.is_store) and len(_parts) >= 2:
         _ops2 = [o.strip() for o in _parts[1].split(",")]
         _m = _MEM_RE.match(_ops2[-1])

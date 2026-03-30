@@ -514,7 +514,12 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             if a.dual_arith_chain_ok:
                 eligible.add("dual_arith_chain")
         if a.defs and a.mnemonic in _CMP_MNEMONICS:
-            eligible.add("cmp_branch_rsd")
+            # cmp_branch_rsd requires rd == rs1 (RSD form).  Only add to
+            # eligible when this structural pre-condition holds, so we don't
+            # mask cmp_branch_chain for instructions that write x31 but whose
+            # source register is different from their destination.
+            if a.uses and a.uses[0] == a.defs[0]:
+                eligible.add("cmp_branch_rsd")
         if a.mnemonic == "lw":
             eligible.add("adjacent_load_pair")
         if a.mnemonic == "sw":
