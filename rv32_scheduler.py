@@ -759,12 +759,23 @@ def rename_destinations(
 
     # If the scoring function holds a mutable liveness cell (e.g. compact32),
     # capture it so try_rename can refresh it during trial scoring.
-    _liveness_cell = getattr(pair_score, "_liveness_cell", None)
+    _liveness_cell  = getattr(pair_score, "_liveness_cell", None)
+    # Eligibility cache inside the scorer (keyed by instruction index).
+    # Must be invalidated whenever an instruction's registers change so that
+    # _a_eligible() is re-run with the current defs/uses.
+    _elig_cache_ref = getattr(pair_score, "_elig_cache",    None)
 
     def _refresh_liveness():
         """Recompute and install fresh liveness if the scorer needs it."""
         if _liveness_cell is not None:
             _liveness_cell[0] = compute_liveness(scheduled)
+
+    def _invalidate_elig(pos: int):
+        """Drop the cached eligibility for the instruction at *pos*.
+        Called after _apply_rename so the scorer recomputes eligibility from
+        the instruction's current (post-rename) register state."""
+        if _elig_cache_ref is not None:
+            _elig_cache_ref.pop(scheduled[pos].index, None)
 
     def _greedy_pair_count(seq, lo: int, hi: int) -> int:
         """Greedy pair count over seq[lo..hi].
@@ -810,7 +821,8 @@ def rename_destinations(
 
         # Apply in-place, keeping undo info in case we need to roll back.
         undo = _apply_rename(scheduled, pos, window_end, rd, new_rd)
-        _refresh_liveness()   # scorer may need updated liveness
+        _invalidate_elig(pos)   # defs[0] changed; drop stale eligibility
+        _refresh_liveness()     # scorer may need updated liveness
 
         score_after_local = _greedy_pair_count(scheduled, scan_lo, scan_hi)
 
@@ -820,7 +832,8 @@ def rename_destinations(
             return (new_score,)
         else:
             _undo_rename(scheduled, undo)
-            _refresh_liveness()  # restore liveness to pre-rename state
+            _invalidate_elig(pos)   # scoring may have re-cached the trial state
+            _refresh_liveness()     # restore liveness to pre-rename state
             return None
 
     # -------------------------------------------------------------------------
@@ -929,10 +942,12 @@ def rename_destinations(
                 scan_hi_c = min(n - 1, window_end + 1)
                 sb_c = _greedy_pair_count(scheduled, scan_lo_c, scan_hi_c)
                 undo = _apply_rename(scheduled, pos_src, window_end, rd_src, target)
+                _invalidate_elig(pos_src)   # defs[0] changed; drop stale eligibility
                 sa_c = _greedy_pair_count(scheduled, scan_lo_c, scan_hi_c)
                 if sa_c > sb_c:
                     return (score_ref + sa_c - sb_c,)
                 _undo_rename(scheduled, undo)
+                _invalidate_elig(pos_src)   # clear entry cached during the trial
                 return None
 
             # (a) Single rename of A toward B's registers / temps
@@ -993,6 +1008,8 @@ def rename_destinations(
                                                    info_a[0], rd_a, ta)
                             undo_b = _apply_rename(scheduled, pair_start + 1,
                                                    info_b[0], rd_b, tb)
+                            _invalidate_elig(pair_start)
+                            _invalidate_elig(pair_start + 1)
                             score_after_joint = _greedy_pair_count(scheduled, jlo, jhi)
                             if score_after_joint > score_before_joint:
                                 score_before = score_before + score_after_joint - score_before_joint
@@ -1000,6 +1017,8 @@ def rename_destinations(
                                 break
                             _undo_rename(scheduled, undo_b)
                             _undo_rename(scheduled, undo_a)
+                            _invalidate_elig(pair_start)
+                            _invalidate_elig(pair_start + 1)
                         if changed:
                             break
 

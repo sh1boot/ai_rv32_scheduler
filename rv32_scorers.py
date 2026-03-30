@@ -417,10 +417,19 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     Two arithmetic operations linked through t6 (x31) as an implicit
     intermediate register.
 
-    Instruction A writes its result to t6; instruction B reads t6 as rs1;
-    t6 must be dead after B.
+    Instruction A writes its result to t6; instruction B reads t6 as **rs1**
+    (``uses[0]``); t6 must be dead after B.
+
+    Note: the chain register must be rs1 of B, not rs2.  For a commutative
+    operation like ``add``, the operand order in the source matters:
+        add  rd, t6, rs2   ← matches  (t6 is rs1 = uses[0])
+        add  rd, rs1, t6   ← does NOT match  (t6 is rs2 = uses[1])
+    The renamer will rename A's destination to t6 if doing so improves the
+    score, which requires A to already have t6 as uses[0] after rename (i.e.
+    the RSD form: rd == rs1 before rename).
     """
-    if not a.dual_arith_chain_ok:
+    if not (a.defs and a.defs[0] == _CHAIN_REG
+            and _dual_arith_ok(a, allow_chain_reg=True)):
         return False
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
@@ -590,8 +599,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
                 if (a.mnemonic == "andi" and a.imm is not None
                         and a.imm > 0 and not (a.imm & (a.imm - 1))):
                     eligible.add("bit_branch")
-        if a.defs and a.defs[0] == "x31":
-            if a.dual_arith_chain_ok:
+        if a.defs and a.defs[0] == _CHAIN_REG:
+            if _dual_arith_ok(a, allow_chain_reg=True):
                 eligible.add("dual_arith_chain")
         if a.mnemonic == "lw":
             eligible.add("adjacent_load_pair")
@@ -601,7 +610,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("pre_increment")
         if a.mnemonic in _MEM_OPS:
             eligible.add("post_increment")
-        if a.dual_arith_ok:
+        if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
@@ -639,6 +648,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         return ""
 
     _score._liveness_cell = cell
+    _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
     _score._describe_pair = _describe
     _score._rule_list = COMPACT32_RULES
     return _score
