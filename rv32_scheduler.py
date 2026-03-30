@@ -114,6 +114,11 @@ class PairStats:
     saving_pct:       float
     singleton_tally:        dict   # {(mn_a, mn_b): count} — unpaired adjacent pairs
     unpaired_opcode_tally:  dict   # {mnemonic: count} — flat singleton opcode counts
+    # Unpaired instructions split by rvc eligibility.
+    # unpaired_rvc     : unpaired instructions that satisfy can_compress()
+    # unpaired_non_rvc : unpaired instructions that do not
+    unpaired_rvc:     int = 0
+    unpaired_non_rvc: int = 0
 
     @classmethod
     def empty(cls) -> "PairStats":
@@ -126,6 +131,7 @@ class PairStats:
             estimated_bytes=0, baseline_bytes=0,
             saving_bytes=0, saving_pct=0.0,
             singleton_tally={}, unpaired_opcode_tally={},
+            unpaired_rvc=0, unpaired_non_rvc=0,
         )
 
     def summary_lines(self, opcode_tally: bool = False) -> list:
@@ -134,11 +140,42 @@ class PairStats:
         opcode_tally: when True, append the singleton opcode-pair tally and
             the flat unpaired-opcode tally sections.  Omitted by default to
             keep normal output concise.
+
+        Output structure
+        ----------------
+        Two header rows use identical layout so they can be compared directly:
+
+          # pairs:       A/N  (2A of T instructions paired)
+          # rvc ceiling: C/N  (E of T instructions eligible)
+
+        where A = successful pairs, N = possible pairs (T//2), T = total
+        instructions, C = rvc_eligible//2 (max pairs if all eligible paired),
+        E = rvc_eligible.  Both rows share the same /N denominator and the
+        same "of T" total so the numbers are immediately comparable.
+
+        Rule rows follow at one level of indentation, then the unpaired
+        breakdown, then the size estimate.
         """
+        # ── Header rows: pairs achieved vs rvc ceiling ───────────────────
+        # Pad the shorter label so the numeric columns align.
+        lbl_pairs = "pairs:"
+        lbl_rvc   = "rvc ceiling:"
+        hdr_w     = max(len(lbl_pairs), len(lbl_rvc))
+
         lines = [
-            f"# pairs:     {self.successful_pairs}/{self.possible_pairs}"
+            f"# {lbl_pairs.ljust(hdr_w)}  "
+            f"{self.successful_pairs}/{self.possible_pairs}"
             f"  ({self.paired_instrs} of {self.total_instrs} instructions paired)",
         ]
+        if self.rvc_eligible:
+            ceiling = self.rvc_eligible // 2
+            lines.append(
+                f"# {lbl_rvc.ljust(hdr_w)}  "
+                f"{ceiling}/{self.possible_pairs}"
+                f"  ({self.rvc_eligible} of {self.total_instrs} instructions eligible)"
+            )
+
+        # ── Per-rule rows ────────────────────────────────────────────────
         all_rules = sorted(
             set(self.rule_counts) | set(self.rule_shadow) | set(self.rule_missed),
             key=lambda r: -self.rule_counts.get(r, 0)
@@ -152,11 +189,15 @@ class PairStats:
             if shadow: parts.append(f"{shadow} shadowed")
             if missed: parts.append(f"{missed} missed")
             lines.append(f"#   {label}: {'  '.join(parts)}")
-        if self.rvc_eligible:
+
+        # ── Unpaired breakdown ───────────────────────────────────────────
+        if self.unpaired_instrs:
             lines.append(
-                f"# rvc eligible: {self.rvc_eligible} instructions"
-                f"  (ceiling {self.rvc_eligible // 2} rvc pairs)"
+                f"# unpaired:  {self.unpaired_instrs} total"
+                f"  —  {self.unpaired_rvc} rvc-eligible,"
+                f"  {self.unpaired_non_rvc} not"
             )
+
         lines.append(
             f"# size est:  {self.estimated_bytes} bytes"
             f"  (baseline {self.baseline_bytes},"
@@ -219,6 +260,8 @@ class PairStats:
         saving_bytes     = sum(s.saving_bytes      for s in stats)
         saving_pct       = ((saving_bytes / baseline_bytes * 100)
                             if baseline_bytes else 0.0)
+        unpaired_rvc     = sum(s.unpaired_rvc      for s in stats)
+        unpaired_non_rvc = sum(s.unpaired_non_rvc  for s in stats)
 
         return cls(
             total_instrs     = total_instrs,
@@ -236,6 +279,8 @@ class PairStats:
             saving_pct       = saving_pct,
             singleton_tally        = _merge_dicts("singleton_tally"),
             unpaired_opcode_tally  = _merge_dicts("unpaired_opcode_tally"),
+            unpaired_rvc     = unpaired_rvc,
+            unpaired_non_rvc = unpaired_non_rvc,
         )
 
 def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
@@ -1203,6 +1248,8 @@ def _process_block(
     rule_missed:           Counter = Counter()
     singleton_tally:       Counter = Counter()
     unpaired_opcode_tally: Counter = Counter()
+    unpaired_rvc_count:    int     = 0
+    unpaired_non_rvc_count: int    = 0
 
     pair_start_set: set  = set()
     pair_rules:     dict = {}
@@ -1249,6 +1296,10 @@ def _process_block(
         key  = (mn_a, mn_b)
         singleton_tally[key]        += 1
         unpaired_opcode_tally[mn_a] += 1
+        if can_compress(real_scheduled[i]):
+            unpaired_rvc_count     += 1
+        else:
+            unpaired_non_rvc_count += 1
         i += 1
 
     # ── Emit annotated output ─────────────────────────────────────────────
@@ -1297,6 +1348,8 @@ def _process_block(
         saving_pct       = saving_pct,
         singleton_tally        = singleton_tally,
         unpaired_opcode_tally  = unpaired_opcode_tally,
+        unpaired_rvc     = unpaired_rvc_count,
+        unpaired_non_rvc = unpaired_non_rvc_count,
     )
 
 # ---------------------------------------------------------------------------
