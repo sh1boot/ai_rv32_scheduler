@@ -519,35 +519,141 @@ def parse_line(index: int, line: str):
     instr.defs, instr.uses = defs, uses
     instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
 
-    # Canonicalise explicit c. instruction mnemonics.  Instructions in _C_CANON
-    # have their own ALL_TABLES entries (so operands decoded correctly above) but
-    # their mnemonic must become the canonical form so all downstream checks —
-    # _DUAL_ARITH_MN, _CMP_MNEMONICS, can_compress, is_load/store/branch, etc. —
-    # see the right mnemonic without needing to know about c. aliases.
+    # ── Mnemonic canonicalisation ────────────────────────────────────────────
+    #
+    # Goal: every pair of assembly files that represent the *same* binary must
+    # produce identical Instruction objects regardless of whether the assembler
+    # emitted alias/pseudo mnemonics or their canonical base-ISA equivalents.
+    # Two common sources of divergence are:
+    #
+    #   1. Compressed (c.) aliases — objdump --no-aliases writes the full form;
+    #      normal objdump writes c.mv, c.li, c.j, c.jr, c.beqz, …
+    #   2. GAS pseudo-instructions — assemblers may emit ``li``, ``mv``, ``j``,
+    #      ``ret``, ``beqz``, ``bnez``, ``bltz``, ``bgez`` etc.  No-alias
+    #      disassemblers expand these to their real encodings: ``addi rd,x0,imm``,
+    #      ``add rd,x0,rs``, ``jal x0,label``, ``jalr x0,0(ra)``, ``bne rs,zero``, …
+    #
+    # The normalisation steps below collapse every alias to the same canonical
+    # form that the c. expansion already produces, so both styles end up with
+    # identical mnemonic, defs, uses, is_branch, is_barrier, can_compress, and
+    # dual_arith_ok values.
+
+    # Step 1 — c. aliases (explicit C-extension mnemonics with their own
+    # ALL_TABLES entries).  Operands were already decoded correctly above using
+    # those entries; now replace the mnemonic so downstream checks see the
+    # canonical base-ISA name.
     if mnemonic in _C_CANON:
         mnemonic       = _C_CANON[mnemonic]
         instr.mnemonic = mnemonic
-        # Re-apply the flag fields that were set from the original mnemonic.
         instr.is_load   = mnemonic in _LOADS
         instr.is_store  = mnemonic in _STORES
         instr.is_branch = mnemonic in _BRANCH_MNEMONICS
 
-    # Normalise pseudo-instructions that are encodings of a standard instruction
-    # with a fixed immediate.  Downstream analysis (dual-arith eligibility, cmp
-    # rules, can_compress) keys on the canonical mnemonic and the imm field, so
-    # the pseudo must be translated before those checks run.
+    # Step 2 — GAS pseudo-instructions that are strict aliases for a base-ISA
+    # instruction.  Operands were decoded correctly from the pseudo's ALL_TABLES
+    # entry; we only need to rename the mnemonic.
     #
-    # zext.b rd, rs  ==  andi rd, rs, 0xff
-    # The immediate 255 is outside the 5-bit signed dual-arith range, so this
-    # instruction will not satisfy dual_arith_ok, but it *will* be visible to
-    # _CMP_MNEMONICS rules (cmp_branch_rsd/chain) and to can_compress (andi is
-    # rvc-eligible).  The raw source line is preserved unchanged in instr.raw.
+    #   mv  rd, rs  == add  rd, x0, rs     (c.mv already canonicalises to add)
+    #   li  rd, imm == addi rd, x0, imm    (c.li already canonicalises to addi)
+    #   j   label   == jal  x0, label      (c.j  already canonicalises to jal)
+    #
+    # This ensures ``li a0,1`` and ``c.li a0,1`` (and ``addi a0,zero,1``) all
+    # produce mnemonic='addi', giving identical can_compress / dual_arith_ok.
+    _PSEUDO_CANON = {"mv": "add", "li": "addi", "j": "jal"}
+    if mnemonic in _PSEUDO_CANON:
+        mnemonic       = _PSEUDO_CANON[mnemonic]
+        instr.mnemonic = mnemonic
+        instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+
+    # Step 3 — ``ret`` canonicalises to ``jalr`` (= jalr x0, 0(ra)).
+    #
+    # ``ret`` is a GAS pseudo for ``jalr x0, 0(ra)``.  Its c. equivalent is
+    # ``c.jr ra`` which already canonicalises to jalr (is_branch=True, not
+    # is_barrier).  ``ret`` must match: it is *not* a scheduling barrier within
+    # a basic block — the block ends because it's a branch, not because it's a
+    # call boundary.  (``call`` and ``tail`` remain barriers because they cross
+    # call boundaries.)
+    #
+    # We also fix up uses=[x1] (ra) to match c.jr ra's decoded uses.
+    if mnemonic == "ret":
+        instr.mnemonic  = "jalr"
+        instr.is_branch = True
+        instr.uses      = ["x1"]   # ra — the base register of jalr x0, 0(ra)
+        mnemonic        = "jalr"
+
+    # Step 4 — ``bne/beq/blt/bge rs, zero, label`` → pseudo branch forms.
+    #
+    # No-alias disassemblers emit ``bne rs, zero, lbl`` where assemblers write
+    # ``bnez rs, lbl``.  Canonicalise to the pseudo form so both produce the
+    # same mnemonic, and so can_compress (which checks for beqz/bnez-style
+    # single-source forms) sees the right mnemonic.
+    #
+    #   bne  rs, zero  → bnez     bge  zero, rs  → blez
+    #   beq  rs, zero  → beqz     bge  rs, zero  → bgez  (always-true, rare)
+    #   blt  rs, zero  → bltz     blt  zero, rs  → bgtz
+    _ZERO_BRANCH: dict = {
+        # (mnemonic, which operand is zero): pseudo
+        ("bne",  1): "bnez",   # bne rs, zero → bnez rs
+        ("beq",  1): "beqz",   # beq rs, zero → beqz rs
+        ("blt",  1): "bltz",   # blt rs, zero → bltz rs
+        ("bge",  1): "bgez",   # bge rs, zero → bgez rs
+        ("blt",  0): "bgtz",   # blt zero, rs → bgtz rs  (rs > 0)
+        ("bge",  0): "blez",   # bge zero, rs → blez rs  (rs ≤ 0)
+    }
+    if mnemonic in ("bne", "beq", "blt", "bge") and len(instr.uses) >= 1:
+        # uses has already had x0 filtered out by _decode_operands, so we need
+        # to inspect the raw ops to determine which position was zero.
+        # ops[0] and ops[1] are the two source registers; ops[2] is the label.
+        if len(ops) >= 3:
+            r0 = _normalise_reg(ops[0])
+            r1 = _normalise_reg(ops[1])
+            zero_pos = None
+            if r1 == "x0":
+                zero_pos = 1
+            elif r0 == "x0":
+                zero_pos = 0
+            if zero_pos is not None:
+                key = (mnemonic, zero_pos)
+                if key in _ZERO_BRANCH:
+                    mnemonic        = _ZERO_BRANCH[key]
+                    instr.mnemonic  = mnemonic
+                    # uses: keep only the non-zero source
+                    instr.uses      = [r1 if zero_pos == 0 else r0]
+                    instr.is_branch = True   # already True, but be explicit
+
+    # Step 5 — ``seqz rd, rs`` / ``snez rd, rs`` pseudo forms.
+    #
+    # No-alias disassemblers emit the real encodings:
+    #   seqz rd, rs  ==  sltiu rd, rs, 1
+    #   snez rd, rs  ==  sltu  rd, x0, rs
+    # Canonicalise both directions so the mnemonic is always seqz/snez,
+    # ensuring they are recognised by _CMP_MNEMONICS rules.
+    # sltiu rd, rs, 1  →  seqz rd, rs
+    # instr.imm is not yet populated at this point (imm scan runs below), so
+    # read the immediate directly from the raw ops list.
+    if mnemonic == "sltiu" and len(ops) >= 3 and ops[2].strip() == "1":
+        instr.mnemonic = "seqz"
+        mnemonic       = "seqz"
+
+    # sltu rd, zero, rs  →  snez rd, rs  (3-operand form with explicit x0/zero)
+    if (mnemonic == "sltu" and instr.defs
+            and len(ops) >= 3 and _normalise_reg(ops[1]) == "x0"):
+        instr.mnemonic = "snez"
+        mnemonic       = "snez"
+
+    # Step 6 — ``zext.b rd, rs  ==  andi rd, rs, 0xff``
+    #
+    # Downstream analysis (dual-arith eligibility, cmp rules, can_compress)
+    # keys on the canonical mnemonic; raw source line preserved in instr.raw.
     if mnemonic == "zext.b":
         instr.mnemonic = "andi"
         instr.imm      = 0xff
         mnemonic       = "andi"
 
-    if mnemonic in ("call", "tail", "ret"):
+    # ── Barrier flags ────────────────────────────────────────────────────────
+    # ``call`` and ``tail`` cross call boundaries → full barrier.
+    # ``ret`` has already been canonicalised to ``jalr`` above (is_branch=True).
+    if mnemonic in ("call", "tail"):
         instr.is_barrier = True
 
     # Cache immediate and memory operand at parse time.
@@ -733,8 +839,11 @@ def compute_liveness(instructions: list) -> dict:
 # Label definition: optional leading dot, word chars, colon.
 _LABEL_DEF = re.compile(r"^\s*(\.?\w+)\s*:")
 # Branches and jumps whose last operand is a label target.
+# The optional ``c\.`` prefix covers compressed-instruction disassembly
+# (``c.beqz``, ``c.bnez``, ``c.j``, ``c.jal``, ``c.jalr``, ``c.jr``).
 _BRANCH_LIKE = re.compile(
-    r"^\s+(?:beq|bne|blt|bge|bltu|bgeu|beqz|bnez|blez|bgez|bltz|bgtz"
+    r"^\s+(?:c\.)?"
+    r"(?:beq|bne|blt|bge|bltu|bgeu|beqz|bnez|blez|bgez|bltz|bgtz"
     r"|jal|jalr|j|jr|call|tail)\s",
 )
 # ELF visibility directives.
