@@ -28,6 +28,7 @@ from rv32_core import (
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
+    make_compact32_scorer,
 )
 
 @dataclass
@@ -119,6 +120,9 @@ class PairStats:
     # unpaired_non_rvc : unpaired instructions that do not
     unpaired_rvc:     int = 0
     unpaired_non_rvc: int = 0
+    # Per-mnemonic count of unpaired rvc-eligible instructions.
+    # Parallel to unpaired_opcode_tally but restricted to can_compress() == True.
+    unpaired_rvc_opcode_tally: dict = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "PairStats":
@@ -132,6 +136,7 @@ class PairStats:
             saving_bytes=0, saving_pct=0.0,
             singleton_tally={}, unpaired_opcode_tally={},
             unpaired_rvc=0, unpaired_non_rvc=0,
+            unpaired_rvc_opcode_tally={},
         )
 
     def summary_lines(self, opcode_tally: bool = False) -> list:
@@ -212,23 +217,50 @@ class PairStats:
     _TALLY_LIMIT = 20
 
     def _opcode_tally_lines(self) -> list:
-        """Format the singleton opcode-pair tally and flat unpaired-opcode tally."""
+        """
+        Format the unpaired-opcode tally.
+
+        Primary sort: rvc-eligible unpaired count, descending.  For each
+        mnemonic, show the rvc-eligible count first, then the total unpaired
+        count (including non-rvc instructions of the same mnemonic) in a
+        second column.  This makes it easy to spot which opcodes have the
+        most rvc-eligible unpaired instances — the strongest candidates for
+        new compact32 pairing rules that operate on rvc-encodable instructions.
+
+        A separate section lists the top unpaired adjacent opcode *pairs*
+        (what instruction appeared next when this one was left as a singleton).
+        """
         lines = []
 
-        # --- paired opcode-pair tally ---
+        # ── Flat unpaired opcode tally, led by rvc-eligible count ─────────
+        if self.unpaired_opcode_tally:
+            # Union of all mnemonic keys from both tallies.
+            all_mn = (set(self.unpaired_rvc_opcode_tally)
+                      | set(self.unpaired_opcode_tally))
+            # Sort by rvc-eligible count descending, then total descending.
+            ranked = sorted(
+                all_mn,
+                key=lambda mn: (
+                    -self.unpaired_rvc_opcode_tally.get(mn, 0),
+                    -self.unpaired_opcode_tally.get(mn, 0),
+                )
+            )
+            lines.append(
+                f"# unpaired opcodes (top {self._TALLY_LIMIT},"
+                f" rvc-eligible / total):"
+            )
+            for mn in ranked[:self._TALLY_LIMIT]:
+                rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn, 0)
+                total_cnt = self.unpaired_opcode_tally.get(mn, 0)
+                lines.append(f"#   {rvc_cnt:5d} / {total_cnt:5d}  {mn}")
+
+        # ── Unpaired adjacent opcode-pair tally ───────────────────────────
         if self.singleton_tally:
             lines.append(f"# unpaired opcode pairs (top {self._TALLY_LIMIT}):")
             ranked = sorted(self.singleton_tally.items(), key=lambda kv: -kv[1])
             for (mn_a, mn_b), cnt in ranked[:self._TALLY_LIMIT]:
                 b_label = mn_b if mn_b else "(end)"
                 lines.append(f"#   {cnt:5d}  {mn_a} | {b_label}")
-
-        # --- flat unpaired opcode tally ---
-        if self.unpaired_opcode_tally:
-            lines.append(f"# unpaired opcodes (top {self._TALLY_LIMIT}):")
-            ranked = sorted(self.unpaired_opcode_tally.items(), key=lambda kv: -kv[1])
-            for mn, cnt in ranked[:self._TALLY_LIMIT]:
-                lines.append(f"#   {cnt:5d}  {mn}")
 
         return lines
 
@@ -281,6 +313,7 @@ class PairStats:
             unpaired_opcode_tally  = _merge_dicts("unpaired_opcode_tally"),
             unpaired_rvc     = unpaired_rvc,
             unpaired_non_rvc = unpaired_non_rvc,
+            unpaired_rvc_opcode_tally = _merge_dicts("unpaired_rvc_opcode_tally"),
         )
 
 def count_pairs(sequence: list, pair_score: PairScoreFn) -> int:
@@ -1246,8 +1279,9 @@ def _process_block(
     rule_counts:           Counter = Counter()
     rule_shadow:           Counter = Counter()
     rule_missed:           Counter = Counter()
-    singleton_tally:       Counter = Counter()
-    unpaired_opcode_tally: Counter = Counter()
+    singleton_tally:           Counter = Counter()
+    unpaired_opcode_tally:     Counter = Counter()
+    unpaired_rvc_opcode_tally: Counter = Counter()
     unpaired_rvc_count:    int     = 0
     unpaired_non_rvc_count: int    = 0
 
@@ -1297,7 +1331,8 @@ def _process_block(
         singleton_tally[key]        += 1
         unpaired_opcode_tally[mn_a] += 1
         if can_compress(real_scheduled[i]):
-            unpaired_rvc_count     += 1
+            unpaired_rvc_count             += 1
+            unpaired_rvc_opcode_tally[mn_a] += 1
         else:
             unpaired_non_rvc_count += 1
         i += 1
@@ -1346,10 +1381,11 @@ def _process_block(
         baseline_bytes   = baseline_bytes,
         saving_bytes     = saving_bytes,
         saving_pct       = saving_pct,
-        singleton_tally        = singleton_tally,
-        unpaired_opcode_tally  = unpaired_opcode_tally,
-        unpaired_rvc     = unpaired_rvc_count,
-        unpaired_non_rvc = unpaired_non_rvc_count,
+        singleton_tally           = singleton_tally,
+        unpaired_opcode_tally     = unpaired_opcode_tally,
+        unpaired_rvc              = unpaired_rvc_count,
+        unpaired_non_rvc          = unpaired_non_rvc_count,
+        unpaired_rvc_opcode_tally = unpaired_rvc_opcode_tally,
     )
 
 # ---------------------------------------------------------------------------
@@ -1418,7 +1454,7 @@ class AssemblyScheduler:
 
     def process(
         self,
-        pair_score:   PairScoreFn = _compress_pair_score,
+        pair_score:   PairScoreFn = None,
         rename:       bool = True,
         opcode_tally: bool = False,
         out          = None,
@@ -1434,7 +1470,8 @@ class AssemblyScheduler:
         Parameters
         ----------
         pair_score
-            Scoring function for adjacent instruction pairs.
+            Scoring function for adjacent instruction pairs.  Defaults to
+            the compact32 scorer (``make_compact32_scorer``).
         rename
             If True, attempt destination-register renaming per block.
         opcode_tally
@@ -1447,6 +1484,8 @@ class AssemblyScheduler:
         Returns the aggregate ``PairStats`` for the whole file (also stored
         as ``self.last_stats``).
         """
+        if pair_score is None:
+            pair_score = make_compact32_scorer({})
         if out is None:
             out = sys.stdout
 
@@ -1689,7 +1728,7 @@ class AssemblyScheduler:
 
     def emit(
         self,
-        pair_score:   PairScoreFn = _compress_pair_score,
+        pair_score:   PairScoreFn = None,
         rename:       bool = True,
         opcode_tally: bool = False,
         verbose:      bool = False,
@@ -1699,7 +1738,10 @@ class AssemblyScheduler:
 
         This is a convenience wrapper around ``process()`` that captures
         output in memory.  Prefer ``process(out=…)`` for large files.
+        Defaults to the compact32 scorer.
         """
+        if pair_score is None:
+            pair_score = make_compact32_scorer({})
         buf = io.StringIO()
         self.process(pair_score=pair_score, rename=rename,
                      opcode_tally=opcode_tally, out=buf, verbose=verbose)
@@ -1716,10 +1758,10 @@ def main():
     ap.add_argument("--no-rename", dest="rename", action="store_false",
                     default=True,
                     help="Disable destination-register renaming")
-    ap.add_argument("--scorer", default="rvc",
+    ap.add_argument("--scorer", default="compact32",
                     metavar="NAME",
                     help=f"Scoring function to use. "
-                         f"Choices: {list(SCORERS)}. Default: rvc")
+                         f"Choices: {list(SCORERS)}. Default: compact32")
     ap.add_argument("--list-rules", action="store_true",
                     help="List available scorers and compact32 rules, then exit")
     ap.add_argument("--opcode-tally", action="store_true",
@@ -1731,7 +1773,7 @@ def main():
     if args.list_rules:
         print("Scorers (--scorer NAME):")
         for name, (_, desc) in SCORERS.items():
-            marker = " [default]" if name == "rvc" else ""
+            marker = " [default]" if name == "compact32" else ""
             print(f"  {name:14s}  {desc}{marker}")
         print()
         print("compact32 rules (in match order):")
