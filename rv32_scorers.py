@@ -57,7 +57,7 @@ _CAN_COMPRESS_MNEMONICS: frozenset = frozenset({
     "sw", "fsw", "fsd",
     "beq", "bne", "jal",
     "sub", "xor", "or", "and", "srai", "srli", "andi",
-    "nop", "ret", "mv",
+    "nop",
 })
 
 
@@ -76,8 +76,10 @@ def can_compress(instr: "Instruction") -> bool:
     uses = instr.uses
 
     if mn in ("sub", "xor", "or", "and"):
+        # RSD form: operand order after expansion is [rs1=rd, rs2].
+        # The CL register constraint applies to rd and rs2 independently.
         rd  = defs[0] if defs else None
-        rs2 = uses[0] if uses else None
+        rs2 = uses[1] if len(uses) > 1 else None
         return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS
 
     if mn in ("srai", "srli", "andi"):
@@ -170,7 +172,9 @@ _COMPACT32_BRANCH_MN = frozenset({
     "beqz", "bnez",
     "jal", "jalr",
 })
-_DUAL_MOVE_MN = frozenset({"mv", "li"})
+# ``mv rd, rs`` canonicalises to ``add`` with uses=[rs] (x0 filtered).
+# ``li rd, imm`` canonicalises to ``addi`` with uses=[] (x0 filtered).
+_DUAL_MOVE_MN = frozenset({"add", "addi"})
 
 
 def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool:
@@ -505,21 +509,30 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
 
 
 def _dual_move_ok(instr: "Instruction") -> bool:
-    """Return True if *instr* is eligible as one slot of a dual_move pair."""
-    if instr.mnemonic not in _DUAL_MOVE_MN:
-        return False
+    """Return True if *instr* is eligible as one slot of a dual_move pair.
+
+    Recognises the canonical forms of ``mv`` and ``li`` after parse-time
+    pseudo-instruction normalisation:
+
+    * mv-form  (``add rd, x0, rs``):  mnemonic ``add``, rd and rs both in
+      x0..x15, exactly one use (x0 is filtered from uses, leaving only rs).
+    * li-form  (``addi rd, x0, imm``): mnemonic ``addi``, rd in x0..x15,
+      no uses (x0 filtered), immediate in −16..+15.
+
+    A general ``add rd, rs1, rs2`` (two uses) or ``addi rd, rs1, imm``
+    (one use) does not qualify; those are arithmetic, not moves.
+    """
     rd = instr.defs[0] if instr.defs else None
     if rd is None or rd not in _REG4:
         return False
-    if instr.mnemonic == "mv":
-        rs = instr.uses[0] if instr.uses else None
-        if rs is None or rs not in _REG4:
-            return False
-    else:  # li
+    if instr.mnemonic == "add" and len(instr.uses) == 1:
+        # mv-form: add rd, x0, rs  (x0 filtered → exactly one use)
+        return instr.uses[0] in _REG4
+    if instr.mnemonic == "addi" and not instr.uses:
+        # li-form: addi rd, x0, imm  (x0 filtered → no uses)
         imm = instr.imm
-        if imm is None or imm < -16 or imm > 15:
-            return False
-    return True
+        return imm is not None and -16 <= imm <= 15
+    return False
 
 
 def _rule_dual_move(a: "Instruction", b: "Instruction",
@@ -528,8 +541,8 @@ def _rule_dual_move(a: "Instruction", b: "Instruction",
     Two independent register-move or small-immediate-load instructions.
 
     Matches any combination of:
-        mv   rd, rs          (copy register, rs in x0..x15)
-        li   rd, imm         (load 5-bit signed immediate, −16..+15)
+        mv   rd, rs          (canonical: add rd, x0, rs — rs in x0..x15)
+        li   rd, imm         (canonical: addi rd, x0, imm — imm in −16..+15)
 
     Both rd values must be distinct and in x0..x15.  Either order is valid.
     No liveness check needed — neither instruction produces a value the
@@ -602,7 +615,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
                 eligible.add("addi_branch")
-        if a.mnemonic in _DUAL_MOVE_MN:
+        if _dual_move_ok(a):
             eligible.add("dual_move")
         return frozenset(eligible)
 

@@ -559,11 +559,23 @@ def parse_line(index: int, line: str):
     #
     # This ensures ``li a0,1`` and ``c.li a0,1`` (and ``addi a0,zero,1``) all
     # produce mnemonic='addi', giving identical can_compress / dual_arith_ok.
-    _PSEUDO_CANON = {"mv": "add", "li": "addi", "j": "jal"}
+    #
+    # Also covers the negation pseudos:
+    #   neg  rd, rs == sub  rd, x0, rs   (uses=[rs]; NOT RSD — rd≠rs1=x0)
+    #   negw rd, rs == subw rd, x0, rs
+    #   not  rd, rs == xori rd, rs, -1   (uses=[rs]; rd may equal rs)
+    #
+    # Canonicalising these ensures consistent mnemonic, can_compress, and
+    # _CMP_MNEMONICS membership regardless of which disassembler style is used.
+    _PSEUDO_CANON = {"mv": "add", "li": "addi", "j": "jal",
+                     "neg": "sub", "not": "xori"}
     if mnemonic in _PSEUDO_CANON:
         mnemonic       = _PSEUDO_CANON[mnemonic]
         instr.mnemonic = mnemonic
         instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+    # For ``not``: fix up imm=-1 so _dual_arith_ok and imm-range checks see it.
+    if mnemonic == "xori" and instr.imm is None and raw_mn == "not":
+        instr.imm = -1
 
     # Step 3 — ``ret`` canonicalises to ``jalr`` (= jalr x0, 0(ra)).
     #
