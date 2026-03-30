@@ -78,7 +78,7 @@ _I = {
     "slli":  ("rd", ("rs1",)),      "srli":  ("rd", ("rs1",)),
     "srai":  ("rd", ("rs1",)),
     "lui":   ("rd", ()),            "auipc": ("rd", ()),
-    "jal":   ("rd", ()),            "jalr":  ("rd", ("rs1",)),
+    "jal":   ("rd", ()),            "jalr":  ("rd", ("mem_base",)),
     "beq":   (None, ("rs1","rs2")), "bne":   (None, ("rs1","rs2")),
     "blt":   (None, ("rs1","rs2")), "bge":   (None, ("rs1","rs2")),
     "bltu":  (None, ("rs1","rs2")), "bgeu":  (None, ("rs1","rs2")),
@@ -503,6 +503,16 @@ def parse_line(index: int, line: str):
         instr.uses = [_normalise_reg(t.rstrip(",")) for t in tokens[1:]
                       if _is_reg_token(t)]
         return instr
+
+    # Normalise single-operand jalr: ``jalr offset(rs)`` is assembler shorthand
+    # for ``jalr ra, offset(rs)`` (rd = ra = x1 implied by the ABI call
+    # convention).  Both GAS and objdump emit this form when rd == rs1 == ra
+    # with an arbitrary offset; other disassemblers (and no-alias dumps) emit
+    # the full three-token form ``jalr ra, offset(rs)``.  Canonicalise here so
+    # _decode_operands always sees (rd, mem_operand) and correctly records
+    # defs=[x1] uses=[base_reg].
+    if mnemonic == "jalr" and len(ops) == 1 and _MEM_RE.match(ops[0]):
+        ops = ["ra"] + ops   # prepend implicit rd = ra (x1)
 
     pat_def, pat_uses = ALL_TABLES[mnemonic]
     defs, uses, csr_defs, csr_uses = _decode_operands(mnemonic, pat_def, pat_uses, ops)
