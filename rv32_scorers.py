@@ -172,7 +172,11 @@ _COMPACT32_BRANCH_MN = frozenset({
     "beqz", "bnez",
     "jal", "jalr",
 })
-# ``mv rd, rs`` canonicalises to ``add`` with uses=[rs] (x0 filtered).
+# ``mv rd, rs``  (GAS pseudo = ``addi rd, rs, 0``) canonicalises to ``addi``
+#   with uses=[rs] and imm=0.  ``mv rd, x0`` filters x0 → uses=[], matching
+#   the li-form.
+# ``c.mv rd, rs`` (C extension = ``add rd, x0, rs``) canonicalises to ``add``
+#   with uses=[rs] (x0 filtered).
 # ``li rd, imm`` canonicalises to ``addi`` with uses=[] (x0 filtered).
 _DUAL_MOVE_MN = frozenset({"add", "addi"})
 
@@ -494,16 +498,20 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
 def _dual_move_ok(instr: "Instruction") -> bool:
     """Return True if *instr* is eligible as one slot of a dual_move pair.
 
-    Recognises the canonical forms of ``mv`` and ``li`` after parse-time
-    pseudo-instruction normalisation:
+    Recognises the canonical forms that map to C-extension compact encodings:
 
-    * mv-form  (``add rd, x0, rs``):  mnemonic ``add``, rd and rs both in
+    * mv-form  (``add rd, x0, rs``):  arises from C-extension ``c.mv rd, rs``
+      (= R-type ``add rd, x0, rs``); mnemonic ``add``, rd and rs both in
       x0..x15, exactly one use (x0 is filtered from uses, leaving only rs).
-    * li-form  (``addi rd, x0, imm``): mnemonic ``addi``, rd in x0..x15,
-      no uses (x0 filtered), immediate in −16..+15.
+      The GAS pseudo ``mv rd, rs`` assembles to ``addi rd, rs, 0`` (I-type,
+      NOT R-type) and canonicalises to mnemonic ``addi``; it does not match
+      this branch.
+    * li-form  (``addi rd, x0, imm``): arises from ``li`` / ``c.li`` / ``mv
+      rd, x0`` (all = ``addi rd, x0, imm``); mnemonic ``addi``, rd in
+      x0..x15, no uses (x0 filtered), immediate in −16..+15.
 
     A general ``add rd, rs1, rs2`` (two uses) or ``addi rd, rs1, imm``
-    (one use) does not qualify; those are arithmetic, not moves.
+    (one use, rs1 ≠ x0) does not qualify; those are arithmetic, not moves.
     """
     rd = instr.defs[0] if instr.defs else None
     if rd is None or rd not in _REG4:
