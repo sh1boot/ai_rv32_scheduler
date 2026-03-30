@@ -489,23 +489,6 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
         return False
     # rsd must appear as either operand of the branch (commutativity).
     return rsd in b.uses
-    """
-    Arithmetic operation (dual-arith subset) followed by a conditional
-    branch on whether the result is zero.
-
-    Matches:
-        <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
-        beqz / bnez      rd, label          (same rd)
-    """
-    if not a.dual_arith_ok:
-        return False
-    rd = a.defs[0] if a.defs else None
-    if rd is None:
-        return False
-    if b.mnemonic not in ("beqz", "bnez"):
-        return False
-    tested = b.uses[0] if b.uses else None
-    return tested == rd
 
 
 def _dual_move_ok(instr: "Instruction") -> bool:

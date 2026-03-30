@@ -592,6 +592,10 @@ def _reg_family(reg: str) -> str:
         return "fp"
     return "vec"
 
+def _reg_pool(reg: str) -> frozenset:
+    """Return the full integer or FP register pool for *reg*."""
+    return _ALL_INT_REGS if _reg_family(reg) == "int" else _ALL_FP_REGS
+
 def rename_destinations(
     scheduled: list,
     graph: DepGraph,
@@ -762,6 +766,19 @@ def rename_destinations(
         if _liveness_cell is not None:
             _liveness_cell[0] = compute_liveness(scheduled)
 
+    def _greedy_pair_count(seq, lo: int, hi: int) -> int:
+        """Greedy pair count over seq[lo..hi].
+        The prev_free state at lo is read from free_table (O(1))."""
+        pf = free_table[lo]
+        cnt = 0
+        i = lo
+        while i <= hi and i < len(seq):
+            if i + 1 < len(seq) and pair_score(seq[i], seq[i+1]) > 0:
+                cnt += 1; pf = False; i += 2
+            else:
+                pf = True; i += 1
+        return cnt
+
     def try_rename(pos: int, rd: str, new_rd: str, score_before: int):
         """
         Attempt to rename *rd* -> *new_rd* at position *pos*.
@@ -789,26 +806,13 @@ def rename_destinations(
         scan_lo = max(0, pos - 1)
         scan_hi = min(n - 1, window_end + 1)
 
-        def _local_score(seq):
-            """Greedy pair count over seq[scan_lo..scan_hi].
-            The prev_free state at scan_lo is read from free_table (O(1))."""
-            pf = free_table[scan_lo]
-            count = 0
-            i = scan_lo
-            while i <= scan_hi and i < len(seq):
-                if i + 1 < len(seq) and pair_score(seq[i], seq[i+1]) > 0:
-                    count += 1; pf = False; i += 2
-                else:
-                    pf = True; i += 1
-            return count
-
-        score_before_local = _local_score(scheduled)
+        score_before_local = _greedy_pair_count(scheduled, scan_lo, scan_hi)
 
         # Apply in-place, keeping undo info in case we need to roll back.
         undo = _apply_rename(scheduled, pos, window_end, rd, new_rd)
         _refresh_liveness()   # scorer may need updated liveness
 
-        score_after_local = _local_score(scheduled)
+        score_after_local = _greedy_pair_count(scheduled, scan_lo, scan_hi)
 
         if score_after_local > score_before_local:
             # Committed.  Recompute global score as delta from previous.
@@ -836,11 +840,7 @@ def rename_destinations(
             if info is None:
                 continue
             window_end, live_at = info
-            if _reg_family(rd) == "int":
-                pool = _ALL_INT_REGS
-            else:
-                pool = _ALL_FP_REGS
-            candidates = sorted(pool - live_at - _RESERVED - {rd})
+            candidates = sorted(_reg_pool(rd) - live_at - _RESERVED - {rd})
             for new_rd in candidates:
                 result = try_rename(pos, rd, new_rd, score_before)
                 if result is not None:
@@ -927,17 +927,9 @@ def rename_destinations(
 
                 scan_lo_c = max(0, pos_src - 1)
                 scan_hi_c = min(n - 1, window_end + 1)
-                def _local_c(seq, lo=scan_lo_c, hi=scan_hi_c):
-                    pf = free_table[lo]; i = lo; cnt = 0
-                    while i <= hi and i < len(seq):
-                        if i+1 < len(seq) and pair_score(seq[i], seq[i+1]) > 0:
-                            cnt += 1; pf = False; i += 2
-                        else:
-                            pf = True; i += 1
-                    return cnt
-                sb_c = _local_c(scheduled)
+                sb_c = _greedy_pair_count(scheduled, scan_lo_c, scan_hi_c)
                 undo = _apply_rename(scheduled, pos_src, window_end, rd_src, target)
-                sa_c = _local_c(scheduled)
+                sa_c = _greedy_pair_count(scheduled, scan_lo_c, scan_hi_c)
                 if sa_c > sb_c:
                     return (score_ref + sa_c - sb_c,)
                 _undo_rename(scheduled, undo)
@@ -982,28 +974,14 @@ def rename_destinations(
                 if info_a is not None and info_b is not None:
                     _, live_a = info_a
                     _, live_b = info_b
-                    free_a = sorted(
-                        (_ALL_INT_REGS if _reg_family(rd_a) == "int" else _ALL_FP_REGS)
-                        - live_a - _RESERVED - {rd_a}
-                    )
-                    free_b = sorted(
-                        (_ALL_INT_REGS if _reg_family(rd_b) == "int" else _ALL_FP_REGS)
-                        - live_b - _RESERVED - {rd_b}
-                    )
+                    free_a = sorted(_reg_pool(rd_a) - live_a - _RESERVED - {rd_a})
+                    free_b = sorted(_reg_pool(rd_b) - live_b - _RESERVED - {rd_b})
                     targets_a = [t for t in free_a if t in partner_regs and t != rd_b]
                     targets_b = [t for t in free_b if t in partner_regs and t != rd_a]
                     # Affected pairs for this joint rename (covers both slots)
                     jlo = max(0, pair_start - 1)
                     jhi = min(n - 1, max(info_a[0], info_b[0]) + 1)
-                    def _local_j(seq, lo=jlo, hi=jhi):
-                        pf = free_table[lo]; i = lo; cnt = 0
-                        while i <= hi and i < len(seq):
-                            if i+1 < len(seq) and pair_score(seq[i], seq[i+1]) > 0:
-                                cnt += 1; pf = False; i += 2
-                            else:
-                                pf = True; i += 1
-                        return cnt
-                    score_before_joint = _local_j(scheduled)
+                    score_before_joint = _greedy_pair_count(scheduled, jlo, jhi)
                     for ta in targets_a[:8]:
                         for tb in targets_b[:8]:
                             if ta == tb:
@@ -1015,7 +993,7 @@ def rename_destinations(
                                                    info_a[0], rd_a, ta)
                             undo_b = _apply_rename(scheduled, pair_start + 1,
                                                    info_b[0], rd_b, tb)
-                            score_after_joint = _local_j(scheduled)
+                            score_after_joint = _greedy_pair_count(scheduled, jlo, jhi)
                             if score_after_joint > score_before_joint:
                                 score_before = score_before + score_after_joint - score_before_joint
                                 changed = True
