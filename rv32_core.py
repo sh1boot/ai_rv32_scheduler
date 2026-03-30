@@ -101,6 +101,40 @@ _I = {
     "li":    ("rd",  ()),           "la":    ("rd",  ()),
     "j":     (None,  ()),           "jr":    (None,  ("rs1",)),
     "call":  ("rd",  ()),           "tail":  (None,  ()),
+    # ── Explicit C-extension expansions ──────────────────────────────────
+    # Each entry declares the exact operand structure of the canonical
+    # expansion so the RSD fixup in parse_line never applies.
+    #
+    #   c.mv  rd, rs   = add  rd, x0, rs   (copy — same pattern as mv)
+    #   c.li  rd, imm  = addi rd, x0, imm  (imm load — same pattern as li)
+    #   c.nop          = addi x0, x0, 0    (no operands)
+    #   c.lui rd, imm  = lui  rd, imm      (same pattern as lui)
+    #   c.j   target   = jal  x0, target   (unconditional jump — same as j)
+    #   c.jal target   = jal  x1, target   (call; x1 written)
+    #   c.jr  rs       = jalr x0, 0(rs)    (indirect jump — same as jr)
+    #   c.jalr rs      = jalr x1, 0(rs)    (indirect call; x1 written)
+    #   c.beqz rs, lbl = beq  rs, x0, lbl  (same pattern as beqz)
+    #   c.bnez rs, lbl = bne  rs, x0, lbl  (same pattern as bnez)
+    #   c.lw  rd,N(rs) = lw   rd, N(rs)    (same as lw)
+    #   c.lwsp rd,N    = lw   rd, N(sp)    (same as lw — sp is base)
+    #   c.sw  rs,N(b)  = sw   rs, N(b)     (same as sw)
+    #   c.swsp rs,N    = sw   rs, N(sp)    (same as sw — sp is base)
+    #   c.ebreak       = ebreak            (no operands)
+    "c.mv":    ("rd",  ("rs1",)),
+    "c.li":    ("rd",  ()),
+    "c.nop":   (None,  ()),
+    "c.lui":   ("rd",  ()),
+    "c.j":     (None,  ()),
+    "c.jal":   (None,  ()),       # jal x1, target — label operand, rd=x1 implicit
+    "c.jr":    (None,  ("rs1",)),
+    "c.jalr":  (None,  ("rs1",)), # jalr x1, 0(rs) — rs1 operand, rd=x1 implicit
+    "c.beqz":  (None,  ("rs1",)),
+    "c.bnez":  (None,  ("rs1",)),
+    "c.lw":    ("rd",  ("mem_base",)),
+    "c.lwsp":  ("rd",  ("mem_base",)),
+    "c.sw":    (None,  ("rs1", "mem_base")),
+    "c.swsp":  (None,  ("rs1", "mem_base")),
+    "c.ebreak":(None,  ()),
 }
 
 _M = {
@@ -296,16 +330,44 @@ _IMM_RE = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)$")
 # Regex for a memory operand in offset(base) form.
 _MEM_RE = re.compile(r"\s*(-?\d+)\s*\(([^)]+)\)")
 
-# C-extension: 2-operand compressed form where rd is also implicit rs1.
+# C-extension compressed instructions.
+#
+# Two categories are handled differently:
+#
+# 1. TRUE RSD ALIASES — instructions where the compressed two-operand form
+#    means rd is also rs1 (e.g. c.add a0, a1 = add a0, a0, a1).  These stay
+#    in _C_ALIASES; the parser's RSD fixup inserts the implicit rs1=rd operand
+#    and then substitutes the canonical mnemonic.
+#
+# 2. EXPLICIT EXPANSIONS — instructions whose canonical expansion has a
+#    different operand structure (e.g. c.mv rd, rs = add rd, x0, rs, NOT
+#    add rd, rd, rs).  These have their own ALL_TABLES entries that declare
+#    the exact operand pattern, and _C_CANON maps them to their canonical
+#    mnemonic.  The RSD fixup never applies because _C_ALIASES doesn't
+#    contain them.
 _C_ALIASES: dict = {
-    "c.add":"add",    "c.addi":"addi",  "c.addi16sp":"addi",
-    "c.addi4spn":"addi", "c.and":"and", "c.andi":"andi",
-    "c.beqz":"beq",   "c.bnez":"bne",  "c.ebreak":"ebreak",
-    "c.j":"jal",      "c.jal":"jal",   "c.jalr":"jalr",   "c.jr":"jalr",
-    "c.li":"addi",    "c.lui":"lui",   "c.lw":"lw",       "c.lwsp":"lw",
-    "c.mv":"add",     "c.nop":"addi",  "c.or":"or",
-    "c.slli":"slli",  "c.srai":"srai", "c.srli":"srli",
-    "c.sub":"sub",    "c.sw":"sw",     "c.swsp":"sw",      "c.xor":"xor",
+    # True RSD accumulate ops — rd is also rs1 in the compressed encoding.
+    "c.add":  "add",   "c.addi": "addi",
+    "c.and":  "and",   "c.andi": "andi",
+    "c.or":   "or",    "c.sub":  "sub",
+    "c.slli": "slli",  "c.srai": "srai",  "c.srli": "srli",
+    "c.xor":  "xor",
+    # sp-relative forms that the RSD fixup harmlessly skips (0 or 1 operand
+    # forms that don't match the 2-op + RSD-pattern condition).
+    "c.addi16sp": "addi",
+    "c.addi4spn": "addi",
+}
+
+# Canonical mnemonic for c. instructions with explicit ALL_TABLES entries.
+# Applied after operand decoding to normalise the mnemonic field.
+_C_CANON: dict = {
+    "c.mv":    "add",   "c.li":    "addi",  "c.nop":   "addi",
+    "c.lui":   "lui",   "c.j":     "jal",   "c.jal":   "jal",
+    "c.jr":    "jalr",  "c.jalr":  "jalr",
+    "c.beqz":  "beqz",  "c.bnez":  "bnez",
+    "c.lw":    "lw",    "c.lwsp":  "lw",
+    "c.sw":    "sw",    "c.swsp":  "sw",
+    "c.ebreak":"ebreak",
 }
 
 # ---------------------------------------------------------------------------
@@ -446,6 +508,19 @@ def parse_line(index: int, line: str):
     defs, uses, csr_defs, csr_uses = _decode_operands(mnemonic, pat_def, pat_uses, ops)
     instr.defs, instr.uses = defs, uses
     instr.csr_defs, instr.csr_uses = csr_defs, csr_uses
+
+    # Canonicalise explicit c. instruction mnemonics.  Instructions in _C_CANON
+    # have their own ALL_TABLES entries (so operands decoded correctly above) but
+    # their mnemonic must become the canonical form so all downstream checks —
+    # _DUAL_ARITH_MN, _CMP_MNEMONICS, can_compress, is_load/store/branch, etc. —
+    # see the right mnemonic without needing to know about c. aliases.
+    if mnemonic in _C_CANON:
+        mnemonic       = _C_CANON[mnemonic]
+        instr.mnemonic = mnemonic
+        # Re-apply the flag fields that were set from the original mnemonic.
+        instr.is_load   = mnemonic in _LOADS
+        instr.is_store  = mnemonic in _STORES
+        instr.is_branch = mnemonic in _BRANCH_MNEMONICS
 
     # Normalise pseudo-instructions that are encodings of a standard instruction
     # with a fixed immediate.  Downstream analysis (dual-arith eligibility, cmp
