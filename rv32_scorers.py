@@ -454,6 +454,56 @@ def _rule_arith_branch(a: "Instruction", b: "Instruction",
     return tested == rd
 
 
+def _rule_addi_branch(a: "Instruction", b: "Instruction",
+                      liveness: dict) -> bool:
+    """
+    Add-immediate (RSD form) followed by a two-register conditional branch
+    on the same register.
+
+    Matches:
+        addi  rsd, rsd, imm    (RSD form; rsd in x0..x15; imm in −16..+15)
+        beq / bne  rsd, rs2, label   (rsd appears as either operand)
+
+    The compact encoding uses a single register field for the addi (RSD) and
+    an implicit comparison against the second operand of the branch.  Since
+    equality is commutative, rsd may appear as either rs1 or rs2 in the branch
+    instruction.
+
+    No liveness check is needed — rsd is not consumed by the branch, only read.
+
+    Canonical examples:
+        addi  a0, a0, -1
+        bne   a0, a1, .loop      # rsd=a0 is rs1
+
+        addi  a2, a2, 1
+        beq   s0, a2, .done      # rsd=a2 is rs2 (commutative match)
+    """
+    if not a.dual_arith_ok or a.mnemonic != "addi":
+        return False
+    rsd = a.defs[0]
+    if b.mnemonic not in ("beq", "bne"):
+        return False
+    # rsd must appear as either operand of the branch (commutativity).
+    return rsd in b.uses
+    """
+    Arithmetic operation (dual-arith subset) followed by a conditional
+    branch on whether the result is zero.
+
+    Matches:
+        <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
+        beqz / bnez      rd, label          (same rd)
+    """
+    if not a.dual_arith_ok:
+        return False
+    rd = a.defs[0] if a.defs else None
+    if rd is None:
+        return False
+    if b.mnemonic not in ("beqz", "bnez"):
+        return False
+    tested = b.uses[0] if b.uses else None
+    return tested == rd
+
+
 def _dual_move_ok(instr: "Instruction") -> bool:
     """Return True if *instr* is eligible as one slot of a dual_move pair."""
     if instr.mnemonic not in _DUAL_MOVE_MN:
@@ -503,6 +553,7 @@ COMPACT32_RULES: list = [
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_branch",        _rule_arith_branch),
+    ("addi_branch",         _rule_addi_branch),
     ("dual_move",           _rule_dual_move),
 ]
 
@@ -549,6 +600,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         if a.dual_arith_ok:
             eligible.add("dual_arith")
             eligible.add("arith_branch")
+            if a.mnemonic == "addi":
+                eligible.add("addi_branch")
         if a.mnemonic in _DUAL_MOVE_MN:
             eligible.add("dual_move")
         return frozenset(eligible)
