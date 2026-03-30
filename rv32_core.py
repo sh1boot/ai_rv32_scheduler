@@ -105,7 +105,7 @@ _I = {
     # Each entry declares the exact operand structure of the canonical
     # expansion so the RSD fixup in parse_line never applies.
     #
-    #   c.mv  rd, rs   = add  rd, x0, rs   (copy — same pattern as mv)
+    #   c.mv  rd, rs   = add  rd, x0, rs   (R-type copy; distinct from GAS mv)
     #   c.li  rd, imm  = addi rd, x0, imm  (imm load — same pattern as li)
     #   c.nop          = addi x0, x0, 0    (no operands)
     #   c.lui rd, imm  = lui  rd, imm      (same pattern as lui)
@@ -553,12 +553,14 @@ def parse_line(index: int, line: str):
     # instruction.  Operands were decoded correctly from the pseudo's ALL_TABLES
     # entry; we only need to rename the mnemonic.
     #
-    #   mv  rd, rs  == add  rd, x0, rs     (c.mv already canonicalises to add)
+    #   mv  rd, rs  == addi rd, rs, 0      (GAS/spec; c.mv separately → add)
     #   li  rd, imm == addi rd, x0, imm    (c.li already canonicalises to addi)
     #   j   label   == jal  x0, label      (c.j  already canonicalises to jal)
     #
-    # This ensures ``li a0,1`` and ``c.li a0,1`` (and ``addi a0,zero,1``) all
-    # produce mnemonic='addi', giving identical can_compress / dual_arith_ok.
+    # This ensures ``mv a0,a1`` (aliases) and ``addi a0,a1,0`` (no-aliases)
+    # produce mnemonic='addi' with identical uses, imm, dual_arith_ok, and
+    # dual_move_ok.  Likewise ``li a0,1`` / ``c.li a0,1`` / ``addi a0,zero,1``
+    # all produce mnemonic='addi'.
     #
     # Also covers the negation pseudos:
     #   neg  rd, rs == sub  rd, x0, rs   (uses=[rs]; NOT RSD — rd≠rs1=x0)
@@ -567,7 +569,14 @@ def parse_line(index: int, line: str):
     #
     # Canonicalising these ensures consistent mnemonic, can_compress, and
     # _CMP_MNEMONICS membership regardless of which disassembler style is used.
-    _PSEUDO_CANON = {"mv": "add", "li": "addi", "j": "jal",
+    #
+    # Note: ``mv rd, rs`` is the GAS / RISC-V spec pseudo for ``addi rd, rs, 0``
+    # (I-type).  It is NOT ``add rd, x0, rs`` (R-type); that is the expansion of
+    # the C-extension ``c.mv rd, rs``, which is handled separately via _C_CANON.
+    # Canonicalising ``mv`` to ``addi`` (not ``add``) ensures that an aliased
+    # disassembler printing ``mv a0, a1`` and a no-alias disassembler printing
+    # ``addi a0, a1, 0`` both produce the same mnemonic, uses, and imm.
+    _PSEUDO_CANON = {"mv": "addi", "li": "addi", "j": "jal",
                      "neg": "sub", "not": "xori"}
     if mnemonic in _PSEUDO_CANON:
         mnemonic       = _PSEUDO_CANON[mnemonic]
@@ -576,6 +585,10 @@ def parse_line(index: int, line: str):
     # For ``not``: fix up imm=-1 so _dual_arith_ok and imm-range checks see it.
     if mnemonic == "xori" and instr.imm is None and raw_mn == "not":
         instr.imm = -1
+    # For ``mv``: fix up imm=0 so dual_arith_ok, _dual_move_ok, and imm-range
+    # checks all see it — identical to what addi rd, rs, 0 produces explicitly.
+    if mnemonic == "addi" and instr.imm is None and raw_mn == "mv":
+        instr.imm = 0
 
     # Step 3 — ``ret`` canonicalises to ``jalr`` (= jalr x0, 0(ra)).
     #

@@ -172,7 +172,11 @@ _COMPACT32_BRANCH_MN = frozenset({
     "beqz", "bnez",
     "jal", "jalr",
 })
-# ``mv rd, rs`` canonicalises to ``add`` with uses=[rs] (x0 filtered).
+# ``mv rd, rs``  (GAS pseudo = ``addi rd, rs, 0``) canonicalises to ``addi``
+#   with uses=[rs] and imm=0.  ``mv rd, x0`` filters x0 → uses=[], matching
+#   the li-form.
+# ``c.mv rd, rs`` (C extension = ``add rd, x0, rs``) canonicalises to ``add``
+#   with uses=[rs] (x0 filtered).
 # ``li rd, imm`` canonicalises to ``addi`` with uses=[] (x0 filtered).
 _DUAL_MOVE_MN = frozenset({"add", "addi"})
 
@@ -413,10 +417,19 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     Two arithmetic operations linked through t6 (x31) as an implicit
     intermediate register.
 
-    Instruction A writes its result to t6; instruction B reads t6 as rs1;
-    t6 must be dead after B.
+    Instruction A writes its result to t6; instruction B reads t6 as **rs1**
+    (``uses[0]``); t6 must be dead after B.
+
+    Note: the chain register must be rs1 of B, not rs2.  For a commutative
+    operation like ``add``, the operand order in the source matters:
+        add  rd, t6, rs2   ← matches  (t6 is rs1 = uses[0])
+        add  rd, rs1, t6   ← does NOT match  (t6 is rs2 = uses[1])
+    The renamer will rename A's destination to t6 if doing so improves the
+    score, which requires A to already have t6 as uses[0] after rename (i.e.
+    the RSD form: rd == rs1 before rename).
     """
-    if not a.dual_arith_chain_ok:
+    if not (a.defs and a.defs[0] == _CHAIN_REG
+            and _dual_arith_ok(a, allow_chain_reg=True)):
         return False
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
@@ -489,38 +502,25 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
         return False
     # rsd must appear as either operand of the branch (commutativity).
     return rsd in b.uses
-    """
-    Arithmetic operation (dual-arith subset) followed by a conditional
-    branch on whether the result is zero.
-
-    Matches:
-        <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
-        beqz / bnez      rd, label          (same rd)
-    """
-    if not a.dual_arith_ok:
-        return False
-    rd = a.defs[0] if a.defs else None
-    if rd is None:
-        return False
-    if b.mnemonic not in ("beqz", "bnez"):
-        return False
-    tested = b.uses[0] if b.uses else None
-    return tested == rd
 
 
 def _dual_move_ok(instr: "Instruction") -> bool:
     """Return True if *instr* is eligible as one slot of a dual_move pair.
 
-    Recognises the canonical forms of ``mv`` and ``li`` after parse-time
-    pseudo-instruction normalisation:
+    Recognises the canonical forms that map to C-extension compact encodings:
 
-    * mv-form  (``add rd, x0, rs``):  mnemonic ``add``, rd and rs both in
+    * mv-form  (``add rd, x0, rs``):  arises from C-extension ``c.mv rd, rs``
+      (= R-type ``add rd, x0, rs``); mnemonic ``add``, rd and rs both in
       x0..x15, exactly one use (x0 is filtered from uses, leaving only rs).
-    * li-form  (``addi rd, x0, imm``): mnemonic ``addi``, rd in x0..x15,
-      no uses (x0 filtered), immediate in −16..+15.
+      The GAS pseudo ``mv rd, rs`` assembles to ``addi rd, rs, 0`` (I-type,
+      NOT R-type) and canonicalises to mnemonic ``addi``; it does not match
+      this branch.
+    * li-form  (``addi rd, x0, imm``): arises from ``li`` / ``c.li`` / ``mv
+      rd, x0`` (all = ``addi rd, x0, imm``); mnemonic ``addi``, rd in
+      x0..x15, no uses (x0 filtered), immediate in −16..+15.
 
     A general ``add rd, rs1, rs2`` (two uses) or ``addi rd, rs1, imm``
-    (one use) does not qualify; those are arithmetic, not moves.
+    (one use, rs1 ≠ x0) does not qualify; those are arithmetic, not moves.
     """
     rd = instr.defs[0] if instr.defs else None
     if rd is None or rd not in _REG4:
@@ -599,8 +599,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
                 if (a.mnemonic == "andi" and a.imm is not None
                         and a.imm > 0 and not (a.imm & (a.imm - 1))):
                     eligible.add("bit_branch")
-        if a.defs and a.defs[0] == "x31":
-            if a.dual_arith_chain_ok:
+        if a.defs and a.defs[0] == _CHAIN_REG:
+            if _dual_arith_ok(a, allow_chain_reg=True):
                 eligible.add("dual_arith_chain")
         if a.mnemonic == "lw":
             eligible.add("adjacent_load_pair")
@@ -610,7 +610,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("pre_increment")
         if a.mnemonic in _MEM_OPS:
             eligible.add("post_increment")
-        if a.dual_arith_ok:
+        if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
@@ -648,6 +648,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         return ""
 
     _score._liveness_cell = cell
+    _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
     _score._describe_pair = _describe
     _score._rule_list = COMPACT32_RULES
     return _score
