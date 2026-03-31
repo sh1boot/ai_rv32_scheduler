@@ -504,29 +504,26 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
 def _dual_move_ok(instr: "Instruction") -> bool:
     """Return True if *instr* is eligible as one slot of a dual_move pair.
 
-    Recognises the canonical forms that map to C-extension compact encodings:
+    Recognises three canonical forms:
 
-    * mv-form  (``add rd, x0, rs``):  arises from C-extension ``c.mv rd, rs``
-      (= R-type ``add rd, x0, rs``); mnemonic ``add``, rd and rs both in
-      x0..x15, exactly one use (x0 is filtered from uses, leaving only rs).
-      The GAS pseudo ``mv rd, rs`` assembles to ``addi rd, rs, 0`` (I-type,
-      NOT R-type) and canonicalises to mnemonic ``addi``; it does not match
-      this branch.
-    * li-form  (``addi rd, x0, imm``): arises from ``li`` / ``c.li`` / ``mv
-      rd, x0`` (all = ``addi rd, x0, imm``); mnemonic ``addi``, rd in
-      x0..x15, no uses (x0 filtered), immediate in −16..+15.
-
-    A general ``add rd, rs1, rs2`` (two uses) or ``addi rd, rs1, imm``
-    (one use, rs1 ≠ x0) does not qualify; those are arithmetic, not moves.
+    * mv-form   (``addi rd, rs, 0``): GAS pseudo ``mv rd, rs`` (I-type);
+      rd in x0..x15, rs in x0..x15, imm=0, exactly one use.
+    * c.mv-form (``add rd, x0, rs``): C-extension ``c.mv rd, rs`` (R-type);
+      rd in x0..x15, rs in x0..x15, exactly one use (x0 filtered).
+    * li-form   (``addi rd, x0, imm``): ``li`` / ``c.li``; rd in x0..x15,
+      no uses (x0 filtered), imm in -16..+15.
     """
     rd = instr.defs[0] if instr.defs else None
     if rd is None or rd not in _REG4:
         return False
+    if instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0:
+        # mv-form: addi rd, rs, 0  (GAS pseudo mv)
+        return instr.uses[0] in _REG4
     if instr.mnemonic == "add" and len(instr.uses) == 1:
-        # mv-form: add rd, x0, rs  (x0 filtered → exactly one use)
+        # c.mv-form: add rd, x0, rs  (x0 filtered -> exactly one use)
         return instr.uses[0] in _REG4
     if instr.mnemonic == "addi" and not instr.uses:
-        # li-form: addi rd, x0, imm  (x0 filtered → no uses)
+        # li-form: addi rd, x0, imm  (x0 filtered -> no uses)
         imm = instr.imm
         return imm is not None and -16 <= imm <= 15
     return False
@@ -538,7 +535,8 @@ def _rule_dual_move(a: "Instruction", b: "Instruction",
     Two independent register-move or small-immediate-load instructions.
 
     Matches any combination of:
-        mv   rd, rs          (canonical: add rd, x0, rs — rs in x0..x15)
+        mv   rd, rs          (canonical: addi rd, rs, 0 — rs in x0..x15)
+        c.mv rd, rs          (canonical: add  rd, x0, rs — rs in x0..x15)
         li   rd, imm         (canonical: addi rd, x0, imm — imm in −16..+15)
 
     Both rd values must be distinct and in x0..x15.  Either order is valid.
