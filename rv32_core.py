@@ -722,6 +722,14 @@ _DUAL_ARITH_MN = frozenset({
     "and",  "bic",  "andn",
     "or",   "xor",
 })
+# R-type instructions whose rs1/rs2 can be swapped without changing the result.
+_COMMUTATIVE_BINOP = frozenset({
+    "add",  "addw",
+    "and",  "or",   "xor",
+    "mul",  "mulh", "mulhu",
+    "min",  "minu", "max",  "maxu",
+    "xnor",
+})
 _REG4      = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
 _IMM_FORMS = frozenset({"addi", "addiw", "andi"})
