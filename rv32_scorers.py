@@ -210,10 +210,11 @@ def can_compress(instr: "Instruction") -> bool:
         return False
 
     if mn == "slli":
-        # c.slli rd, shamt: rd != x0, shamt in 1..31.
+        # c.slli rd, shamt: RSD form (rd==rs1), rd != x0, shamt in 1..31.
         rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
         imm = instr.imm
-        return (rd is not None and rd != "x0"
+        return (rd is not None and rd != "x0" and rd == rs1
                 and imm is not None and 1 <= imm <= 31)
 
     if mn == "lui":
