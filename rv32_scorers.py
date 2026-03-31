@@ -65,9 +65,9 @@ def can_compress(instr: "Instruction") -> bool:
     """
     Return True if *instr* is a candidate for a 16-bit RVC encoding.
 
-    Conservative static test: checks the mnemonic and, where the compressed
-    form restricts the register set, the actual operand registers.  Does NOT
-    check immediate ranges.
+    Checks mnemonic, register constraints, and immediate ranges against the
+    actual RVC encoding rules.  Branch/jump offset ranges are not checked
+    (the offset is a label whose value is unknown at this stage).
     """
     mn   = instr.mnemonic
     if mn not in _CAN_COMPRESS_MNEMONICS:
@@ -76,53 +76,142 @@ def can_compress(instr: "Instruction") -> bool:
     uses = instr.uses
 
     if mn in ("sub", "xor", "or", "and"):
-        # RSD form: operand order after expansion is [rs1=rd, rs2].
-        # The CL register constraint applies to rd and rs2 independently.
+        # c.sub/c.xor/c.or/c.and: RSD form, rd and rs2 both in CL (x8..x15).
         rd  = defs[0] if defs else None
         rs2 = uses[1] if len(uses) > 1 else None
         return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS
 
     if mn in ("srai", "srli", "andi"):
+        # c.srai/c.srli: rd in CL, shamt in 1..31.
+        # c.andi:        rd in CL, imm in -32..31.
         rd = defs[0] if defs else None
-        return rd in _CL_INT_REGS
+        if rd not in _CL_INT_REGS:
+            return False
+        imm = instr.imm
+        if mn == "andi":
+            return imm is not None and -32 <= imm <= 31
+        # srai/srli: shamt must be non-zero and fit in 5 bits
+        return imm is not None and 1 <= imm <= 31
 
     if mn in ("beq", "bne"):
+        # c.beqz/c.bnez: rs1 in CL, rs2 == x0.  Offset range not checked.
         rs1 = uses[0] if len(uses) > 0 else None
         rs2 = uses[1] if len(uses) > 1 else None
         return rs1 in _CL_INT_REGS and rs2 == "x0"
 
     if mn in ("lw", "flw", "fld"):
-        base = uses[0] if uses else None
+        # c.lw/c.flw/c.fld: base in CL, rd in CL, offset in 0..124 (mult 4).
+        # c.lwsp/c.flwsp/c.fldsp: base == sp, offset in 0..252/504 (mult 4/8).
+        # Memory operands are decoded into instr.mem = (offset, base_reg).
+        mem  = instr.mem
         rd   = defs[0] if defs else None
+        off, base = mem if mem else (None, None)
         if base == "x2":
-            return True
+            # lwsp/flwsp/fldsp: offset must be non-negative and aligned.
+            if off is None or off < 0:
+                return False
+            align = 8 if mn == "fld" else 4
+            limit = 504 if mn == "fld" else 252
+            return off % align == 0 and off <= limit
         cl_regs = _CL_FP_REGS if mn in ("flw", "fld") else _CL_INT_REGS
-        return base in _CL_INT_REGS and rd in cl_regs
+        if base not in _CL_INT_REGS or rd not in cl_regs:
+            return False
+        # Offset: 0..124 (mult 4) for lw/flw, 0..248 (mult 8) for fld.
+        if off is None or off < 0:
+            return False
+        align = 8 if mn == "fld" else 4
+        limit = 248 if mn == "fld" else 124
+        return off % align == 0 and off <= limit
 
     if mn in ("sw", "fsw", "fsd"):
-        base = uses[1] if len(uses) > 1 else (uses[0] if uses else None)
+        # c.sw/c.fsw/c.fsd: base in CL, rs2 in CL, offset in 0..124 (mult 4).
+        # c.swsp/c.fswsp/c.fsdsp: base == sp, offset in 0..252/504 (mult 4/8).
+        mem  = instr.mem
         rs2  = uses[0] if uses else None
+        off, base = mem if mem else (None, None)
         if base == "x2":
-            return True
+            if off is None or off < 0:
+                return False
+            align = 8 if mn == "fsd" else 4
+            limit = 504 if mn == "fsd" else 252
+            return off % align == 0 and off <= limit
         cl_regs = _CL_FP_REGS if mn in ("fsw", "fsd") else _CL_INT_REGS
-        return base in _CL_INT_REGS and rs2 in cl_regs
+        if base not in _CL_INT_REGS or rs2 not in cl_regs:
+            return False
+        if off is None or off < 0:
+            return False
+        align = 8 if mn == "fsd" else 4
+        limit = 248 if mn == "fsd" else 124
+        return off % align == 0 and off <= limit
 
     if mn == "jalr":
-        return True
+        # c.jalr rs1: rd=x1, rs1 != x0, offset=0.
+        # c.jr   rs1: rd=x0, rs1 != x0, offset=0.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        imm = instr.imm
+        if rs1 is None or rs1 == "x0":
+            return False
+        if imm is not None and imm != 0:
+            return False
+        return rd in (None, "x0", "x1")
+
     if mn == "add":
-        rd = defs[0] if defs else None
-        return rd is not None and rd != "x0"
+        # c.add rd, rs2: RSD form (rd == rs1), rd != x0.
+        # c.mv  rd, rs:  rs1 == x0 (filtered to single use), rd != x0.
+        rd  = defs[0] if defs else None
+        if rd is None or rd == "x0":
+            return False
+        rs1 = uses[0] if len(uses) > 0 else None
+        rs2 = uses[1] if len(uses) > 1 else None
+        if rs2 is None:
+            # x0 was filtered — this is the c.mv form.
+            return True
+        # c.add: RSD form only.
+        return rd == rs1
+
     if mn == "addi":
-        return True
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        imm = instr.imm
+        if rd is None:
+            return False
+        # c.li rd, imm: addi rd, x0, imm (x0 filtered → no uses).
+        if not uses:
+            return rd != "x0" and imm is not None and -32 <= imm <= 31
+        # c.addi16sp: addi x2, x2, imm (RSD on sp).
+        if rd == "x2" and rs1 == "x2":
+            return (imm is not None and imm != 0
+                    and imm % 16 == 0 and -512 <= imm <= 496)
+        # c.addi4spn rd', x2, imm: sp-relative, rd in CL, imm positive mult of 4.
+        if rs1 == "x2" and rd in _CL_INT_REGS:
+            return (imm is not None and imm > 0
+                    and imm % 4 == 0 and imm <= 1020)
+        # c.addi rd, imm: RSD form, rd != x0/x2, imm != 0, -32..31.
+        if rd == rs1 and rd not in ("x0", "x2"):
+            return imm is not None and imm != 0 and -32 <= imm <= 31
+        return False
+
     if mn == "slli":
-        rd = defs[0] if defs else None
-        return rd is not None and rd != "x0"
+        # c.slli rd, shamt: rd != x0, shamt in 1..31.
+        rd  = defs[0] if defs else None
+        imm = instr.imm
+        return (rd is not None and rd != "x0"
+                and imm is not None and 1 <= imm <= 31)
+
     if mn == "lui":
-        rd = defs[0] if defs else None
-        return rd is not None and rd not in ("x0", "x2")
+        # c.lui rd, imm: rd != x0/x2, imm != 0, imm in -32..31 (upper 20 bits).
+        rd  = defs[0] if defs else None
+        imm = instr.imm
+        return (rd is not None and rd not in ("x0", "x2")
+                and imm is not None and imm != 0 and -32 <= imm <= 31)
+
     if mn == "jal":
-        return True
-    return True
+        # c.jal (RV32C, rd=x1) / c.j (rd=x0): offset range not checked.
+        rd = defs[0] if defs else None
+        return rd in (None, "x0", "x1")
+
+    return False
 
 
 # ---------------------------------------------------------------------------
