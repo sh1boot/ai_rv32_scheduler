@@ -176,13 +176,17 @@ def can_compress(instr: "Instruction") -> bool:
         imm = instr.imm
         if rd is None:
             return False
-        # c.li rd, imm: addi rd, x0, imm (x0 filtered → no uses).
+        # c.li: addi rd, x0, imm (x0 filtered → no uses).
         if not uses:
             return rd != "x0" and imm is not None and -32 <= imm <= 31
         # c.addi16sp: addi x2, x2, imm (RSD on sp).
         if rd == "x2" and rs1 == "x2":
             return (imm is not None and imm != 0
                     and imm % 16 == 0 and -512 <= imm <= 496)
+        # c.mv: addi rd, rs, 0 (GAS mv pseudo; x0 already filtered so rs != x0).
+        # Assembler emits c.mv rd, rs for this form.  No register-range limit.
+        if imm == 0 and rd != "x0":
+            return True
         # c.addi4spn rd', x2, imm: sp-relative, rd in CL, imm positive mult of 4.
         if rs1 == "x2" and rd in _CL_INT_REGS:
             return (imm is not None and imm > 0
