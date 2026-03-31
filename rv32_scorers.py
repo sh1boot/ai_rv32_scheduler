@@ -55,7 +55,7 @@ _CAN_COMPRESS_MNEMONICS: frozenset = frozenset({
     "jalr", "add",
     "addi", "lui", "slli", "lw", "flw", "fld",
     "sw", "fsw", "fsd",
-    "beq", "bne", "jal",
+    "beq", "bne", "beqz", "bnez", "jal",
     "sub", "xor", "or", "and", "srai", "srli", "andi",
     "nop",
 })
@@ -93,8 +93,13 @@ def can_compress(instr: "Instruction") -> bool:
         # srai/srli: shamt must be non-zero and fit in 5 bits
         return imm is not None and 1 <= imm <= 31
 
+    if mn in ("beqz", "bnez"):
+        # c.beqz/c.bnez: rs1 in CL.  Offset range not checked.
+        rs1 = uses[0] if uses else None
+        return rs1 in _CL_INT_REGS
+
     if mn in ("beq", "bne"):
-        # c.beqz/c.bnez: rs1 in CL, rs2 == x0.  Offset range not checked.
+        # c.beqz/c.bnez via full form: rs1 in CL, rs2 == x0.
         rs1 = uses[0] if len(uses) > 0 else None
         rs2 = uses[1] if len(uses) > 1 else None
         return rs1 in _CL_INT_REGS and rs2 == "x0"
@@ -147,12 +152,17 @@ def can_compress(instr: "Instruction") -> bool:
     if mn == "jalr":
         # c.jalr rs1: rd=x1, rs1 != x0, offset=0.
         # c.jr   rs1: rd=x0, rs1 != x0, offset=0.
+        # Single-operand pseudo form (jalr rs / jr rs): parser puts the
+        # register in defs with uses=[]; treat as compressible call/jump.
         rd  = defs[0] if defs else None
         rs1 = uses[0] if uses else None
         imm = instr.imm
-        if rs1 is None or rs1 == "x0":
-            return False
         if imm is not None and imm != 0:
+            return False
+        if rs1 is None:
+            # Single-operand form: register is in defs; any non-x0 reg is ok.
+            return rd is not None and rd != "x0"
+        if rs1 == "x0":
             return False
         return rd in (None, "x0", "x1")
 

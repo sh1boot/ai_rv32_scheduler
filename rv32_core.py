@@ -573,7 +573,7 @@ def parse_line(index: int, line: str):
     # Canonicalising ``mv`` to ``addi`` (not ``add``) ensures that an aliased
     # disassembler printing ``mv a0, a1`` and a no-alias disassembler printing
     # ``addi a0, a1, 0`` both produce the same mnemonic, uses, and imm.
-    _PSEUDO_CANON = {"mv": "addi", "li": "addi", "j": "jal",
+    _PSEUDO_CANON = {"mv": "addi", "li": "addi", "j": "jal", "jr": "jalr",
                      "neg": "sub", "not": "xori"}
     if mnemonic in _PSEUDO_CANON:
         mnemonic       = _PSEUDO_CANON[mnemonic]
@@ -616,7 +616,9 @@ def parse_line(index: int, line: str):
     _ZERO_BRANCH: dict = {
         # (mnemonic, which operand is zero): pseudo
         ("bne",  1): "bnez",   # bne rs, zero → bnez rs
+        ("bne",  0): "bnez",   # bne zero, rs → bnez rs  (commuted; bne is symmetric)
         ("beq",  1): "beqz",   # beq rs, zero → beqz rs
+        ("beq",  0): "beqz",   # beq zero, rs → beqz rs  (commuted; beq is symmetric)
         ("blt",  1): "bltz",   # blt rs, zero → bltz rs
         ("bge",  1): "bgez",   # bge rs, zero → bgez rs
         ("blt",  0): "bgtz",   # blt zero, rs → bgtz rs  (rs > 0)
