@@ -76,16 +76,17 @@ def can_compress(instr: "Instruction") -> bool:
     uses = instr.uses
 
     if mn in ("sub", "xor", "or", "and"):
-        # c.sub/c.xor/c.or/c.and: RSD form, rd and rs2 both in CL (x8..x15).
+        # c.sub/c.xor/c.or/c.and: RSD form (rd==rs1), rd and rs2 both in CL.
         rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
         rs2 = uses[1] if len(uses) > 1 else None
-        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS
+        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS and rd == rs1
 
     if mn in ("srai", "srli", "andi"):
-        # c.srai/c.srli: rd in CL, shamt in 1..31.
-        # c.andi:        rd in CL, imm in -32..31.
-        rd = defs[0] if defs else None
-        if rd not in _CL_INT_REGS:
+        # c.srai/c.srli/c.andi: RSD form (rd==rs1), rd in CL.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        if rd not in _CL_INT_REGS or rd != rs1:
             return False
         imm = instr.imm
         if mn == "andi":
@@ -132,8 +133,10 @@ def can_compress(instr: "Instruction") -> bool:
         # c.sw/c.fsw/c.fsd: base in CL, rs2 in CL, offset in 0..124 (mult 4).
         # c.swsp/c.fswsp/c.fsdsp: base == sp, offset in 0..252/504 (mult 4/8).
         mem  = instr.mem
-        rs2  = uses[0] if uses else None
         off, base = mem if mem else (None, None)
+        # x0 is filtered from uses; if all remaining uses equal the base,
+        # the stored value was x0.
+        rs2 = next((r for r in uses if r != base), "x0")
         if base == "x2":
             if off is None or off < 0:
                 return False

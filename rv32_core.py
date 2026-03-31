@@ -701,6 +701,12 @@ def parse_line(index: int, line: str):
         _m = _MEM_RE.match(_ops2[-1])
         if _m:
             instr.mem = (int(_m.group(1)), _normalise_reg(_m.group(2).strip()))
+    # jalr rd, offset(rs1): offset is the branch condition — capture it as imm.
+    if mnemonic == "jalr" and instr.imm is None and len(_parts) >= 2:
+        _ops2 = [o.strip() for o in _parts[1].split(",")]
+        _m = _MEM_RE.match(_ops2[-1])
+        if _m:
+            instr.imm = int(_m.group(1))
 
     # Pre-compute dual-arith eligibility flags.
     instr.dual_arith_ok       = _dual_arith_ok(instr)
