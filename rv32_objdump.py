@@ -118,7 +118,7 @@ _RE_ANGLE_ANNOT = re.compile(r"\s+<[^>]+>")
 
 # Branch and jump mnemonics whose *last* operand is a target address.
 # Includes both canonical forms (as objdump emits by default) and the
-# explicit c. compressed forms (emitted when --explicit-compressed is active).
+# explicit c. compressed forms (emitted when --mark-compressed is active).
 _BRANCH_MN = frozenset({
     "beq", "bne", "blt", "bge", "bltu", "bgeu",
     "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
@@ -165,88 +165,6 @@ def _is_16bit_encoding(hex_field: str) -> bool:
     compressed (RVC) instructions and 8 digits for standard 32-bit ones.
     """
     return len(hex_field.strip()) == 4
-
-
-def _decode_c_mnemonic(word: int) -> Optional[str]:
-    """
-    Decode a 16-bit RVC instruction word and return its canonical ``c.``
-    mnemonic, or ``None`` if the encoding is unrecognised or reserved.
-
-    The quadrant (bits [1:0]) and funct3 (bits [15:13]) fields determine the
-    instruction class; secondary fields are used where needed to distinguish
-    within a class (e.g. ``c.mv`` vs ``c.add``, ``c.jr`` vs ``c.jalr``).
-
-    Reference: RISC-V Compressed ISA, Volume I, Chapter 16.
-    """
-    quad   = word & 0x3          # bits [1:0]
-    funct3 = (word >> 13) & 0x7  # bits [15:13]
-
-    # ── Quadrant 0 ────────────────────────────────────────────────────────
-    if quad == 0:
-        if funct3 == 0b000:
-            return "c.addi4spn" if (word >> 5) & 0xFF else None  # 0 = illegal
-        if funct3 == 0b001: return "c.fld"
-        if funct3 == 0b010: return "c.lw"
-        if funct3 == 0b011: return "c.flw"
-        if funct3 == 0b101: return "c.fsd"
-        if funct3 == 0b110: return "c.sw"
-        if funct3 == 0b111: return "c.fsw"
-        return None
-
-    # ── Quadrant 1 ────────────────────────────────────────────────────────
-    if quad == 1:
-        if funct3 == 0b000:
-            rd = (word >> 7) & 0x1F
-            return "c.nop" if rd == 0 else "c.addi"
-        if funct3 == 0b001: return "c.jal"
-        if funct3 == 0b010: return "c.li"
-        if funct3 == 0b011:
-            rd = (word >> 7) & 0x1F
-            return "c.addi16sp" if rd == 2 else "c.lui"
-        if funct3 == 0b100:
-            funct2 = (word >> 10) & 0x3
-            if funct2 == 0b00: return "c.srli"
-            if funct2 == 0b01: return "c.srai"
-            if funct2 == 0b10: return "c.andi"
-            if funct2 == 0b11:
-                funct_hi = (word >> 12) & 0x1
-                funct2b  = (word >> 5)  & 0x3
-                if funct_hi == 0:
-                    if funct2b == 0b00: return "c.sub"
-                    if funct2b == 0b01: return "c.xor"
-                    if funct2b == 0b10: return "c.or"
-                    if funct2b == 0b11: return "c.and"
-                else:
-                    if funct2b == 0b00: return "c.subw"
-                    if funct2b == 0b01: return "c.addw"
-                return None
-        if funct3 == 0b101: return "c.j"
-        if funct3 == 0b110: return "c.beqz"
-        if funct3 == 0b111: return "c.bnez"
-        return None
-
-    # ── Quadrant 2 ────────────────────────────────────────────────────────
-    if quad == 2:
-        if funct3 == 0b000: return "c.slli"
-        if funct3 == 0b001: return "c.fldsp"
-        if funct3 == 0b010: return "c.lwsp"
-        if funct3 == 0b011: return "c.flwsp"
-        if funct3 == 0b100:
-            funct_bit = (word >> 12) & 0x1
-            rs2       = (word >> 2)  & 0x1F
-            rd        = (word >> 7)  & 0x1F
-            if funct_bit == 0:
-                return "c.mv" if rs2 != 0 else ("c.jr" if rd != 0 else None)
-            else:
-                if rs2 == 0:
-                    return "c.ebreak" if rd == 0 else "c.jalr"
-                return "c.add"
-        if funct3 == 0b101: return "c.fsdsp"
-        if funct3 == 0b110: return "c.swsp"
-        if funct3 == 0b111: return "c.fswsp"
-        return None
-
-    return None  # quad == 3: not a compressed instruction
 
 
 def _label_for(addr: int, kind: str) -> str:
@@ -430,7 +348,7 @@ def _pass2(
     label_map: dict[int, str],
     branch_target_addrs: set[int],
     keep_comments: bool,
-    explicit_compressed: bool = False,
+    mark_compressed: bool = False,
 ) -> list[str]:
     """
     Walk the objdump lines and produce clean assembly lines.
@@ -564,14 +482,11 @@ def _pass2(
         mn = parts[0]
         operands_raw = parts[1].strip() if len(parts) > 1 else ""
 
-        # If --explicit-compressed is active and this is a 16-bit instruction,
+        # If --mark-compressed is active and this is a 16-bit instruction,
         # replace the canonical mnemonic with the exact c. form decoded from
         # the instruction word bits.
-        if explicit_compressed and _is_16bit_encoding(hex_field):
-            word = int(hex_field.strip(), 16)
-            c_mn = _decode_c_mnemonic(word)
-            if c_mn is not None:
-                mn = c_mn
+        if mark_compressed and _is_16bit_encoding(hex_field):
+            hash_comment = "\t# RVC" + hash_comment
 
         # Replace bare hex address tokens in branch/jump operands with labels.
         mn_lower = mn.lower()
@@ -615,7 +530,7 @@ def convert(
     source: str,
     *,
     keep_comments: bool = True,
-    explicit_compressed: bool = False,
+    mark_compressed: bool = False,
 ) -> str:
     """
     Convert *source* (an ``objdump -d`` disassembly string) to plain
@@ -631,7 +546,7 @@ def convert(
         output (section headers, hash-comment addresses resolved to label
         names, data / fill markers).  Set to False for a minimal output with
         no comments.
-    explicit_compressed
+    mark_compressed
         If True, 16-bit (RVC) instructions are emitted with their exact
         ``c.`` mnemonic (e.g. ``c.mv``, ``c.addi``, ``c.swsp``) rather than
         the canonical form that objdump normally uses.
@@ -647,7 +562,7 @@ def convert(
     addr_to_defined_name, addr_to_ref_kind, branch_target_addrs = _pass1(lines)
     label_map = _build_label_map(addr_to_defined_name, addr_to_ref_kind)
     output_lines = _pass2(lines, label_map, branch_target_addrs,
-                          keep_comments, explicit_compressed)
+                          keep_comments, mark_compressed)
 
     # Strip leading/trailing blank lines, add a trailing newline.
     while output_lines and output_lines[0] == "":
@@ -691,7 +606,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="omit informational comments from the output",
     )
     p.add_argument(
-        "--explicit-compressed",
+        "--mark-compressed",
         action="store_true",
         help="emit c. mnemonics (c.mv, c.addi, c.swsp, …) for 16-bit RVC "
              "instructions instead of the canonical form objdump uses",
@@ -732,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     result = convert(source, keep_comments=not args.no_comments,
-                    explicit_compressed=args.explicit_compressed)
+                    mark_compressed=args.mark_compressed)
 
     # Write output.
     if args.output == "-":
