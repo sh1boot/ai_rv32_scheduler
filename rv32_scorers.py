@@ -420,13 +420,10 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     Instruction A writes its result to t6; instruction B reads t6 as **rs1**
     (``uses[0]``); t6 must be dead after B.
 
-    Note: the chain register must be rs1 of B, not rs2.  For a commutative
-    operation like ``add``, the operand order in the source matters:
-        add  rd, t6, rs2   ← matches  (t6 is rs1 = uses[0])
-        add  rd, rs1, t6   ← does NOT match  (t6 is rs2 = uses[1])
-    The renamer will rename A's destination to t6 if doing so improves the
-    score, which requires A to already have t6 as uses[0] after rename (i.e.
-    the RSD form: rd == rs1 before rename).
+    Note: the chain register must be rs1 of B (``uses[0]``) at score time.
+    For commutative operations (``add``, ``and``, ``or``, …) the renamer
+    normalises operand order so that the chain register is always rs1 when
+    possible, so both source orderings are handled automatically.
     """
     if not (a.defs and a.defs[0] == _CHAIN_REG
             and _dual_arith_ok(a, allow_chain_reg=True)):

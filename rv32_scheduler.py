@@ -25,6 +25,7 @@ from rv32_core import (
     Instruction, DepGraph, parse_line, build_dep_graph, compute_liveness,
     _INT_ABI, _FP_ABI, _SENTINEL_MN, _LABEL_DEF,
     _classify_labels, build_cfg_liveness,
+    _COMMUTATIVE_BINOP, _CHAIN_REG,
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
@@ -1027,6 +1028,23 @@ def rename_destinations(
 
     return scheduled
 
+def _swap_raw(instr, r1: str, r2: str) -> None:
+    """Swap two canonical register names (and their ABI aliases) in instr.raw."""
+    SENT = "\x00"
+    raw = instr.raw
+    def _surface(canon: str) -> set:
+        s = {canon}
+        for abi, c in {**_INT_ABI, **_FP_ABI}.items():
+            if c == canon:
+                s.add(abi)
+        return s
+    for a in _surface(r1):
+        raw = re.sub(r'\b' + re.escape(a) + r'\b', SENT, raw)
+    for a in _surface(r2):
+        raw = re.sub(r'\b' + re.escape(a) + r'\b', r1, raw)
+    instr.raw = raw.replace(SENT, r2)
+
+
 def _apply_rename(scheduled: list, start: int, end: int,
                   old_reg: str, new_reg: str) -> list:
     """
@@ -1058,6 +1076,18 @@ def _apply_rename(scheduled: list, start: int, end: int,
                 instr.raw,
                 flags=re.IGNORECASE,
             )
+        # Commutative operand normalisation: for instructions where rs1/rs2 are
+        # interchangeable, ensure the "key" register is always rs1 (uses[0]).
+        # Preference order: chain reg (x31) > RSD form (rd == rs1) > leave alone.
+        if instr.mnemonic in _COMMUTATIVE_BINOP and len(instr.uses) == 2:
+            rs1, rs2 = instr.uses[0], instr.uses[1]
+            rd = instr.defs[0] if instr.defs else None
+            if rs2 == _CHAIN_REG and rs1 != _CHAIN_REG:
+                instr.uses[0], instr.uses[1] = rs2, rs1
+                _swap_raw(instr, rs1, rs2)
+            elif rs2 == rd and rs1 != rd and _CHAIN_REG not in (rs1, rs2):
+                instr.uses[0], instr.uses[1] = rs2, rs1
+                _swap_raw(instr, rs1, rs2)
         undo.append((pos, old_defs, old_uses, old_raw))
     return undo
 
