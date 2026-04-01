@@ -394,7 +394,6 @@ class Instruction:
     imm:        object = None  # int immediate if present, else None
     mem:        object = None  # (offset:int, base:str) for load/store, else None
     dual_arith_ok:       bool = False
-    dual_arith_chain_ok: bool = False
     # Source lines (label definitions) that must be emitted immediately before
     # this instruction wherever it is scheduled.  Used for non-barrier labels
     # such as .Lpcrel_hi* that must stay anchored to the instruction they
@@ -708,12 +707,8 @@ def parse_line(index: int, line: str):
         if _m:
             instr.imm = int(_m.group(1))
 
-    # Pre-compute dual-arith eligibility flags.
-    instr.dual_arith_ok       = _dual_arith_ok(instr)
-    instr.dual_arith_chain_ok = (
-        _dual_arith_ok(instr, allow_chain_reg=True)
-        and bool(instr.defs) and instr.defs[0] == "x31"
-    )
+    # Pre-compute dual-arith eligibility flag.
+    instr.dual_arith_ok = _dual_arith_ok(instr)
     return instr
 
 # ---------------------------------------------------------------------------
@@ -739,7 +734,7 @@ _REG4      = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
 _IMM_FORMS = frozenset({"addi", "addiw", "andi"})
 
-def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
+def _dual_arith_ok(instr: "Instruction") -> bool:
     mn  = instr.mnemonic
     if mn not in _DUAL_ARITH_MN:
         return False
@@ -748,17 +743,13 @@ def _dual_arith_ok(instr: "Instruction", allow_chain_reg: bool = False) -> bool:
     if rd is None or rs1 is None:
         return False
     if mn == "addi" and rs1 == "x2" and rd != "x2":
-        reg_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
-        if not reg_ok:
+        if rd not in _REG4:
             return False
         imm = instr.imm
         if imm is None or imm <= 0 or imm % 4 != 0 or imm > 124:
             return False
         return True
-    if rd != rs1:
-        return False
-    rsd_ok = (rd in _REG4) or (allow_chain_reg and rd == _CHAIN_REG)
-    if not rsd_ok:
+    if rd != rs1 or rd not in _REG4:
         return False
     if len(instr.uses) >= 2 and instr.uses[1] not in _REG4:
         return False

@@ -34,7 +34,7 @@ from typing import Callable
 
 from rv32_core import (
     Instruction,
-    _DUAL_ARITH_MN, _REG4, _CHAIN_REG, _IMM_FORMS,
+    _DUAL_ARITH_MN, _REG4, _IMM_FORMS,
     _dual_arith_ok,
 )
 
@@ -297,15 +297,14 @@ def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool
         beqz / bnez  rd, label   (rd dead after B)
 
     The immediate must have exactly one bit set, so the andi isolates a single
-    bit from rs.  The compact encoding represents it as a bit index rather than
-    a full 12-bit immediate.  rd must differ from rs (chain form — rs preserved)
-    and will be renamed to x31 by the renamer if liveness confirms it is safe.
+    bit from rs.  rd must differ from rs so the source is preserved.  rd must
+    be dead after B — its sole purpose is to carry the isolated bit to the branch.
 
-    Canonical examples (pre-rename):
-        andi  a0, s6, 4      # test bit 2; a0 → x31 after rename
+    Canonical examples:
+        andi  a0, s6, 4      # test bit 2; a0 dead after branch
         beqz  a0, .skip
 
-        andi  a1, t1, 256    # test bit 8; a1 → x31 after rename
+        andi  a1, t1, 256    # test bit 8; a1 dead after branch
         bnez  a1, .found
     """
     if not a.defs:
@@ -340,21 +339,15 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
         <cmp-op>  rd, rs, ...    (any _CMP_MNEMONICS mnemonic; rd != rs1)
         beqz / bnez  rd, label   (rd dead after B)
 
-    rd must differ from rs1 — this is the key distinction from cmp_branch_rsd:
-    the source register is *preserved* because rd overwrites a different slot.
-    The compact encoding uses x31 as an implicit chain register, so rd must be
-    (or be renameable to) x31.  The renamer will rename rd → x31 if this rule
-    scores the pair and liveness confirms the rename is safe.
+    rd must differ from rs1 — the source register is preserved because rd
+    occupies a distinct slot.  rd must be dead after B: it carries the
+    comparison result only as far as the branch, then is discarded.
 
-    The liveness check — rd dead after B — serves double duty: it confirms the
-    rename is safe (nothing reads rd past B) AND is required by the encoding
-    (x31 is a scratch register that must not be live across the pair).
-
-    Canonical examples (pre-rename):
-        andi   a0, s6, 1     # rd=a0, rs1=s6 (rd != rs1) → rename a0 → x31
+    Canonical examples:
+        andi   a0, s6, 1     # rd=a0, rs1=s6; a0 dead after branch
         bne    a0, zero, .L
 
-        sltiu  a1, a0, 1     # rd=a1, rs1=a0 (rd != rs1) → rename a1 → x31
+        sltiu  a1, a0, 1     # rd=a1, rs1=a0; a1 dead after branch
         bnez   a1, .done
     """
     if not a.defs:
@@ -521,24 +514,26 @@ def _rule_dual_arith(a: "Instruction", b: "Instruction",
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
                             liveness: dict) -> bool:
     """
-    Two arithmetic operations linked through t6 (x31) as an implicit
-    intermediate register.
+    Two arithmetic operations where A's result is consumed by B as its first
+    source, then discarded (dead after B).
 
-    Instruction A writes its result to t6; instruction B reads t6 as **rs1**
-    (``uses[0]``); t6 must be dead after B.
+    Matches:
+        <dual-arith op>  rd_a, rd_a, rs2_a   (A in RSD form; rd_a in x0..x15)
+        <dual-arith op>  rd_b, rd_a, rs2_b   (B reads A's result as rs1)
 
-    Note: the chain register must be rs1 of B (``uses[0]``) at score time.
-    For commutative operations (``add``, ``and``, ``or``, …) the renamer
-    normalises operand order so that the chain register is always rs1 when
-    possible, so both source orderings are handled automatically.
+    rd_a must be dead after B — it is the intermediate, used only to pass
+    A's result to B.  rd_b must be in x0..x15.
+
+    Note: B reads A's result as rs1 (``uses[0]``).  For commutative ops
+    (``add``, ``and``, ``or``, …) the renamer normalises operand order so
+    the chain intermediate is rs1 when possible.
     """
-    if not (a.defs and a.defs[0] == _CHAIN_REG
-            and _dual_arith_ok(a, allow_chain_reg=True)):
+    if not a.dual_arith_ok:
         return False
+    rd_a = a.defs[0]
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
-    rs1_b = b.uses[0] if b.uses else None
-    if rs1_b != _CHAIN_REG:
+    if not b.uses or b.uses[0] != rd_a:
         return False
     rd_b = b.defs[0] if b.defs else None
     if rd_b is None or rd_b not in _REG4:
@@ -549,7 +544,8 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
         imm = b.imm
         if imm is None or imm < -16 or imm > 15:
             return False
-    if _CHAIN_REG not in liveness.get(b.index, frozenset()):
+    # A's result is consumed by B and not needed afterwards.
+    if rd_a not in liveness.get(b.index, frozenset()):
         return False
     return True
 
@@ -696,14 +692,12 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
                 eligible.add("cmp_branch_rsd")
             else:
                 # Non-RSD form (rd != rs1): eligible for cmp_branch_chain.
-                # The renamer will rename rd → x31 if liveness permits.
                 eligible.add("cmp_branch_chain")
                 if (a.mnemonic == "andi" and a.imm is not None
                         and a.imm > 0 and not (a.imm & (a.imm - 1))):
                     eligible.add("bit_branch")
-        if a.defs and a.defs[0] == _CHAIN_REG:
-            if _dual_arith_ok(a, allow_chain_reg=True):
-                eligible.add("dual_arith_chain")
+        if _dual_arith_ok(a):
+            eligible.add("dual_arith_chain")
         if a.mnemonic == "lw":
             eligible.add("adjacent_load_pair")
         if a.mnemonic == "sw":
