@@ -87,9 +87,8 @@ _RE_LABEL_HDR = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$", re.IGNORECASE)
 # extra hex group when only one space separates them from the last hex byte.
 _RE_INSTR = re.compile(
     r"^([0-9a-f]+):\s+"           # address
-    r"((?:[0-9a-f]{2,8} )*"       # hex-byte groups separated by single spaces
-    r"[0-9a-f]{2,8})"             # last hex-byte group (no trailing space)
-    r"\s{2,}"                     # 2+ spaces separating encoding from mnemonic
+    r"([0-9a-f]{4,8})"            # hex instruction representation
+    r"\s*\t"                      # padding then tab separating encoding from mnemonic
     r"(\S.*)$",                   # mnemonic + operands (+ optional comment)
     re.IGNORECASE,
 )
@@ -97,7 +96,7 @@ _RE_INSTR = re.compile(
 # Pure data line (two or more 4-byte words, no mnemonic column):
 #   "ADDR:  WORD  WORD  ..."
 _RE_DATA = re.compile(
-    r"^[0-9a-f]+:\s+(?:[0-9a-f]{8}\s+){2,}\s*$",
+    r"^[0-9a-f]+:\s+((?:[0-9a-f]{8}\s){2,})\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -417,9 +416,8 @@ def _pass2(
             continue
 
         # ── Data lines ────────────────────────────────────────────────────
-        if _RE_DATA.match(stripped):
-            if keep_comments:
-                output.append(f"\t# data: {stripped}")
+        if m := _RE_DATA.match(stripped):
+            output.append(f"\t.word\t0x{m[1].replace(' ', ', 0x')} # {m[2]}")
             continue
 
         # ── Label header ──────────────────────────────────────────────────
