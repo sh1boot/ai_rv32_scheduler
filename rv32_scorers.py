@@ -336,8 +336,8 @@ def _rule_bit_branch_chain(a: "Instruction", b: "Instruction",
         slli / srli / srai  rd, rs, N   (rd != rs)
         beqz / bnez  rd, label          (rd dead after B)
 
-    rd carries only the isolated or shifted bit to the branch and is then
-    discarded.  The source register rs is preserved.
+    rd is dead after B — it carries only the isolated or shifted bit to
+    the branch and is then discarded.  The source register rs is preserved.
     """
     if not a.defs:
         return False
