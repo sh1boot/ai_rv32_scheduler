@@ -64,12 +64,14 @@ def _is_reg_token(tok: str) -> bool:
 # mnemonic -> (def_slot, (use_slot, ...))
 
 _I = {
-    "add":   ("rd", ("rs1","rs2")), "sub":   ("rd", ("rs1","rs2")),
+    "add":   ("rd", ("rs1","rs2")), "addw":  ("rd", ("rs1","rs2")),
+    "sub":   ("rd", ("rs1","rs2")), "subw":  ("rd", ("rs1","rs2")),
+    "addi":  ("rd", ("rs1",)),      "addiw": ("rd", ("rs1",)),
     "sll":   ("rd", ("rs1","rs2")), "slt":   ("rd", ("rs1","rs2")),
     "sltu":  ("rd", ("rs1","rs2")), "xor":   ("rd", ("rs1","rs2")),
     "srl":   ("rd", ("rs1","rs2")), "sra":   ("rd", ("rs1","rs2")),
     "or":    ("rd", ("rs1","rs2")), "and":   ("rd", ("rs1","rs2")),
-    "addi":  ("rd", ("rs1",)),      "slti":  ("rd", ("rs1",)),
+    "slti":  ("rd", ("rs1",)),
     "sltiu": ("rd", ("rs1",)),      "xori":  ("rd", ("rs1",)),
     "ori":   ("rd", ("rs1",)),      "andi":  ("rd", ("rs1",)),
     "slli":  ("rd", ("rs1",)),      "srli":  ("rd", ("rs1",)),
@@ -219,8 +221,10 @@ _ZICSR = {
 CSR_WRITERS = frozenset(_ZICSR)
 
 _B = {
-    "sh1add": ("rd", ("rs1","rs2")), "sh2add": ("rd", ("rs1","rs2")),
-    "sh3add": ("rd", ("rs1","rs2")),
+    "sh1add":    ("rd", ("rs1","rs2")), "sh2add":    ("rd", ("rs1","rs2")),
+    "sh3add":    ("rd", ("rs1","rs2")),
+    "sh1add.uw": ("rd", ("rs1","rs2")), "sh2add.uw": ("rd", ("rs1","rs2")),
+    "sh3add.uw": ("rd", ("rs1","rs2")),
     "andn":   ("rd", ("rs1","rs2")), "orn":    ("rd", ("rs1","rs2")),
     "xnor":   ("rd", ("rs1","rs2")),
     "clz":    ("rd", ("rs1",)),      "ctz":    ("rd", ("rs1",)),
