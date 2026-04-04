@@ -1,3 +1,4 @@
+*.out.s
 __pycache__/
 *.py[cod]
 *.pyo
