@@ -264,8 +264,7 @@ _compress_pair_score._describe_pair = _rvc_describe_pair
 # liveness[i] = frozenset of registers dead after instruction i.
 
 _CMP_MNEMONICS = frozenset({
-    "slti", "sltiu", "slli", "srli", "srai",
-    "andi", "ori", "xori",
+    "slti", "sltiu",
     "slt", "sltu",
     "seqz", "snez", "sltz", "sgtz",
 })
@@ -295,45 +294,66 @@ _COMPACT32_BRANCH_MN = frozenset({
 _DUAL_MOVE_MN = frozenset({"add", "addi"})
 
 
-def _rule_bit_branch(a: "Instruction", b: "Instruction", liveness: dict) -> bool:
+def _is_pow2_imm(imm) -> bool:
+    return imm is not None and imm > 0 and not (imm & (imm - 1))
+
+
+def _rule_bit_branch_rsd(a: "Instruction", b: "Instruction",
+                         liveness: dict) -> bool:
     """
-    Single-bit test + conditional branch (bit-branch form).
+    Single-bit mask in RSD form + conditional branch.
 
     Matches:
-        andi  rd, rs, imm        (imm is a positive power of two; rd != rs)
+        andi  rd, rd, imm        (imm a positive power of two; rd == rs1)
         beqz / bnez  rd, label   (rd dead after B)
 
-    The immediate must have exactly one bit set, so the andi isolates a single
-    bit from rs.  rd must differ from rs so the source is preserved.  rd must
-    be dead after B — its sole purpose is to carry the isolated bit to the branch.
-
-    Canonical examples:
-        andi  a0, s6, 4      # test bit 2; a0 dead after branch
-        beqz  a0, .skip
-
-        andi  a1, t1, 256    # test bit 8; a1 dead after branch
-        bnez  a1, .found
+    rd is overwritten with the isolated bit and then consumed by the branch.
     """
-    if not a.defs:
+    if not a.defs or a.mnemonic != "andi":
         return False
     rd = a.defs[0]
-    if a.mnemonic != "andi":
+    if not _is_pow2_imm(a.imm):
         return False
-    imm = a.imm
-    if imm is None or imm <= 0:
-        return False
-    if imm & (imm - 1):           # not a power of two
-        return False
-    # Chain form: rd must differ from rs1 so the source is preserved.
-    if a.uses and a.uses[0] == rd:
+    if not a.uses or a.uses[0] != rd:   # must be RSD form
         return False
     if b.mnemonic not in ("beqz", "bnez"):
         return False
     if rd not in b.uses:
         return False
-    if rd not in liveness.get(b.index, frozenset()):
+    return rd in liveness.get(b.index, frozenset())
+
+
+def _rule_bit_branch_chain(a: "Instruction", b: "Instruction",
+                           liveness: dict) -> bool:
+    """
+    Single-bit test into a fresh register + conditional branch (chain form).
+
+    Matches either:
+        andi   rd, rs, imm       (imm a positive power of two; rd != rs)
+        beqz / bnez  rd, label   (rd dead after B)
+
+    or:
+        slli / srli / srai  rd, rs, N   (rd != rs)
+        beqz / bnez  rd, label          (rd dead after B)
+
+    rd is dead after B — it carries only the isolated or shifted bit to
+    the branch and is then discarded.  The source register rs is preserved.
+    """
+    if not a.defs:
         return False
-    return True
+    rd = a.defs[0]
+    if a.uses and a.uses[0] == rd:      # RSD form → not chain
+        return False
+    if a.mnemonic == "andi":
+        if not _is_pow2_imm(a.imm):
+            return False
+    elif a.mnemonic not in ("slli", "srli", "srai"):
+        return False
+    if b.mnemonic not in ("beqz", "bnez"):
+        return False
+    if rd not in b.uses:
+        return False
+    return rd in liveness.get(b.index, frozenset())
 
 
 def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
@@ -699,7 +719,8 @@ def _rule_dual_move(a: "Instruction", b: "Instruction",
 # Registry: (display_name, rule_function).  Rules are tested in order;
 # the first match wins.
 COMPACT32_RULES: list = [
-    ("bit_branch",          _rule_bit_branch),
+    ("bit_branch_rsd",      _rule_bit_branch_rsd),
+    ("bit_branch_chain",    _rule_bit_branch_chain),
     ("cmp_branch_rsd",      _rule_cmp_branch_rsd),
     ("cmp_branch_chain",    _rule_cmp_branch_chain),
     ("adjacent_load_pair",  _rule_adjacent_load_pair),
@@ -733,16 +754,19 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         eligible = set()
         if a.defs and a.mnemonic in _CMP_MNEMONICS:
             rd = a.defs[0]
-            rsd = a.uses and a.uses[0] == rd
-            if rsd:
-                # RSD form (rd == rs1): eligible for cmp_branch_rsd only.
+            if a.uses and a.uses[0] == rd:
                 eligible.add("cmp_branch_rsd")
             else:
-                # Non-RSD form (rd != rs1): eligible for cmp_branch_chain.
                 eligible.add("cmp_branch_chain")
-                if (a.mnemonic == "andi" and a.imm is not None
-                        and a.imm > 0 and not (a.imm & (a.imm - 1))):
-                    eligible.add("bit_branch")
+        if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
+            rd = a.defs[0]
+            if a.uses and a.uses[0] == rd:
+                eligible.add("bit_branch_rsd")
+            else:
+                eligible.add("bit_branch_chain")
+        if a.defs and a.mnemonic in ("slli", "srli", "srai"):
+            if not (a.uses and a.uses[0] == a.defs[0]):  # non-RSD only
+                eligible.add("bit_branch_chain")
         if _dual_arith_ok(a):
             eligible.add("dual_arith_chain")
         if a.mnemonic == "lw":
