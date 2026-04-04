@@ -526,6 +526,7 @@ def _process_block(
     unpaired_non_rvc_count: int    = 0
 
     pair_start_set: set  = set()
+    pair_end_set:   set  = set()
     pair_rules:     dict = {}
 
     rule_list     = getattr(pair_score, "_rule_list", None)
@@ -546,6 +547,7 @@ def _process_block(
                     winner = matching_rules[0]
                     if slot_scores:
                         pair_start_set.add(i)
+                        pair_end_set.add(i + 1)
                         pair_rules[i] = winner
                         successful += 1
                         rule_counts[winner] += 1
@@ -558,6 +560,7 @@ def _process_block(
             else:
                 if slot_scores:
                     pair_start_set.add(i)
+                    pair_end_set.add(i + 1)
                     rule = describe_fn(a_s, b_s) if describe_fn else ""
                     pair_rules[i] = rule
                     successful += 1
@@ -594,6 +597,8 @@ def _process_block(
                 rule_tag = pair_rules.get(rp, "")
                 tag = f"  # PAIR+ [{rule_tag}]" if rule_tag else "  # PAIR+"
                 print(instr.raw + tag, file=out)
+            elif rp in pair_end_set:
+                print(instr.raw + "  # PAIR=", file=out)
             else:
                 print(instr.raw, file=out)
 
