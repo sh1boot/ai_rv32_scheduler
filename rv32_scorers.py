@@ -269,6 +269,7 @@ _CMP_MNEMONICS = frozenset({
     "seqz", "snez", "sltz", "sgtz",
 })
 _BRANCH_ZERO = frozenset({"beqz", "bnez", "beq", "bne"})
+_BRANCH_CMP  = frozenset({"beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez"})
 
 # Module-level constants shared by multiple rules and by make_compact32_scorer.
 _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
@@ -370,29 +371,53 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
     occupies a distinct slot.  rd must be dead after B: it carries the
     comparison result only as far as the branch, then is discarded.
 
+    Also matches the load-immediate + comparison-branch pattern:
+
+        li     rd, imm           # addi rd, x0, imm — rd is a fresh constant
+        blt / bge / bltu / bgeu / beq / bne  rs, rd, label   (rd dead after B)
+
+    This is equivalent to  sltiu t, rs, imm; bnez t, label  (or similar) with
+    t being any dead register.  rd must be dead after B.
+
     Canonical examples:
         andi   a0, s6, 1     # rd=a0, rs1=s6; a0 dead after branch
         bne    a0, zero, .L
 
         sltiu  a1, a0, 1     # rd=a1, rs1=a0; a1 dead after branch
         bnez   a1, .done
+
+        li     a5, 5         # addi a5, x0, 5
+        bltu   a3, a5, .L    # a5 dead after branch
     """
     if not a.defs:
         return False
     rd = a.defs[0]
-    if a.mnemonic not in _CMP_MNEMONICS:
-        return False
-    # Chain form: rd must differ from rs1 so the source is preserved.
-    # If rd == rs1 this is cmp_branch_rsd territory instead.
-    if a.uses and a.uses[0] == rd:
-        return False
-    if b.mnemonic not in _BRANCH_ZERO:
-        return False
-    if rd not in b.uses:
-        return False
-    if rd not in liveness.get(b.index, frozenset()):
-        return False
-    return True
+
+    # Path 1: classic compare opcode + beqz/bnez/beq/bne
+    if a.mnemonic in _CMP_MNEMONICS:
+        # Chain form: rd must differ from rs1 so the source is preserved.
+        # If rd == rs1 this is cmp_branch_rsd territory instead.
+        if a.uses and a.uses[0] == rd:
+            return False
+        if b.mnemonic not in _BRANCH_ZERO:
+            return False
+        if rd not in b.uses:
+            return False
+        if rd not in liveness.get(b.index, frozenset()):
+            return False
+        return True
+
+    # Path 2: li rd, imm  (addi rd, x0, imm — no uses) + any comparison branch
+    if a.mnemonic == "addi" and not a.uses:
+        if b.mnemonic not in _BRANCH_CMP:
+            return False
+        if rd not in b.uses:
+            return False
+        if rd not in liveness.get(b.index, frozenset()):
+            return False
+        return True
+
+    return False
 
 
 def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
@@ -758,6 +783,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
                 eligible.add("cmp_branch_rsd")
             else:
                 eligible.add("cmp_branch_chain")
+        if a.defs and a.mnemonic == "addi" and not a.uses:
+            eligible.add("cmp_branch_chain")
         if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
             rd = a.defs[0]
             if a.uses and a.uses[0] == rd:
