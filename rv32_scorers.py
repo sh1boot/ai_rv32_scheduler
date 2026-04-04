@@ -582,6 +582,19 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     return True
 
 
+def _rule_arith_jump(a: "Instruction", b: "Instruction",
+                     liveness: dict) -> bool:
+    """
+    Arithmetic operation (dual-arith subset) followed by an unconditional
+    call or jump.
+
+    Matches:
+        <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
+        jal / jalr       ...
+    """
+    return a.dual_arith_ok and b.mnemonic in ("jal", "jalr")
+
+
 def _rule_arith_branch(a: "Instruction", b: "Instruction",
                        liveness: dict) -> bool:
     """
@@ -696,6 +709,7 @@ COMPACT32_RULES: list = [
     ("post_increment",      _rule_post_increment),
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
+    ("arith_jump",          _rule_arith_jump),
     ("arith_branch",        _rule_arith_branch),
     ("addi_branch",         _rule_addi_branch),
     ("dual_move",           _rule_dual_move),
@@ -743,6 +757,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("post_increment")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
+            eligible.add("arith_jump")
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
                 eligible.add("addi_branch")
