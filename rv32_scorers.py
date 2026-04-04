@@ -273,6 +273,13 @@ _BRANCH_ZERO = frozenset({"beqz", "bnez", "beq", "bne"})
 
 # Module-level constants shared by multiple rules and by make_compact32_scorer.
 _ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+_ADDR_CHAIN_MN = frozenset({
+    "add",  "addi",  "addw",  "addiw",
+    "sub",  "subw",
+    "sh1add", "sh1add.uw",
+    "sh2add", "sh2add.uw",
+    "sh3add", "sh3add.uw",
+})
 _MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
 _COMPACT32_BRANCH_MN = frozenset({
     "beq", "bne", "blt", "bge", "bltu", "bgeu",
@@ -457,6 +464,31 @@ def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
     rs_a = a.uses[0] if a.uses else None
     rs_b = b.uses[0] if b.uses else None
     return rs_a is not None and rs_b is not None and rs_a != rs_b
+
+
+def _rule_addr_chain(a: "Instruction", b: "Instruction",
+                     liveness: dict) -> bool:
+    """
+    Address arithmetic followed by a load or store using the computed address
+    as the base register, which is then dead (chain form).
+
+    Matches:
+        add/addi/addw/addiw/sub/subw/sh[1-3]add[.uw]  rd, ...
+        lw / sw / lh / sh / lb / sb / lhu / lbu        ..., N(rd)
+
+    rd must be dead after B — it carries only the computed address, which
+    is consumed by the memory operation and not needed afterwards.
+    """
+    if a.mnemonic not in _ADDR_CHAIN_MN or b.mnemonic not in _MEM_OPS:
+        return False
+    if not a.defs:
+        return False
+    rd_a = a.defs[0]
+    if b.mem is None or b.mem[1] != rd_a:
+        return False
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return False
+    return True
 
 
 def _rule_pre_increment(a: "Instruction", b: "Instruction",
@@ -659,6 +691,7 @@ COMPACT32_RULES: list = [
     ("cmp_branch_chain",    _rule_cmp_branch_chain),
     ("adjacent_load_pair",  _rule_adjacent_load_pair),
     ("adjacent_store_pair", _rule_adjacent_store_pair),
+    ("addr_chain",          _rule_addr_chain),
     ("pre_increment",       _rule_pre_increment),
     ("post_increment",      _rule_post_increment),
     ("dual_arith",          _rule_dual_arith),
@@ -702,6 +735,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("adjacent_load_pair")
         if a.mnemonic == "sw":
             eligible.add("adjacent_store_pair")
+        if a.mnemonic in _ADDR_CHAIN_MN:
+            eligible.add("addr_chain")
         if a.mnemonic in _ADDR_ARITH:
             eligible.add("pre_increment")
         if a.mnemonic in _MEM_OPS:
