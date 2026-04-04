@@ -759,7 +759,10 @@ def _dual_arith_ok(instr: "Instruction") -> bool:
         return False
     if mn in _IMM_FORMS:
         imm = instr.imm
-        if imm is None or imm < -16 or imm > 15:
+        if imm is None:
+            return False
+        limit = 31 if mn == "addi" else 15
+        if imm < -(limit + 1) or imm > limit:
             return False
     return True
 
