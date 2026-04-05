@@ -38,7 +38,21 @@ class DepGraph:
         return {i.index: len(self.predecessors[i.index])
                 for i in self.instructions}
 
-def build_dep_graph(instructions: list) -> DepGraph:
+def build_dep_graph(instructions: list,
+                    same_base_reorder: bool = False) -> DepGraph:
+    """Build a dependency graph for *instructions*.
+
+    same_base_reorder
+        When True, loads and stores that share the same base register and have
+        non-overlapping address ranges are allowed to reorder past each other.
+        Only applies when the base register is provably unchanged between the
+        two operations (i.e. no instruction between them writes that register).
+        Stores to different offsets within the same object, and loads from
+        different offsets, can therefore be moved together to become pairable.
+
+        When False (default), all memory operations are chained sequentially —
+        the conservative, always-safe behaviour.
+    """
     graph = DepGraph(instructions=instructions)
     last_writer: dict = {}
     last_readers: dict = defaultdict(list)
@@ -46,6 +60,8 @@ def build_dep_graph(instructions: list) -> DepGraph:
     last_csr_readers: dict = defaultdict(list)
     mem_ops: list = []
     last_barrier: int = -1
+
+    instr_by_idx: dict = {instr.index: instr for instr in instructions}
 
     for instr in instructions:
         idx = instr.index
@@ -79,8 +95,19 @@ def build_dep_graph(instructions: list) -> DepGraph:
             if csr in last_csr_writer:
                 graph.add_edge(last_csr_writer[csr], idx)
         if (instr.is_load or instr.is_store) and not instr.is_amo:
-            if mem_ops:
-                graph.add_edge(mem_ops[-1], idx)
+            if same_base_reorder:
+                # Check every previous mem op individually.  We can't rely on
+                # chain transitivity once we start dropping edges, so each pair
+                # must be tested directly.
+                for prev_idx in mem_ops:
+                    prev = instr_by_idx[prev_idx]
+                    if not _mem_independent(prev, instr, last_writer):
+                        graph.add_edge(prev_idx, idx)
+            else:
+                # Conservative: chain to the immediately preceding mem op only
+                # (transitivity through the chain preserves full ordering).
+                if mem_ops:
+                    graph.add_edge(mem_ops[-1], idx)
             mem_ops.append(idx)
         for reg in instr.defs:
             last_writer[reg] = idx
@@ -94,6 +121,41 @@ def build_dep_graph(instructions: list) -> DepGraph:
             last_csr_readers[csr].append(idx)
 
     return graph
+
+
+def _mem_independent(a: "Instruction", b: "Instruction",
+                     last_writer: dict) -> bool:
+    """Return True if memory operations *a* and *b* are provably independent.
+
+    Independence requires:
+      1. Both have a parsed memory operand (offset, base).
+      2. They use the same base register.
+      3. The base register has not been written between *a* and *b*
+         (last_writer[base] < a.index, or base not written at all).
+      4. Their byte ranges do not overlap, given their respective access widths.
+
+    If any condition cannot be verified the function returns False (conservative).
+    """
+    from rv32_scorers import _MEM_WIDTH  # local import to avoid circular dep
+    if a.mem is None or b.mem is None:
+        return False
+    off_a, base_a = a.mem
+    off_b, base_b = b.mem
+    if base_a != base_b:
+        return False
+    # Base must not have been written between a and b.
+    writer_idx = last_writer.get(base_a, -1)
+    if writer_idx > a.index:   # written after a, before (or at) b
+        return False
+    # Both access widths must be known.
+    w_a = _MEM_WIDTH.get(a.mnemonic)
+    w_b = _MEM_WIDTH.get(b.mnemonic)
+    if w_a is None or w_b is None:
+        return False
+    # Non-overlap: [off_a, off_a+w_a) and [off_b, off_b+w_b) must not intersect.
+    if off_a + w_a <= off_b or off_b + w_b <= off_a:
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Liveness analysis

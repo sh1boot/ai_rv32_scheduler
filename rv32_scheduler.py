@@ -450,6 +450,7 @@ def _process_block(
     is_function_entry: bool = False,
     block_live_in:     frozenset = frozenset(),
     cfg_live_out:      frozenset = frozenset(),
+    same_base_reorder: bool = False,
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -494,7 +495,7 @@ def _process_block(
     if not instructions:
         return PairStats.empty()
 
-    graph = build_dep_graph(instructions)
+    graph = build_dep_graph(instructions, same_base_reorder=same_base_reorder)
 
     if verbose:
         lv = compute_liveness([i for i in instructions if i.mnemonic != _SENTINEL_MN])
@@ -727,11 +728,12 @@ class AssemblyScheduler:
 
     def process(
         self,
-        pair_score:   PairScoreFn = None,
-        rename:       bool = True,
-        opcode_tally: bool = False,
-        out          = None,
-        verbose:      bool = False,
+        pair_score:         PairScoreFn = None,
+        rename:             bool = True,
+        opcode_tally:       bool = False,
+        out                      = None,
+        verbose:            bool = False,
+        same_base_reorder:  bool = False,
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -813,6 +815,7 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
+                same_base_reorder  = same_base_reorder,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -879,6 +882,7 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
+                same_base_reorder  = same_base_reorder,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1041,6 +1045,12 @@ def main():
                     help="Append a ranked tally of unpaired opcode combinations "
                          "to the output and stderr report. Use this to identify "
                          "the best candidates for new pairing rules.")
+    ap.add_argument("--same-base-reorder", action="store_true",
+                    help="(Experimental) Allow loads/stores to reorder past each "
+                         "other when they share the same base register, the base "
+                         "is not modified between them, and their address ranges "
+                         "do not overlap.  Enables adjacent loads/stores within "
+                         "the same object to be moved together for pairing.")
     args = ap.parse_args()
 
     if args.list_rules:
@@ -1071,11 +1081,12 @@ def main():
 
     # Stream output directly to stdout; summary printed at end of process().
     sched.process(
-        pair_score   = pair_score,
-        rename       = args.rename,
-        opcode_tally = args.opcode_tally,
-        out          = sys.stdout,
-        verbose      = args.verbose,
+        pair_score        = pair_score,
+        rename            = args.rename,
+        opcode_tally      = args.opcode_tally,
+        out               = sys.stdout,
+        verbose           = args.verbose,
+        same_base_reorder = args.same_base_reorder,
     )
 
     if sched.last_stats is not None:
