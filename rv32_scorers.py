@@ -562,8 +562,18 @@ def _is_cmp(instr: "Instruction") -> bool:
     return instr.mnemonic in _CMP_MNEMONICS
 
 def _is_mv(instr: "Instruction") -> bool:
-    """True if *instr* is a register-to-register move (addi rd, rs, 0 — one use, imm=0)."""
-    return instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0
+    """True if *instr* is a register-to-register move.
+
+    Covers two canonical forms:
+    * ``addi rd, rs, 0`` — GAS pseudo ``mv rd, rs`` (I-type)
+    * ``add  rd, x0, rs`` — C-extension ``c.mv rd, rs`` (R-type; x0 filtered
+      away leaves exactly one use)
+    """
+    if instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0:
+        return True
+    if instr.mnemonic == "add" and len(instr.uses) == 1:
+        return True
+    return False
 
 
 def _is_li(instr: "Instruction") -> bool:
@@ -869,9 +879,6 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
         mv / mv         — two independent register copies (any sources)
         li / li         — two independent small constant loads
     """
-    partners = _OP_PAIR_TABLE.get(a.mnemonic)
-    if partners is None or b.mnemonic not in partners:
-        return False
     if not a.defs or not b.defs or a.defs[0] == b.defs[0]:
         return False
     # Move/li pairs: each instruction is an independent one-input→one-output
@@ -879,9 +886,14 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
     # mv+mv (each routes a different register) or li+li (each loads a constant).
     # mv+li is intentionally excluded — the scheduler can reveal whether the
     # pressure to separate these forms produces better overall schedules.
-    if a.mnemonic == "addi":
+    # Checked before the table so c.mv (add rd, rs — one use) is handled here
+    # rather than falling into the add/sub same-input path.
+    if _is_mv(a) or _is_li(a):
         return (_is_mv(a) and _is_mv(b)) or (_is_li(a) and _is_li(b))
-    # All other dual-result pairs: both instructions must read the same inputs.
+    # Table-driven same-input pairs.
+    partners = _OP_PAIR_TABLE.get(a.mnemonic)
+    if partners is None or b.mnemonic not in partners:
+        return False
     return bool(a.uses) and a.uses == b.uses
 
 
