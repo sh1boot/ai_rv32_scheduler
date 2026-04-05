@@ -193,9 +193,10 @@ class PairStats:
             )
 
         # ── Per-rule rows ────────────────────────────────────────────────
+        _rule_order = {name: i for i, (name, _) in enumerate(COMPACT32_RULES)}
         all_rules = sorted(
             set(self.rule_counts) | set(self.rule_shadow) | set(self.rule_missed),
-            key=lambda r: -self.rule_counts.get(r, 0)
+            key=lambda r: (-self.rule_counts.get(r, 0), _rule_order.get(r, 999))
         )
         for rule in all_rules:
             won    = self.rule_counts.get(rule, 0)

@@ -272,8 +272,17 @@ _BRANCH_ZERO = frozenset({"beqz", "bnez", "beq", "bne"})
 _BRANCH_CMP  = frozenset({"beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez"})
 
 # Module-level constants shared by multiple rules and by make_compact32_scorer.
-_ADDR_ARITH = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
-_ADDR_CHAIN_MN = frozenset({
+#
+# Two distinct arithmetic mnemonic sets are used for memory-related rules:
+#
+#   _ADDR_UPDATE_MN — scalar address updates for pre/post-increment pairs.
+#     Simple add/sub/shift-add; no 64-bit word or .uw variants.
+#
+#   _ADDR_COMPUTE_MN — address computations for addr_chain pairs.
+#     Wider: also includes addw/addiw/subw and sh[1-3]add.uw.
+#
+_ADDR_UPDATE_MN = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+_ADDR_COMPUTE_MN = frozenset({
     "add",  "addi",  "addw",  "addiw",
     "sub",  "subw",
     "sh1add", "sh1add.uw",
@@ -394,8 +403,8 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
         return False
     rd = a.defs[0]
 
-    # Path 1: classic compare opcode + beqz/bnez/beq/bne
-    if a.mnemonic in _CMP_MNEMONICS:
+    # Path 1: _is_cmp + beqz/bnez/beq/bne (chain form: rd != rs1)
+    if _is_cmp(a):
         # Chain form: rd must differ from rs1 so the source is preserved.
         # If rd == rs1 this is cmp_branch_rsd territory instead.
         if a.uses and a.uses[0] == rd:
@@ -404,19 +413,15 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
             return False
         if rd not in b.uses:
             return False
-        if rd not in liveness.get(b.index, frozenset()):
-            return False
-        return True
+        return rd in liveness.get(b.index, frozenset())
 
-    # Path 2: li rd, imm  (addi rd, x0, imm — no uses) + any comparison branch
-    if a.mnemonic == "addi" and not a.uses:
+    # Path 2: _is_li + any comparison branch (rd used as comparison operand)
+    if _is_li(a):
         if b.mnemonic not in _BRANCH_CMP:
             return False
         if rd not in b.uses:
             return False
-        if rd not in liveness.get(b.index, frozenset()):
-            return False
-        return True
+        return rd in liveness.get(b.index, frozenset())
 
     return False
 
@@ -451,7 +456,7 @@ def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
     if not a.defs:
         return False
     rd = a.defs[0]
-    if a.mnemonic not in _CMP_MNEMONICS:
+    if not _is_cmp(a):
         return False
     # RSD constraint: rd must equal rs1 so the compact encoding can omit
     # one register field.  No pseudo-instruction exemptions — even seqz/snez
@@ -491,24 +496,94 @@ _STORE_MN = frozenset(mn for mn in _MEM_WIDTH
 _MEM_OPS  = frozenset(_MEM_WIDTH)    # all load/store mnemonics
 
 
+# ---------------------------------------------------------------------------
+# Named instruction compatibility predicates
+# ---------------------------------------------------------------------------
+# These are the canonical per-instruction gate functions referenced by the
+# pairing rules.  Each rule names the predicates it applies, making the
+# opcode-set and structural constraints explicit at the call site.
+#
+# Existing predicates defined in rv32_core.py:
+#   _dual_arith_ok(instr)  — RSD form, x0..x15 regs, bounded immediate
+#   _dual_move_ok(instr)   — mv / c.mv / li form, regs in x0..x15
+#
+# Predicates defined here (compact32-rule specific):
+
+def _is_load(instr: "Instruction") -> bool:
+    """True if *instr* is any load (byte/half/word/double, integer or float)."""
+    return instr.mnemonic in _LOAD_MN
+
+def _is_store(instr: "Instruction") -> bool:
+    """True if *instr* is any store (byte/half/word/double, integer or float)."""
+    return instr.mnemonic in _STORE_MN
+
+def _is_mem_op(instr: "Instruction") -> bool:
+    """True if *instr* is any load or store."""
+    return instr.mnemonic in _MEM_OPS
+
+def _is_addr_update(instr: "Instruction") -> bool:
+    """True if *instr* is a scalar address-update op (pre/post-increment slot).
+
+    Covers: add, addi, sub, sh1add, sh2add, sh3add.
+    Excludes 64-bit word variants (addw, addiw, subw) and .uw shift-adds —
+    those are only valid in the addr_chain slot (_is_addr_compute).
+    """
+    return instr.mnemonic in _ADDR_UPDATE_MN
+
+def _is_addr_compute(instr: "Instruction") -> bool:
+    """True if *instr* is an address-computation op (addr_chain slot).
+
+    Wider than _is_addr_update: also includes addw, addiw, subw, and the
+    sh[1-3]add.uw variants.
+    """
+    return instr.mnemonic in _ADDR_COMPUTE_MN
+
+def _addr_stride_ok(arith: "Instruction", mem: "Instruction") -> bool:
+    """True if *arith*'s immediate stride is aligned to *mem*'s access width.
+
+    Only constrains immediate-form arithmetic (addi / addiw).  For
+    register-based arithmetic (add, sub, sh1add …) there is no immediate
+    to check, so the function always returns True.
+
+    When an immediate is present it must be non-zero and a multiple of the
+    memory access width (e.g. ±4, ±8, ±12 for lw; ±2, ±4 for lh; ±1 for lb).
+    """
+    if arith.mnemonic not in _IMM_ARITH:
+        return True
+    width = _MEM_WIDTH.get(mem.mnemonic, 0)
+    imm = arith.imm
+    return width != 0 and imm is not None and abs(imm) % width == 0
+
+def _is_cmp(instr: "Instruction") -> bool:
+    """True if *instr* is a true comparison op (produces a boolean integer result).
+
+    Covers: slti, sltiu, slt, sltu, seqz, snez, sltz, sgtz.
+    Does NOT include shifts or bit-masks — see _rule_bit_branch_* for those.
+    """
+    return instr.mnemonic in _CMP_MNEMONICS
+
+def _is_li(instr: "Instruction") -> bool:
+    """True if *instr* is a load-immediate (addi rd, x0, imm — no register uses).
+
+    The GAS pseudo ``li rd, imm`` canonicalises to ``addi rd, x0, imm`` with
+    x0 filtered from uses[], so this form has mnemonic="addi" and uses=[].
+    """
+    return instr.mnemonic == "addi" and not instr.uses
+
+
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
                               liveness: dict) -> bool:
     """
-    Pair of loads of the same width from adjacent memory locations with the
-    same base register.  The address difference must equal the access size.
-
-    Covers byte, halfword, word, doubleword, and float/double loads
-    (lb/lbu/lh/lhu/lw/lwu/ld/flw/fld and their paired forms).
+    Pair of same-width loads from adjacent memory locations with the same base.
+    Address difference must equal the access width.  Both destinations distinct.
 
     Matches:
         <load>  rd1, N(base)
         <load>  rd2, N±<width>(base)   rd1 != rd2, same mnemonic
     """
-    if a.mnemonic != b.mnemonic:
+    if not _is_load(a) or a.mnemonic != b.mnemonic:
         return False
     width = _MEM_WIDTH.get(a.mnemonic)
-    if width is None or a.mnemonic not in _LOAD_MN:
-        return False
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
@@ -523,21 +598,16 @@ def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
 def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
                                liveness: dict) -> bool:
     """
-    Pair of stores of the same width to adjacent memory locations with the
-    same base register.  The address difference must equal the access size.
-
-    Covers byte, halfword, word, doubleword, and float/double stores
-    (sb/sh/sw/sd/fsw/fsd and their paired forms).
+    Pair of same-width stores to adjacent memory locations with the same base.
+    Address difference must equal the access width.
 
     Matches:
         <store>  rs1, N(base)
         <store>  rs2, N±<width>(base)   same mnemonic
     """
-    if a.mnemonic != b.mnemonic:
+    if not _is_store(a) or a.mnemonic != b.mnemonic:
         return False
     width = _MEM_WIDTH.get(a.mnemonic)
-    if width is None or a.mnemonic not in _STORE_MN:
-        return False
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
@@ -552,98 +622,75 @@ def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
 def _rule_addr_chain(a: "Instruction", b: "Instruction",
                      liveness: dict) -> bool:
     """
-    Address arithmetic followed by a load or store using the computed address
-    as the base register, which is then dead (chain form).
+    Address computation followed by a load/store using the result as base,
+    where the computed address is dead after the memory op (chain form).
 
-    Matches:
-        add/addi/addw/addiw/sub/subw/sh[1-3]add[.uw]  rd, ...
-        lw / sw / lh / sh / lb / sb / lhu / lbu        ..., N(rd)
+    A slot: _is_addr_compute  (add/addi/addw/addiw/sub/subw/sh[1-3]add[.uw])
+    B slot: _is_mem_op        (any load or store)
 
-    rd must be dead after B — it carries only the computed address, which
-    is consumed by the memory operation and not needed afterwards.
+    rd_a must be dead after B — it carries only the computed address.
     """
-    if a.mnemonic not in _ADDR_CHAIN_MN or b.mnemonic not in _MEM_OPS:
+    if not _is_addr_compute(a) or not _is_mem_op(b):
         return False
     if not a.defs:
         return False
     rd_a = a.defs[0]
     if b.mem is None or b.mem[1] != rd_a:
         return False
-    if rd_a not in liveness.get(b.index, frozenset()):
-        return False
-    return True
+    return rd_a in liveness.get(b.index, frozenset())
 
 
 def _rule_pre_increment(a: "Instruction", b: "Instruction",
                         liveness: dict) -> bool:
     """
-    Address arithmetic followed by a memory op using that result as base
+    Address update followed by a memory op using that result as base
     (pre-increment / stride-then-access).
 
-    Matches:
-        add / addi / sub / sh1add / sh2add / sh3add   rd, ...
-        <any load or store>                            ..., N(rd)
+    A slot: _is_addr_update   (add/addi/sub/sh[1-3]add — scalar only)
+    B slot: _is_mem_op        (any load or store)
 
-    When the arithmetic instruction is an immediate form (addi/addiw) the
-    absolute value of the immediate must equal the width of the memory
-    access (1 for byte, 2 for halfword, 4 for word, 8 for doubleword/float
-    double), reflecting that the stride matches the element size.  For
-    register-based arithmetic (add, sub, sh1add …) no immediate constraint
-    is applied.
+    _addr_stride_ok constrains the immediate when A is addi/addiw: the
+    stride must be a non-zero multiple of B's access width.  Register-based
+    arithmetic (add, sub, sh1add …) has no immediate to constrain.
 
-    The stored value register of a store must not be the same as rd (it
-    would be overwritten by the arithmetic before the store executes).
+    The stored-value register of a store must not be rd (it would be
+    overwritten by A before the store executes).
     """
-    if a.mnemonic not in _ADDR_ARITH or b.mnemonic not in _MEM_OPS:
+    if not _is_addr_update(a) or not _is_mem_op(b):
         return False
     if not a.defs:
         return False
     rd = a.defs[0]
     if rd not in b.uses:
         return False
-    if b.mnemonic in _STORE_MN and b.uses and b.uses[0] == rd:
+    if _is_store(b) and b.uses and b.uses[0] == rd:
         return False
-    if a.mnemonic in _IMM_ARITH:
-        width = _MEM_WIDTH.get(b.mnemonic, 0)
-        if a.imm is None or width == 0 or abs(a.imm) % width != 0:
-            return False
-    return True
+    return _addr_stride_ok(a, b)
 
 
 def _rule_post_increment(a: "Instruction", b: "Instruction",
                           liveness: dict) -> bool:
     """
-    Memory op followed by address arithmetic on the same base
+    Memory op followed by an address update on the same base
     (post-increment / access-then-stride).
 
-    Matches:
-        <any load or store>                            ..., N(base)
-        add / addi / sub / sh1add / sh2add / sh3add   rd, base, ...
+    A slot: _is_mem_op        (any load or store)
+    B slot: _is_addr_update   (add/addi/sub/sh[1-3]add — scalar only)
 
-    When the arithmetic instruction is an immediate form (addi/addiw) the
-    absolute value of the immediate must equal the width of the memory
-    access, reflecting that the stride matches the element size.  For
-    register-based arithmetic no immediate constraint is applied.
-
-    For loads, the destination register of the load must differ from the
-    destination of the arithmetic (they share the base register, not the
-    result slot).
+    _addr_stride_ok constrains the immediate when B is addi/addiw.
+    For loads, the load destination must differ from B's destination.
     """
-    if a.mnemonic not in _MEM_OPS or b.mnemonic not in _ADDR_ARITH:
+    if not _is_mem_op(a) or not _is_addr_update(b):
         return False
     base = a.uses[-1] if a.uses else None
     if base is None or not b.uses or b.uses[0] != base:
         return False
-    if a.mnemonic in _LOAD_MN:
+    if _is_load(a):
         load_rd  = a.defs[0] if a.defs else None
         arith_rd = b.defs[0] if b.defs else None
         if load_rd is not None and load_rd == arith_rd:
             return False
-    if b.mnemonic in _IMM_ARITH:
-        width = _MEM_WIDTH.get(a.mnemonic, 0)
-        if b.imm is None or width == 0 or abs(b.imm) % width != 0:
-            return False
-    return True
+    return _addr_stride_ok(b, a)
 
 
 def _rule_dual_arith(a: "Instruction", b: "Instruction",
@@ -844,13 +891,13 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
-        if a.defs and a.mnemonic in _CMP_MNEMONICS:
+        if a.defs and _is_cmp(a):
             rd = a.defs[0]
             if a.uses and a.uses[0] == rd:
                 eligible.add("cmp_branch_rsd")
             else:
                 eligible.add("cmp_branch_chain")
-        if a.defs and a.mnemonic == "addi" and not a.uses:
+        if a.defs and _is_li(a):
             eligible.add("cmp_branch_chain")
         if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
             rd = a.defs[0]
@@ -861,20 +908,19 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         if a.defs and a.mnemonic in ("slli", "srli", "srai"):
             if not (a.uses and a.uses[0] == a.defs[0]):  # non-RSD only
                 eligible.add("bit_branch_chain")
-        if _dual_arith_ok(a):
-            eligible.add("dual_arith_chain")
-        if a.mnemonic in _LOAD_MN:
+        if _is_load(a):
             eligible.add("adjacent_load_pair")
-        if a.mnemonic in _STORE_MN:
+        if _is_store(a):
             eligible.add("adjacent_store_pair")
-        if a.mnemonic in _ADDR_CHAIN_MN:
+        if _is_addr_compute(a):
             eligible.add("addr_chain")
-        if a.mnemonic in _ADDR_ARITH:
+        if _is_addr_update(a):
             eligible.add("pre_increment")
-        if a.mnemonic in _MEM_OPS:
+        if _is_mem_op(a):
             eligible.add("post_increment")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
+            eligible.add("dual_arith_chain")
             eligible.add("arith_jump")
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
