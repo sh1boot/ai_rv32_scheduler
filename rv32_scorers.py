@@ -561,6 +561,11 @@ def _is_cmp(instr: "Instruction") -> bool:
     """
     return instr.mnemonic in _CMP_MNEMONICS
 
+def _is_mv(instr: "Instruction") -> bool:
+    """True if *instr* is a register-to-register move (addi rd, rs, 0 — one use, imm=0)."""
+    return instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0
+
+
 def _is_li(instr: "Instruction") -> bool:
     """True if *instr* is a load-immediate (addi rd, x0, imm — no register uses).
 
@@ -829,8 +834,8 @@ _DUAL_RESULT_PARTNERS: dict = {
     "and":    frozenset({"andn"}),
     "andn":   frozenset({"and"}),
     # mv (addi rd, rs, 0) and li (addi rd, x0, imm) both canonicalise to addi.
-    # Two mv instructions sharing the same source, or two li instructions
-    # (both have uses=[]), are valid dual-issue pairs.
+    # mv+mv pairs two independent copies (any sources); li+li pairs two
+    # constant loads.  mv+li is excluded — handled by the rule directly.
     "addi":   frozenset({"addi"}),
 }
 
@@ -838,11 +843,16 @@ _DUAL_RESULT_PARTNERS: dict = {
 def _rule_dual_result(a: "Instruction", b: "Instruction",
                       liveness: dict) -> bool:
     """
-    Two instructions that read the same source registers and produce two
-    independent results (dual-result form).
+    Two instructions that together take two inputs and produce two independent
+    results (dual-result form).
 
-    Both instructions must use identical source operands (same rs1, rs2 in
-    the same order) and write to distinct destination registers.
+    For arithmetic pairs (add/sub, div/rem, mul/mulh, min/max, and/andn …)
+    both instructions consume the *same* rs1, rs2 and write to distinct
+    destinations.
+
+    For move pairs (mv+mv, mv+li, li+li) each instruction independently
+    routes one input to one output; the pair as a whole takes two inputs
+    and gives two results.  Same-source constraint does not apply here.
 
     Valid pairs and their relationship:
         add / sub       — sum and difference of the same operands
@@ -854,15 +864,23 @@ def _rule_dual_result(a: "Instruction", b: "Instruction",
         min / max       — minimum and maximum (signed)
         minu / maxu     — minimum and maximum (unsigned)
         and / andn      — AND and AND-NOT of the same operands
+        mv / mv         — two independent register copies (any sources)
+        li / li         — two independent small constant loads
     """
     partners = _DUAL_RESULT_PARTNERS.get(a.mnemonic)
     if partners is None or b.mnemonic not in partners:
         return False
-    if not a.uses or a.uses != b.uses:
+    if not a.defs or not b.defs or a.defs[0] == b.defs[0]:
         return False
-    if not a.defs or not b.defs:
-        return False
-    return a.defs[0] != b.defs[0]
+    # Move/li pairs: each instruction is an independent one-input→one-output
+    # data path; no shared-source requirement.  Only same-kind pairs allowed:
+    # mv+mv (each routes a different register) or li+li (each loads a constant).
+    # mv+li is intentionally excluded — the scheduler can reveal whether the
+    # pressure to separate these forms produces better overall schedules.
+    if a.mnemonic == "addi":
+        return (_is_mv(a) and _is_mv(b)) or (_is_li(a) and _is_li(b))
+    # All other dual-result pairs: both instructions must read the same inputs.
+    return bool(a.uses) and a.uses == b.uses
 
 
 
