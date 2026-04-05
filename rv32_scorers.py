@@ -467,22 +467,49 @@ def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
     return True
 
 
+# Map each load/store mnemonic to the number of bytes it accesses.
+# RV32I/RV64I integer, and F/D extension float widths included so the
+# adjacent-pair rules generalise cleanly to future ISA variants.
+_MEM_WIDTH: dict = {
+    # RV32I / RV64I integer loads and stores
+    "lb":  1, "lbu": 1, "sb":  1,
+    "lh":  2, "lhu": 2, "sh":  2,
+    "lw":  4, "lwu": 4, "sw":  4,
+    "ld":  8,            "sd":  8,
+    # F extension (single-precision float)
+    "flw": 4, "fsw": 4,
+    # D extension (double-precision float)
+    "fld": 8, "fsd": 8,
+}
+_LOAD_MN  = frozenset(mn for mn in _MEM_WIDTH
+                       if mn.startswith(("l", "f")) and not mn.startswith("fs"))
+_STORE_MN = frozenset(mn for mn in _MEM_WIDTH
+                       if mn.startswith(("s", "fs")))
+
+
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
                               liveness: dict) -> bool:
     """
-    Pair of word loads from adjacent memory locations with the same base.
+    Pair of loads of the same width from adjacent memory locations with the
+    same base register.  The address difference must equal the access size.
+
+    Covers byte, halfword, word, doubleword, and float/double loads
+    (lb/lbu/lh/lhu/lw/lwu/ld/flw/fld and their paired forms).
 
     Matches:
-        lw  rd1, N(base)
-        lw  rd2, N±4(base)
+        <load>  rd1, N(base)
+        <load>  rd2, N±<width>(base)   rd1 != rd2, same mnemonic
     """
-    if a.mnemonic != "lw" or b.mnemonic != "lw":
+    if a.mnemonic != b.mnemonic:
+        return False
+    width = _MEM_WIDTH.get(a.mnemonic)
+    if width is None or a.mnemonic not in _LOAD_MN:
         return False
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
     off_b, base_b = b.mem
-    if base_a != base_b or abs(off_a - off_b) != 4:
+    if base_a != base_b or abs(off_a - off_b) != width:
         return False
     rd_a = a.defs[0] if a.defs else None
     rd_b = b.defs[0] if b.defs else None
@@ -492,23 +519,30 @@ def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
 def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
                                liveness: dict) -> bool:
     """
-    Pair of word stores to adjacent memory locations with the same base.
+    Pair of stores of the same width to adjacent memory locations with the
+    same base register.  The address difference must equal the access size.
+
+    Covers byte, halfword, word, doubleword, and float/double stores
+    (sb/sh/sw/sd/fsw/fsd and their paired forms).
 
     Matches:
-        sw  rs1, N(base)
-        sw  rs2, N±4(base)
+        <store>  rs1, N(base)
+        <store>  rs2, N±<width>(base)   same mnemonic
     """
-    if a.mnemonic != "sw" or b.mnemonic != "sw":
+    if a.mnemonic != b.mnemonic:
+        return False
+    width = _MEM_WIDTH.get(a.mnemonic)
+    if width is None or a.mnemonic not in _STORE_MN:
         return False
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
     off_b, base_b = b.mem
-    if base_a != base_b or abs(off_a - off_b) != 4:
+    if base_a != base_b or abs(off_a - off_b) != width:
         return False
     rs_a = a.uses[0] if a.uses else None
     rs_b = b.uses[0] if b.uses else None
-    return rs_a is not None and rs_b is not None and rs_a != rs_b
+    return rs_a is not None and rs_b is not None
 
 
 def _rule_addr_chain(a: "Instruction", b: "Instruction",
@@ -796,9 +830,9 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
                 eligible.add("bit_branch_chain")
         if _dual_arith_ok(a):
             eligible.add("dual_arith_chain")
-        if a.mnemonic == "lw":
+        if a.mnemonic in _LOAD_MN:
             eligible.add("adjacent_load_pair")
-        if a.mnemonic == "sw":
+        if a.mnemonic in _STORE_MN:
             eligible.add("adjacent_store_pair")
         if a.mnemonic in _ADDR_CHAIN_MN:
             eligible.add("addr_chain")
