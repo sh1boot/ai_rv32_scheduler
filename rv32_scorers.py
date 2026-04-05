@@ -818,7 +818,7 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
 # Pairs of mnemonics that consume the same two source registers but produce
 # two distinct results, making them natural candidates for dual-issue.
 # Each entry maps a mnemonic to the set of valid partners.
-_DUAL_RESULT_PARTNERS: dict = {
+_OP_PAIR_TABLE: dict = {
     "add":    frozenset({"sub"}),
     "sub":    frozenset({"add"}),
     "div":    frozenset({"rem"}),
@@ -842,7 +842,7 @@ _DUAL_RESULT_PARTNERS: dict = {
 }
 
 
-def _rule_dual_result(a: "Instruction", b: "Instruction",
+def _rule_op_pair(a: "Instruction", b: "Instruction",
                       liveness: dict) -> bool:
     """
     Two instructions that together take two inputs and produce two independent
@@ -869,7 +869,7 @@ def _rule_dual_result(a: "Instruction", b: "Instruction",
         mv / mv         — two independent register copies (any sources)
         li / li         — two independent small constant loads
     """
-    partners = _DUAL_RESULT_PARTNERS.get(a.mnemonic)
+    partners = _OP_PAIR_TABLE.get(a.mnemonic)
     if partners is None or b.mnemonic not in partners:
         return False
     if not a.defs or not b.defs or a.defs[0] == b.defs[0]:
@@ -885,9 +885,41 @@ def _rule_dual_result(a: "Instruction", b: "Instruction",
     return bool(a.uses) and a.uses == b.uses
 
 
+# Chain form: A's result is consumed by B, then dead.
+# Each entry maps A's mnemonic to the set of valid B mnemonics.
+_OP_PAIR_CHAIN_TABLE: dict = {
+    "slli": frozenset({"srli", "srai", "add", "sub", "or"}),
+}
 
 
-# Registry: (display_name, rule_function).  Rules are tested in order;
+def _rule_op_pair_chain(a: "Instruction", b: "Instruction",
+                        liveness: dict) -> bool:
+    """
+    Chain form of op_pair: A computes a value into rd_a, B consumes rd_a
+    as one of its source registers, and rd_a is dead after B.
+
+    A slot: first mnemonic of the explicit pair
+    B slot: second mnemonic of the explicit pair
+
+    Current pairs:
+        slli / srli   — shift left then shift right (bit-field extraction)
+        slli / srai   — shift left then arithmetic shift right (sign-extend)
+        slli / add    — shift left then add (scaled index)
+        slli / sub    — shift left then subtract (scaled index)
+        slli / or     — shift left then OR (bit-field insertion)
+    """
+    partners = _OP_PAIR_CHAIN_TABLE.get(a.mnemonic)
+    if partners is None or b.mnemonic not in partners:
+        return False
+    if not a.defs:
+        return False
+    rd_a = a.defs[0]
+    if rd_a not in b.uses:
+        return False
+    return rd_a in liveness.get(b.index, frozenset())
+
+
+
 # the first match wins.
 COMPACT32_RULES: list = [
     ("bit_branch_rsd",      _rule_bit_branch_rsd),
@@ -899,7 +931,8 @@ COMPACT32_RULES: list = [
     ("addr_chain",          _rule_addr_chain),
     ("pre_increment",       _rule_pre_increment),
     ("post_increment",      _rule_post_increment),
-    ("dual_result",         _rule_dual_result),
+    ("op_pair",             _rule_op_pair),
+    ("op_pair_chain",       _rule_op_pair_chain),
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_jump",          _rule_arith_jump),
@@ -950,8 +983,10 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("pre_increment")
         if _is_mem_op(a):
             eligible.add("post_increment")
-        if a.mnemonic in _DUAL_RESULT_PARTNERS:
-            eligible.add("dual_result")
+        if a.mnemonic in _OP_PAIR_TABLE:
+            eligible.add("op_pair")
+        if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
+            eligible.add("op_pair_chain")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
