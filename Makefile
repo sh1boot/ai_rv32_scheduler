@@ -10,7 +10,7 @@ clean:
 	rm -f *.out.s
 
 %.out.s: %.s $(SOURCES)
-	python ./rv32_scheduler.py --opcode-tally $< > $@
+	python ./rv32_scheduler.py --same-base-reorder --opcode-tally $< > $@
 
 %.s: %.objdump rv32_objdump.py
 	python ./rv32_objdump.py $< > $@
