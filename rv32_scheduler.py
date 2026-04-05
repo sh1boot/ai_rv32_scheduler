@@ -16,7 +16,7 @@ Usage
     python rv32_scheduler.py -          # read from stdin
 
 """
-import re, io, sys, copy, argparse
+import re, io, sys, copy, argparse, shutil
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 from typing import Callable
@@ -151,12 +151,14 @@ class PairStats:
             unpaired_rvc_opcode_tally={},
         )
 
-    def summary_lines(self, opcode_tally: bool = False) -> list:
+    def summary_lines(self, opcode_tally: bool = False,
+                      grid_rows: int = 20, grid_cols: int = 20) -> list:
         """Return comment lines suitable for appending to assembly output.
 
         opcode_tally: when True, append the singleton opcode-pair tally and
-            the flat unpaired-opcode tally sections.  Omitted by default to
-            keep normal output concise.
+            the unpaired-opcode grid.  Omitted by default to keep output concise.
+        grid_rows, grid_cols: dimensions of the cross-tab grid (number of rows
+            and columns shown).
 
         Output structure
         ----------------
@@ -222,86 +224,76 @@ class PairStats:
             f" saving {self.saving_bytes} = {self.saving_pct:.1f}%)"
         )
         if opcode_tally:
-            lines.extend(self._opcode_tally_lines())
+            lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
+                                                   grid_cols=grid_cols))
         return lines
 
-    # Maximum rows shown in each tally section.  Keeps output readable even
-    # for large files with many distinct mnemonic combinations.
-    _TALLY_LIMIT = 20
-
-    def _opcode_tally_lines(self) -> list:
+    def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20) -> list:
         """
-        Format the unpaired-opcode tally.
+        Format the unpaired-opcode cross-tab grid.
 
-        Primary sort: rvc-eligible unpaired count, descending.  For each
-        mnemonic, show the rvc-eligible count first, then the total unpaired
-        count (including non-rvc instructions of the same mnemonic) in a
-        second column.  This makes it easy to spot which opcodes have the
-        most rvc-eligible unpaired instances — the strongest candidates for
-        new compact32 pairing rules that operate on rvc-encodable instructions.
-
-        A separate section lists the top unpaired adjacent opcode *pairs*
-        (what instruction appeared next when this one was left as a singleton).
+        Rows are the top *grid_rows* opcodes by total unpaired count.
+        Columns are the top *grid_cols* successor opcodes by frequency, plus
+        two fixed trailing columns: ``rvc`` (rvc-eligible unpaired count) and
+        ``total`` (total unpaired count for that row opcode).
         """
+        if not self.singleton_tally and not self.unpaired_opcode_tally:
+            return []
+
         lines = []
 
-        # ── Flat unpaired opcode tally, led by rvc-eligible count ─────────
-        if self.unpaired_opcode_tally:
-            # Union of all mnemonic keys from both tallies.
-            all_mn = (set(self.unpaired_rvc_opcode_tally)
-                      | set(self.unpaired_opcode_tally))
-            # Sort by rvc-eligible count descending, then total descending.
-            ranked = sorted(
-                all_mn,
-                key=lambda mn: (
-                    -self.unpaired_rvc_opcode_tally.get(mn, 0),
-                    -self.unpaired_opcode_tally.get(mn, 0),
-                )
-            )
-            lines.append(
-                f"# unpaired opcodes (top {self._TALLY_LIMIT},"
-                f" rvc-eligible / total):"
-            )
-            for mn in ranked[:self._TALLY_LIMIT]:
-                rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn, 0)
-                total_cnt = self.unpaired_opcode_tally.get(mn, 0)
-                lines.append(f"#   {rvc_cnt:5d} / {total_cnt:5d}  {mn}")
+        # Top N row opcodes by total unpaired count.
+        row_ops = [mn for mn, _ in
+                   sorted(self.unpaired_opcode_tally.items(),
+                          key=lambda kv: -kv[1])[:grid_rows]]
 
-        # ── Unpaired adjacent opcode-pair tally (cross-tab table) ────────
-        if self.singleton_tally:
-            # Top N row opcodes by total unpaired count.
-            row_ops = [mn for mn, _ in
-                       sorted(self.unpaired_opcode_tally.items(),
-                              key=lambda kv: -kv[1])[:self._TALLY_LIMIT]]
-            # Top N column opcodes: successors most often seen after any
-            # unpaired instruction (sum over all row opcodes).
-            col_count: dict = {}
-            for (mn_a, mn_b), cnt in self.singleton_tally.items():
-                if mn_b:  # skip (end) entries for column selection
-                    col_count[mn_b] = col_count.get(mn_b, 0) + cnt
-            col_ops = [mn for mn, _ in
-                       sorted(col_count.items(),
-                              key=lambda kv: -kv[1])[:self._TALLY_LIMIT]]
+        # Top N column opcodes: successors most often seen after any unpaired
+        # instruction (sum over all row opcodes).
+        col_count: dict = {}
+        for (mn_a, mn_b), cnt in self.singleton_tally.items():
+            if mn_b:  # skip (end-of-block) sentinel entries
+                col_count[mn_b] = col_count.get(mn_b, 0) + cnt
+        col_ops = [mn for mn, _ in
+                   sorted(col_count.items(),
+                          key=lambda kv: -kv[1])[:grid_cols]]
 
-            # Build lookup: (row, col) -> count
-            tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
+        # Build lookup: (row, col) -> count
+        tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
 
-            col_w = max((len(mn) for mn in col_ops), default=4)
-            row_w = max((len(mn) for mn in row_ops), default=4)
+        col_w = max((len(mn) for mn in col_ops), default=4)
+        row_w = max((len(mn) for mn in row_ops), default=4)
 
-            # Header
-            header = "#" + " " * (row_w + 2)
-            header += "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
-            lines.append(f"# unpaired opcode pair table"
-                         f" (rows=unpaired, cols=successor):")
-            lines.append(header)
-            # Rows
-            for mn_a in row_ops:
-                cells = []
-                for mn_b in col_ops:
-                    v = tbl.get((mn_a, mn_b), 0)
-                    cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
-                lines.append(f"# {mn_a:<{row_w}}  " + "  ".join(cells))
+        # Fixed trailing columns widths.
+        rvc_w   = max(3, max((len(str(self.unpaired_rvc_opcode_tally.get(mn, 0)))
+                               for mn in row_ops), default=1))
+        total_w = max(5, max((len(str(self.unpaired_opcode_tally.get(mn, 0)))
+                               for mn in row_ops), default=1))
+        rvc_w   = max(rvc_w,   3)   # at least width of "rvc"
+        total_w = max(total_w, 5)   # at least width of "total"
+
+        # Header line
+        header = "# " + " " * row_w + "  "
+        if col_ops:
+            header += "  ".join(f"{mn:>{col_w}}" for mn in col_ops) + "  "
+        header += f"{'rvc':>{rvc_w}}  {'total':>{total_w}}"
+
+        lines.append("# unpaired opcode pair table"
+                     " (rows=unpaired, cols=successor, +rvc/total):")
+        lines.append(header)
+
+        # Data rows
+        for mn_a in row_ops:
+            cells = []
+            for mn_b in col_ops:
+                v = tbl.get((mn_a, mn_b), 0)
+                cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
+            rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn_a, 0)
+            total_cnt = self.unpaired_opcode_tally.get(mn_a, 0)
+            row = f"# {mn_a:<{row_w}}  "
+            if cells:
+                row += "  ".join(cells) + "  "
+            row += f"{rvc_cnt:>{rvc_w}d}  {total_cnt:>{total_w}d}"
+            lines.append(row)
 
         return lines
 
@@ -735,6 +727,8 @@ class AssemblyScheduler:
         out                      = None,
         verbose:            bool = False,
         same_base_reorder:  bool = False,
+        grid_rows:          int  = 20,
+        grid_cols:          int  = 20,
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -998,7 +992,9 @@ class AssemblyScheduler:
         merged = PairStats.merge(all_stats)
 
         # Append the file-wide summary as assembly comments.
-        for summary_line in merged.summary_lines(opcode_tally=opcode_tally):
+        for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
+                                                  grid_rows=grid_rows,
+                                                  grid_cols=grid_cols):
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1052,6 +1048,13 @@ def main():
                          "is not modified between them, and their address ranges "
                          "do not overlap.  Enables adjacent loads/stores within "
                          "the same object to be moved together for pairing.")
+    ap.add_argument("--grid-rows", type=int, default=20, metavar="N",
+                    help="Number of rows in the --opcode-tally grid (default: 20)")
+    _default_grid_cols = max(5, (shutil.get_terminal_size(fallback=(80, 24)).columns
+                                 - 20) // 10)
+    ap.add_argument("--grid-cols", type=int, default=_default_grid_cols, metavar="N",
+                    help=f"Number of successor columns in the --opcode-tally grid "
+                         f"(default: {_default_grid_cols}, derived from terminal width)")
     args = ap.parse_args()
 
     if args.list_rules:
@@ -1088,13 +1091,17 @@ def main():
         out               = sys.stdout,
         verbose           = args.verbose,
         same_base_reorder = args.same_base_reorder,
+        grid_rows         = args.grid_rows,
+        grid_cols         = args.grid_cols,
     )
 
     if sched.last_stats is not None:
         st = sched.last_stats
         src_label = args.input if args.input != "-" else "<stdin>"
         print(f"\n# --- report: {args.scorer}  {src_label} ---", file=sys.stderr)
-        for line in st.summary_lines(opcode_tally=args.opcode_tally):
+        for line in st.summary_lines(opcode_tally=args.opcode_tally,
+                                     grid_rows=args.grid_rows,
+                                     grid_cols=args.grid_cols):
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
