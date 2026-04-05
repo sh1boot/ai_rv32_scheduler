@@ -280,7 +280,8 @@ _ADDR_CHAIN_MN = frozenset({
     "sh2add", "sh2add.uw",
     "sh3add", "sh3add.uw",
 })
-_MEM_OPS    = frozenset({"lw", "lh", "lb", "lhu", "lbu", "sw", "sh", "sb"})
+# Arithmetic mnemonics that carry an immediate operand (potential stride).
+_IMM_ARITH  = frozenset({"addi", "addiw"})
 _COMPACT32_BRANCH_MN = frozenset({
     "beq", "bne", "blt", "bge", "bltu", "bgeu",
     "beqz", "bnez",
@@ -467,6 +468,8 @@ def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
     return True
 
 
+
+
 # Map each load/store mnemonic to the number of bytes it accesses.
 # RV32I/RV64I integer, and F/D extension float widths included so the
 # adjacent-pair rules generalise cleanly to future ISA variants.
@@ -485,6 +488,7 @@ _LOAD_MN  = frozenset(mn for mn in _MEM_WIDTH
                        if mn.startswith(("l", "f")) and not mn.startswith("fs"))
 _STORE_MN = frozenset(mn for mn in _MEM_WIDTH
                        if mn.startswith(("s", "fs")))
+_MEM_OPS  = frozenset(_MEM_WIDTH)    # all load/store mnemonics
 
 
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
@@ -573,11 +577,22 @@ def _rule_addr_chain(a: "Instruction", b: "Instruction",
 def _rule_pre_increment(a: "Instruction", b: "Instruction",
                         liveness: dict) -> bool:
     """
-    Address arithmetic followed by a memory op using that result as base (pre-increment).
+    Address arithmetic followed by a memory op using that result as base
+    (pre-increment / stride-then-access).
 
     Matches:
         add / addi / sub / sh1add / sh2add / sh3add   rd, ...
-        lw / sw / lh / sh / lb / sb / lhu / lbu       ..., N(rd)
+        <any load or store>                            ..., N(rd)
+
+    When the arithmetic instruction is an immediate form (addi/addiw) the
+    absolute value of the immediate must equal the width of the memory
+    access (1 for byte, 2 for halfword, 4 for word, 8 for doubleword/float
+    double), reflecting that the stride matches the element size.  For
+    register-based arithmetic (add, sub, sh1add …) no immediate constraint
+    is applied.
+
+    The stored value register of a store must not be the same as rd (it
+    would be overwritten by the arithmetic before the store executes).
     """
     if a.mnemonic not in _ADDR_ARITH or b.mnemonic not in _MEM_OPS:
         return False
@@ -586,29 +601,47 @@ def _rule_pre_increment(a: "Instruction", b: "Instruction",
     rd = a.defs[0]
     if rd not in b.uses:
         return False
-    if b.mnemonic in ("sw", "sh", "sb") and b.uses and b.uses[0] == rd:
+    if b.mnemonic in _STORE_MN and b.uses and b.uses[0] == rd:
         return False
+    if a.mnemonic in _IMM_ARITH:
+        width = _MEM_WIDTH.get(b.mnemonic, 0)
+        if a.imm is None or abs(a.imm) != width:
+            return False
     return True
 
 
 def _rule_post_increment(a: "Instruction", b: "Instruction",
                           liveness: dict) -> bool:
     """
-    Memory op followed by address arithmetic on the same base (post-increment).
+    Memory op followed by address arithmetic on the same base
+    (post-increment / access-then-stride).
 
     Matches:
-        lw / sw / lh / sh / lb / sb / lhu / lbu       ..., N(base)
+        <any load or store>                            ..., N(base)
         add / addi / sub / sh1add / sh2add / sh3add   rd, base, ...
+
+    When the arithmetic instruction is an immediate form (addi/addiw) the
+    absolute value of the immediate must equal the width of the memory
+    access, reflecting that the stride matches the element size.  For
+    register-based arithmetic no immediate constraint is applied.
+
+    For loads, the destination register of the load must differ from the
+    destination of the arithmetic (they share the base register, not the
+    result slot).
     """
     if a.mnemonic not in _MEM_OPS or b.mnemonic not in _ADDR_ARITH:
         return False
     base = a.uses[-1] if a.uses else None
     if base is None or not b.uses or b.uses[0] != base:
         return False
-    if a.mnemonic in ("lw", "lh", "lb", "lhu", "lbu"):
+    if a.mnemonic in _LOAD_MN:
         load_rd  = a.defs[0] if a.defs else None
         arith_rd = b.defs[0] if b.defs else None
         if load_rd is not None and load_rd == arith_rd:
+            return False
+    if b.mnemonic in _IMM_ARITH:
+        width = _MEM_WIDTH.get(a.mnemonic, 0)
+        if b.imm is None or abs(b.imm) != width:
             return False
     return True
 
