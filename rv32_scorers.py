@@ -567,12 +567,14 @@ def _is_mv(instr: "Instruction") -> bool:
 
 
 def _is_li(instr: "Instruction") -> bool:
-    """True if *instr* is a load-immediate (addi rd, x0, imm — no register uses).
+    """True if *instr* is a load-immediate within the compact encoding range.
 
     The GAS pseudo ``li rd, imm`` canonicalises to ``addi rd, x0, imm`` with
     x0 filtered from uses[], so this form has mnemonic="addi" and uses=[].
+    Immediate is restricted to −16..+15 to fit the compact encoding field.
     """
-    return instr.mnemonic == "addi" and not instr.uses
+    return (instr.mnemonic == "addi" and not instr.uses
+            and instr.imm is not None and -16 <= instr.imm <= 15)
 
 
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
