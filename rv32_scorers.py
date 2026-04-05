@@ -836,6 +836,59 @@ def _dual_move_ok(instr: "Instruction") -> bool:
     return False
 
 
+# Pairs of mnemonics that consume the same two source registers but produce
+# two distinct results, making them natural candidates for dual-issue.
+# Each entry maps a mnemonic to the set of valid partners.
+_DUAL_RESULT_PARTNERS: dict = {
+    "add":    frozenset({"sub"}),
+    "sub":    frozenset({"add"}),
+    "div":    frozenset({"rem"}),
+    "rem":    frozenset({"div"}),
+    "divu":   frozenset({"remu"}),
+    "remu":   frozenset({"divu"}),
+    "mul":    frozenset({"mulh", "mulhu", "mulhsu"}),
+    "mulh":   frozenset({"mul"}),
+    "mulhu":  frozenset({"mul"}),
+    "mulhsu": frozenset({"mul"}),
+    "min":    frozenset({"max"}),
+    "max":    frozenset({"min"}),
+    "minu":   frozenset({"maxu"}),
+    "maxu":   frozenset({"minu"}),
+    "and":    frozenset({"andn"}),
+    "andn":   frozenset({"and"}),
+}
+
+
+def _rule_dual_result(a: "Instruction", b: "Instruction",
+                      liveness: dict) -> bool:
+    """
+    Two instructions that read the same source registers and produce two
+    independent results (dual-result form).
+
+    Both instructions must use identical source operands (same rs1, rs2 in
+    the same order) and write to distinct destination registers.
+
+    Valid pairs and their relationship:
+        add / sub       — sum and difference of the same operands
+        div / rem       — quotient and remainder (signed)
+        divu / remu     — quotient and remainder (unsigned)
+        mul / mulh      — low and high word of signed×signed product
+        mul / mulhu     — low and high word of unsigned×unsigned product
+        mul / mulhsu    — low and high word of signed×unsigned product
+        min / max       — minimum and maximum (signed)
+        minu / maxu     — minimum and maximum (unsigned)
+        and / andn      — AND and AND-NOT of the same operands
+    """
+    partners = _DUAL_RESULT_PARTNERS.get(a.mnemonic)
+    if partners is None or b.mnemonic not in partners:
+        return False
+    if not a.uses or a.uses != b.uses:
+        return False
+    if not a.defs or not b.defs:
+        return False
+    return a.defs[0] != b.defs[0]
+
+
 def _rule_dual_move(a: "Instruction", b: "Instruction",
                     liveness: dict) -> bool:
     """
@@ -867,6 +920,7 @@ COMPACT32_RULES: list = [
     ("addr_chain",          _rule_addr_chain),
     ("pre_increment",       _rule_pre_increment),
     ("post_increment",      _rule_post_increment),
+    ("dual_result",         _rule_dual_result),
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_jump",          _rule_arith_jump),
@@ -918,6 +972,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("pre_increment")
         if _is_mem_op(a):
             eligible.add("post_increment")
+        if a.mnemonic in _DUAL_RESULT_PARTNERS:
+            eligible.add("dual_result")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
