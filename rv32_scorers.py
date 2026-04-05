@@ -505,7 +505,6 @@ _MEM_OPS  = frozenset(_MEM_WIDTH)    # all load/store mnemonics
 #
 # Existing predicates defined in rv32_core.py:
 #   _dual_arith_ok(instr)  — RSD form, x0..x15 regs, bounded immediate
-#   _dual_move_ok(instr)   — mv / c.mv / li form, regs in x0..x15
 #
 # Predicates defined here (compact32-rule specific):
 
@@ -808,33 +807,6 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
     return rsd in b.uses
 
 
-def _dual_move_ok(instr: "Instruction") -> bool:
-    """Return True if *instr* is eligible as one slot of a dual_move pair.
-
-    Recognises three canonical forms:
-
-    * mv-form   (``addi rd, rs, 0``): GAS pseudo ``mv rd, rs`` (I-type);
-      rd in x0..x15, rs in x0..x15, imm=0, exactly one use.
-    * c.mv-form (``add rd, x0, rs``): C-extension ``c.mv rd, rs`` (R-type);
-      rd in x0..x15, rs in x0..x15, exactly one use (x0 filtered).
-    * li-form   (``addi rd, x0, imm``): ``li`` / ``c.li``; rd in x0..x15,
-      no uses (x0 filtered), imm in -16..+15.
-    """
-    rd = instr.defs[0] if instr.defs else None
-    if rd is None or rd not in _REG4:
-        return False
-    if instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0:
-        # mv-form: addi rd, rs, 0  (GAS pseudo mv)
-        return instr.uses[0] in _REG4
-    if instr.mnemonic == "add" and len(instr.uses) == 1:
-        # c.mv-form: add rd, x0, rs  (x0 filtered -> exactly one use)
-        return instr.uses[0] in _REG4
-    if instr.mnemonic == "addi" and not instr.uses:
-        # li-form: addi rd, x0, imm  (x0 filtered -> no uses)
-        imm = instr.imm
-        return imm is not None and -16 <= imm <= 15
-    return False
-
 
 # Pairs of mnemonics that consume the same two source registers but produce
 # two distinct results, making them natural candidates for dual-issue.
@@ -856,6 +828,10 @@ _DUAL_RESULT_PARTNERS: dict = {
     "maxu":   frozenset({"minu"}),
     "and":    frozenset({"andn"}),
     "andn":   frozenset({"and"}),
+    # mv (addi rd, rs, 0) and li (addi rd, x0, imm) both canonicalise to addi.
+    # Two mv instructions sharing the same source, or two li instructions
+    # (both have uses=[]), are valid dual-issue pairs.
+    "addi":   frozenset({"addi"}),
 }
 
 
@@ -889,23 +865,6 @@ def _rule_dual_result(a: "Instruction", b: "Instruction",
     return a.defs[0] != b.defs[0]
 
 
-def _rule_dual_move(a: "Instruction", b: "Instruction",
-                    liveness: dict) -> bool:
-    """
-    Two independent register-move or small-immediate-load instructions.
-
-    Matches any combination of:
-        mv   rd, rs          (canonical: addi rd, rs, 0 — rs in x0..x15)
-        c.mv rd, rs          (canonical: add  rd, x0, rs — rs in x0..x15)
-        li   rd, imm         (canonical: addi rd, x0, imm — imm in −16..+15)
-
-    Both rd values must be distinct and in x0..x15.  Either order is valid.
-    No liveness check needed — neither instruction produces a value the
-    other consumes.
-    """
-    if not (_dual_move_ok(a) and _dual_move_ok(b)):
-        return False
-    return a.defs[0] != b.defs[0]
 
 
 # Registry: (display_name, rule_function).  Rules are tested in order;
@@ -926,7 +885,6 @@ COMPACT32_RULES: list = [
     ("arith_jump",          _rule_arith_jump),
     ("arith_branch",        _rule_arith_branch),
     ("addi_branch",         _rule_addi_branch),
-    ("dual_move",           _rule_dual_move),
 ]
 
 
@@ -981,8 +939,6 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
                 eligible.add("addi_branch")
-        if _dual_move_ok(a):
-            eligible.add("dual_move")
         return frozenset(eligible)
 
     _elig_cache: dict = {}
