@@ -266,13 +266,41 @@ class PairStats:
                 total_cnt = self.unpaired_opcode_tally.get(mn, 0)
                 lines.append(f"#   {rvc_cnt:5d} / {total_cnt:5d}  {mn}")
 
-        # ── Unpaired adjacent opcode-pair tally ───────────────────────────
+        # ── Unpaired adjacent opcode-pair tally (cross-tab table) ────────
         if self.singleton_tally:
-            lines.append(f"# unpaired opcode pairs (top {self._TALLY_LIMIT}):")
-            ranked = sorted(self.singleton_tally.items(), key=lambda kv: -kv[1])
-            for (mn_a, mn_b), cnt in ranked[:self._TALLY_LIMIT]:
-                b_label = mn_b if mn_b else "(end)"
-                lines.append(f"#   {cnt:5d}  {mn_a} | {b_label}")
+            # Top N row opcodes by total unpaired count.
+            row_ops = [mn for mn, _ in
+                       sorted(self.unpaired_opcode_tally.items(),
+                              key=lambda kv: -kv[1])[:self._TALLY_LIMIT]]
+            # Top N column opcodes: successors most often seen after any
+            # unpaired instruction (sum over all row opcodes).
+            col_count: dict = {}
+            for (mn_a, mn_b), cnt in self.singleton_tally.items():
+                if mn_b:  # skip (end) entries for column selection
+                    col_count[mn_b] = col_count.get(mn_b, 0) + cnt
+            col_ops = [mn for mn, _ in
+                       sorted(col_count.items(),
+                              key=lambda kv: -kv[1])[:self._TALLY_LIMIT]]
+
+            # Build lookup: (row, col) -> count
+            tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
+
+            col_w = max((len(mn) for mn in col_ops), default=4)
+            row_w = max((len(mn) for mn in row_ops), default=4)
+
+            # Header
+            header = "#" + " " * (row_w + 2)
+            header += "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
+            lines.append(f"# unpaired opcode pair table"
+                         f" (rows=unpaired, cols=successor):")
+            lines.append(header)
+            # Rows
+            for mn_a in row_ops:
+                cells = []
+                for mn_b in col_ops:
+                    v = tbl.get((mn_a, mn_b), 0)
+                    cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
+                lines.append(f"# {mn_a:<{row_w}}  " + "  ".join(cells))
 
         return lines
 
