@@ -232,20 +232,25 @@ class PairStats:
         """
         Format the unpaired-opcode cross-tab grid.
 
-        Rows are the top *grid_rows* opcodes by total unpaired count.
-        Columns are the top *grid_cols* successor opcodes by frequency, plus
-        two fixed trailing columns: ``rvc`` (rvc-eligible unpaired count) and
-        ``total`` (total unpaired count for that row opcode).
+        Rows are the top *grid_rows* opcodes sorted by rvc-eligible unpaired
+        count (descending), then total (descending).  Two fixed leading columns
+        show ``total`` and ``rvc`` counts; the remaining *grid_cols* columns
+        are the most frequent successor opcodes.
         """
         if not self.singleton_tally and not self.unpaired_opcode_tally:
             return []
 
         lines = []
 
-        # Top N row opcodes by total unpaired count.
-        row_ops = [mn for mn, _ in
-                   sorted(self.unpaired_opcode_tally.items(),
-                          key=lambda kv: -kv[1])[:grid_rows]]
+        # All mnemonics from either tally, sorted rvc-desc then total-desc.
+        all_mn = set(self.unpaired_rvc_opcode_tally) | set(self.unpaired_opcode_tally)
+        row_ops = sorted(
+            all_mn,
+            key=lambda mn: (
+                -self.unpaired_rvc_opcode_tally.get(mn, 0),
+                -self.unpaired_opcode_tally.get(mn, 0),
+            )
+        )[:grid_rows]
 
         # Top N column opcodes: successors most often seen after any unpaired
         # instruction (sum over all row opcodes).
@@ -260,39 +265,33 @@ class PairStats:
         # Build lookup: (row, col) -> count
         tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
 
-        col_w = max((len(mn) for mn in col_ops), default=4)
-        row_w = max((len(mn) for mn in row_ops), default=4)
-
-        # Fixed trailing columns widths.
-        rvc_w   = max(3, max((len(str(self.unpaired_rvc_opcode_tally.get(mn, 0)))
-                               for mn in row_ops), default=1))
+        col_w   = max((len(mn) for mn in col_ops), default=4)
+        row_w   = max((len(mn) for mn in row_ops), default=4)
         total_w = max(5, max((len(str(self.unpaired_opcode_tally.get(mn, 0)))
                                for mn in row_ops), default=1))
-        rvc_w   = max(rvc_w,   3)   # at least width of "rvc"
-        total_w = max(total_w, 5)   # at least width of "total"
+        rvc_w   = max(3, max((len(str(self.unpaired_rvc_opcode_tally.get(mn, 0)))
+                               for mn in row_ops), default=1))
 
-        # Header line
-        header = "# " + " " * row_w + "  "
+        # Header line: total and rvc lead, then successor columns.
+        header = f"# {'':>{row_w}}  {'total':>{total_w}}  {'rvc':>{rvc_w}}"
         if col_ops:
-            header += "  ".join(f"{mn:>{col_w}}" for mn in col_ops) + "  "
-        header += f"{'rvc':>{rvc_w}}  {'total':>{total_w}}"
+            header += "  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
 
         lines.append("# unpaired opcode pair table"
-                     " (rows=unpaired, cols=successor, +rvc/total):")
+                     " (rows=unpaired, cols=successor, total/rvc+):")
         lines.append(header)
 
         # Data rows
         for mn_a in row_ops:
-            cells = []
-            for mn_b in col_ops:
-                v = tbl.get((mn_a, mn_b), 0)
-                cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
-            rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn_a, 0)
             total_cnt = self.unpaired_opcode_tally.get(mn_a, 0)
-            row = f"# {mn_a:<{row_w}}  "
-            if cells:
-                row += "  ".join(cells) + "  "
-            row += f"{rvc_cnt:>{rvc_w}d}  {total_cnt:>{total_w}d}"
+            rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn_a, 0)
+            row = f"# {mn_a:<{row_w}}  {total_cnt:>{total_w}d}  {rvc_cnt:>{rvc_w}d}"
+            if col_ops:
+                cells = []
+                for mn_b in col_ops:
+                    v = tbl.get((mn_a, mn_b), 0)
+                    cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
+                row += "  " + "  ".join(cells)
             lines.append(row)
 
         return lines
