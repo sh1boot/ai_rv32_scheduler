@@ -605,7 +605,7 @@ def _rule_pre_increment(a: "Instruction", b: "Instruction",
         return False
     if a.mnemonic in _IMM_ARITH:
         width = _MEM_WIDTH.get(b.mnemonic, 0)
-        if a.imm is None or abs(a.imm) != width:
+        if a.imm is None or width == 0 or abs(a.imm) % width != 0:
             return False
     return True
 
@@ -641,7 +641,7 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
             return False
     if b.mnemonic in _IMM_ARITH:
         width = _MEM_WIDTH.get(a.mnemonic, 0)
-        if b.imm is None or abs(b.imm) != width:
+        if b.imm is None or width == 0 or abs(b.imm) % width != 0:
             return False
     return True
 
