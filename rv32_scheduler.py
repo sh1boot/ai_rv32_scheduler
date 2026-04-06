@@ -135,8 +135,6 @@ class PairStats:
     # Per-mnemonic count of unpaired rvc-eligible instructions.
     # Parallel to unpaired_opcode_tally but restricted to can_compress() == True.
     unpaired_rvc_opcode_tally: dict = field(default_factory=dict)
-    # Like singleton_tally but restricted to rvc-eligible row instructions.
-    singleton_rvc_tally: dict = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "PairStats":
@@ -151,7 +149,6 @@ class PairStats:
             singleton_tally={}, unpaired_opcode_tally={},
             unpaired_rvc=0, unpaired_non_rvc=0,
             unpaired_rvc_opcode_tally={},
-            singleton_rvc_tally={},
         )
 
     def summary_lines(self, opcode_tally: bool = False,
@@ -366,7 +363,6 @@ class PairStats:
             unpaired_rvc     = unpaired_rvc,
             unpaired_non_rvc = unpaired_non_rvc,
             unpaired_rvc_opcode_tally = _merge_dicts("unpaired_rvc_opcode_tally"),
-            singleton_rvc_tally    = _merge_dicts("singleton_rvc_tally"),
         )
 
 # ---------------------------------------------------------------------------
@@ -631,7 +627,6 @@ def _process_block(
     rule_shadow:           Counter = Counter()
     rule_missed:           Counter = Counter()
     singleton_tally:           Counter = Counter()
-    singleton_rvc_tally:       Counter = Counter()
     unpaired_opcode_tally:     Counter = Counter()
     unpaired_rvc_opcode_tally: Counter = Counter()
     unpaired_rvc_count:    int     = 0
@@ -688,7 +683,6 @@ def _process_block(
         if can_compress(real_scheduled[i]):
             unpaired_rvc_count             += 1
             unpaired_rvc_opcode_tally[mn_a] += 1
-            singleton_rvc_tally[key]        += 1
         else:
             unpaired_non_rvc_count += 1
         i += 1
@@ -744,7 +738,6 @@ def _process_block(
         unpaired_rvc              = unpaired_rvc_count,
         unpaired_non_rvc          = unpaired_non_rvc_count,
         unpaired_rvc_opcode_tally = unpaired_rvc_opcode_tally,
-        singleton_rvc_tally       = singleton_rvc_tally,
     )
 
 # ---------------------------------------------------------------------------
