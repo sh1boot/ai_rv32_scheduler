@@ -256,14 +256,12 @@ class PairStats:
             return not show_big and (mn.endswith("(big)")
                                      or mn in ("auipc", "lui"))
 
-        # All mnemonics from either tally, sorted rvc-desc then total-desc.
+        # All non-excluded mnemonics, sorted by their own total count descending.
         all_mn = set(self.unpaired_rvc_opcode_tally) | set(self.unpaired_opcode_tally)
+        visible_mn = [mn for mn in all_mn if not _exclude(mn)]
         row_ops = sorted(
-            (mn for mn in all_mn if not _exclude(mn)),
-            key=lambda mn: (
-                -self.unpaired_rvc_opcode_tally.get(mn, 0),
-                -self.unpaired_opcode_tally.get(mn, 0),
-            )
+            visible_mn,
+            key=lambda mn: -self.unpaired_opcode_tally.get(mn, 0),
         )[:grid_rows]
 
         # Top N column opcodes ranked by pairing value: frequency after
@@ -284,12 +282,19 @@ class PairStats:
         # Build lookup: (row, col) -> count
         tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
 
+        # Column totals over all non-excluded rows (not just the visible top-N).
+        col_totals = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
+                      for mn_b in col_ops}
+        grand_total = sum(self.unpaired_opcode_tally.get(mn, 0)
+                          for mn in visible_mn)
+
         col_w   = max((len(mn) for mn in col_ops), default=4)
         row_w   = max((len(mn) for mn in row_ops), default=4)
         total_w = max(5, max((len(str(self.unpaired_opcode_tally.get(mn, 0)))
                                for mn in row_ops), default=1))
+        total_w = max(total_w, len(str(grand_total)))
 
-        # Header line: total leads, then successor columns (rvc hidden).
+        # Header line
         header = f"# {'':>{row_w}}  {'total':>{total_w}}"
         if col_ops:
             header += "  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
@@ -297,6 +302,15 @@ class PairStats:
         lines.append("# unpaired opcode pair table"
                      " (rows=unpaired, cols=successor, +total):")
         lines.append(header)
+
+        # Totals row
+        tot_row = f"# {'':>{row_w}}  {grand_total:>{total_w}d}"
+        if col_ops:
+            tot_row += "  " + "  ".join(
+                f"{col_totals[mn_b]:>{col_w}d}" if col_totals[mn_b]
+                else " " * col_w
+                for mn_b in col_ops)
+        lines.append(tot_row)
 
         # Data rows
         for mn_a in row_ops:
