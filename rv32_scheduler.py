@@ -452,6 +452,117 @@ def _tally_label(instr: "Instruction") -> str:
 
     return f"{mn}(big)" if big else mn
 
+
+# ---------------------------------------------------------------------------
+# Chain-reorder helpers
+# ---------------------------------------------------------------------------
+
+def _order_run_by_chains(instrs: list, graph: "DepGraph") -> list:
+    """
+    Topologically sort *instrs* with a greedy producer-consumer bias.
+
+    Within the constraints of the dep graph, prefer to schedule each
+    instruction immediately after the instruction that produces one of its
+    source registers (i.e. a direct RAW predecessor that is itself in
+    *instrs*).  This maximises the number of producer→consumer adjacent
+    pairs and is what --chain-reorder uses to reorder singleton runs.
+
+    The algorithm is a standard Kahn's-algorithm topological sort with a
+    priority tie-break: among all currently-ready instructions, prefer one
+    whose most recently scheduled predecessor is the instruction just
+    emitted (direct chain continuation).
+
+    Parameters
+    ----------
+    instrs
+        The instructions to reorder (a contiguous singleton run, no pairs).
+    graph
+        The full block dep graph — used for predecessor/successor lookups.
+
+    Returns
+    -------
+    A reordered list that respects all dep-graph edges among *instrs*.
+    """
+    if len(instrs) <= 1:
+        return list(instrs)
+
+    idx_set = {instr.index for instr in instrs}
+    by_idx  = {instr.index: instr for instr in instrs}
+
+    # Compute in-degree restricted to edges within this run.
+    in_deg: dict = {instr.index: 0 for instr in instrs}
+    for instr in instrs:
+        for succ in graph.successors[instr.index]:
+            if succ in idx_set:
+                in_deg[succ] += 1
+
+    ready = [instr for instr in instrs if in_deg[instr.index] == 0]
+    result: list = []
+    last_emitted_idx: "int | None" = None
+
+    while ready:
+        # Prefer an instruction that directly follows the last emitted one.
+        chosen = None
+        if last_emitted_idx is not None:
+            for cand in ready:
+                if last_emitted_idx in graph.predecessors[cand.index]:
+                    chosen = cand
+                    break
+        if chosen is None:
+            chosen = ready[0]
+
+        ready.remove(chosen)
+        result.append(chosen)
+        last_emitted_idx = chosen.index
+
+        for succ in graph.successors[chosen.index]:
+            if succ in idx_set:
+                in_deg[succ] -= 1
+                if in_deg[succ] == 0:
+                    ready.append(by_idx[succ])
+
+    # Append any stragglers (shouldn't happen if graph is acyclic within run).
+    remaining = [i for i in instrs if i not in result]
+    result.extend(remaining)
+    return result
+
+
+def _chain_reorder_singletons(
+    real_scheduled: list,
+    pair_start_set: set,
+    pair_end_set:   set,
+    graph:          "DepGraph",
+) -> list:
+    """
+    Reorder singleton runs within *real_scheduled* to maximise
+    producer-consumer adjacency, without disturbing paired instructions.
+
+    A singleton run is a maximal contiguous subsequence of instructions
+    where none occupies a position in *pair_start_set* or *pair_end_set*.
+    Each such run is independently reordered by ``_order_run_by_chains``.
+    Paired instructions are left in their original positions.
+
+    *pair_start_set* and *pair_end_set* are sets of **positions** (integer
+    offsets into *real_scheduled*), as produced by the greedy-advance walk.
+
+    Returns a new list (same length as *real_scheduled*).
+    """
+    result: list = []
+    run:    list = []
+
+    for pos, instr in enumerate(real_scheduled):
+        if pos in pair_start_set or pos in pair_end_set:
+            if run:
+                result.extend(_order_run_by_chains(run, graph))
+                run.clear()
+            result.append(instr)
+        else:
+            run.append(instr)
+    if run:
+        result.extend(_order_run_by_chains(run, graph))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ABI-based block boundary liveness
 # ---------------------------------------------------------------------------
@@ -529,6 +640,7 @@ def _process_block(
     block_live_in:     frozenset = frozenset(),
     cfg_live_out:      frozenset = frozenset(),
     same_base_reorder: bool = False,
+    chain_reorder:     bool = False,
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -641,6 +753,8 @@ def _process_block(
     liveness_snap = (pair_score._liveness_cell[0]
                      if hasattr(pair_score, "_liveness_cell") else {})
 
+    # ── Greedy-advance walk: identify pairs ──────────────────────────────
+    # pair_start_set / pair_end_set hold *positions* in real_scheduled.
     i = 0
     while i < total_instrs:
         if i + 1 < total_instrs:
@@ -674,18 +788,27 @@ def _process_block(
                     rule_counts[rule] += 1
                     i += 2
                     continue
+        i += 1
 
-        mn_a = _tally_label(real_scheduled[i])
+    # ── Optional chain-reorder of singleton runs ─────────────────────────
+    if chain_reorder:
+        real_scheduled = _chain_reorder_singletons(
+            real_scheduled, pair_start_set, pair_end_set, graph)
+        real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
+
+    # ── Tally pass over the (possibly reordered) sequence ────────────────
+    for i, instr in enumerate(real_scheduled):
+        if i in pair_start_set or i in pair_end_set:
+            continue
+        mn_a = _tally_label(instr)
         mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
-        key  = (mn_a, mn_b)
-        singleton_tally[key]        += 1
-        unpaired_opcode_tally[mn_a] += 1
-        if can_compress(real_scheduled[i]):
+        singleton_tally[(mn_a, mn_b)] += 1
+        unpaired_opcode_tally[mn_a]   += 1
+        if can_compress(instr):
             unpaired_rvc_count             += 1
             unpaired_rvc_opcode_tally[mn_a] += 1
         else:
             unpaired_non_rvc_count += 1
-        i += 1
 
     # ── Emit annotated output ─────────────────────────────────────────────
     # Walk `scheduled` (sentinels included) in order.  Sentinels are barriers
@@ -812,6 +935,7 @@ class AssemblyScheduler:
         out                      = None,
         verbose:            bool = False,
         same_base_reorder:  bool = False,
+        chain_reorder:      bool = False,
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
         show_big:           bool = False,
@@ -897,6 +1021,7 @@ class AssemblyScheduler:
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
                 same_base_reorder  = same_base_reorder,
+                chain_reorder      = chain_reorder,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -964,6 +1089,7 @@ class AssemblyScheduler:
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
                 same_base_reorder  = same_base_reorder,
+                chain_reorder      = chain_reorder,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1133,6 +1259,12 @@ def main():
                     help="Include large-immediate variants (labels ending in "
                          "'(big)'), lui, and auipc in the --opcode-tally grid. "
                          "Hidden by default to focus on compact-encodable forms.")
+    ap.add_argument("--chain-reorder", action="store_true",
+                    help="(Experimental) After scheduling, reorder unpaired "
+                         "singleton instructions within each run to maximise "
+                         "producer-consumer adjacency.  Updates the opcode-tally "
+                         "table to reflect the reordered sequence, helping identify "
+                         "instruction pairs that naturally follow each other.")
     ap.add_argument("--same-base-reorder", action="store_true",
                     help="(Experimental) Allow loads/stores to reorder past each "
                          "other when they share the same base register, the base "
@@ -1182,6 +1314,7 @@ def main():
         out               = sys.stdout,
         verbose           = args.verbose,
         same_base_reorder = args.same_base_reorder,
+        chain_reorder     = args.chain_reorder,
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
         show_big          = args.show_big,
