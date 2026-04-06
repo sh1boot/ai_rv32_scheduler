@@ -264,27 +264,17 @@ class PairStats:
             key=lambda mn: -self.unpaired_opcode_tally.get(mn, 0),
         )[:grid_rows]
 
-        # Top N column opcodes ranked by pairing value: frequency after
-        # rvc-eligible rows, scaled by the successor's own rvc-eligible fraction.
-        # This penalises non-rvc successors that happen to appear often after
-        # rvc rows but cannot themselves form compact pairs.
-        col_score: dict = {}
-        for (mn_a, mn_b), cnt in self.singleton_rvc_tally.items():
-            if mn_b and not _exclude(mn_b):
-                rvc_b   = self.unpaired_rvc_opcode_tally.get(mn_b, 0)
-                total_b = self.unpaired_opcode_tally.get(mn_b, 0)
-                frac    = rvc_b / total_b if total_b else 0.0
-                col_score[mn_b] = col_score.get(mn_b, 0.0) + cnt * frac
-        col_ops = [mn for mn, _ in
-                   sorted(col_score.items(),
-                          key=lambda kv: -kv[1])[:grid_cols]]
-
         # Build lookup: (row, col) -> count
         tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
 
-        # Column totals over all non-excluded rows (not just the visible top-N).
-        col_totals = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
-                      for mn_b in col_ops}
+        # Column totals over all non-excluded rows; use them to rank columns.
+        all_col_mn = {mn_b for (_, mn_b) in self.singleton_tally if mn_b and not _exclude(mn_b)}
+        col_totals_all = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
+                          for mn_b in all_col_mn}
+        col_ops = [mn for mn, _ in
+                   sorted(col_totals_all.items(),
+                          key=lambda kv: -kv[1])[:grid_cols]]
+        col_totals = {mn_b: col_totals_all[mn_b] for mn_b in col_ops}
         grand_total = sum(self.unpaired_opcode_tally.get(mn, 0)
                           for mn in visible_mn)
 
