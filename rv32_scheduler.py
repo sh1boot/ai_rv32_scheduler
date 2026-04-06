@@ -31,7 +31,7 @@ from rv32_analysis import (
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
-    make_compact32_scorer,
+    make_compact32_scorer, _MEM_WIDTH,
 )
 from rv32_rename import (
     _ALL_INT_REGS, _ALL_FP_REGS, _TEMPORARIES, _RESERVED,
@@ -358,33 +358,88 @@ class PairStats:
 # Tally helpers (module-level so they can be used by the streaming processor)
 # ---------------------------------------------------------------------------
 
+# Default bit width for the "small immediate" threshold.
+# An immediate fits when its encoded value (after dividing by any scale
+# factor) lies in the signed range [-(2^(n-1)), 2^(n-1)-1], i.e. -16..+15
+# for n=5, or the unsigned range [0, 2^n - 1] = 0..31 where noted.
+_IMM_BITS = 5
+
+# Shift-amount fields are structurally 0..(2^n - 1) and are never big.
+_SHIFT_MN = frozenset({"slli", "srli", "srai", "slliw", "srliw", "sraiw"})
+
+# Upper-immediate instructions have no "small" form and are excluded from
+# the big/small split (they would always be classified as big).
+_UPPER_IMM_MN = frozenset({"lui", "auipc"})
+
+
+def _imm_is_big(instr: "Instruction", n: int = _IMM_BITS) -> bool:
+    """Return True if *instr*'s immediate exceeds the compact n-bit threshold.
+
+    Memory ops scale the threshold by data width so naturally-aligned
+    accesses within ±2^(n-1) elements are considered small
+    (e.g. ``lw rd, -64(rb)`` is small for n=5: −64 = −16×4).
+
+    ``addi rd, sp, imm`` uses an unsigned scale-4 check (stack frame
+    indexing: non-negative multiples of 4 up to 4×(2^n − 1)).
+
+    Shift-amount fields (slli/srli/srai …) and upper-immediate instructions
+    (lui/auipc) are excluded and always return False.
+
+    Returns False for instructions that carry no immediate.
+    """
+    mn = instr.mnemonic
+
+    if mn in _UPPER_IMM_MN or mn in _SHIFT_MN:
+        return False
+
+    lo_s = -(1 << (n - 1))          # −16 for n=5
+    hi_s =  (1 << (n - 1)) - 1      #  +15 for n=5
+    hi_u =  (1 << n) - 1            #  +31 for n=5
+
+    # Memory ops: offset scaled by data width.
+    if instr.mem is not None:
+        offset = instr.mem[0]
+        if offset is None:
+            return False
+        scale = _MEM_WIDTH.get(mn, 1)
+        return not (offset % scale == 0
+                    and lo_s * scale <= offset <= hi_s * scale)
+
+    imm = instr.imm
+    if imm is None:
+        return False
+
+    # addi rd, sp, imm: unsigned, scale 4 (stack frame addressing).
+    if mn == "addi" and instr.uses and instr.uses[0] == "x2":
+        return not (0 <= imm and imm % 4 == 0 and imm <= hi_u * 4)
+
+    # General signed n-bit check.
+    return not (lo_s <= imm <= hi_s)
+
+
 def _tally_label(instr: "Instruction") -> str:
+    """Return the tally key for *instr*.
+
+    Stack-relative loads/stores gain a ``(sp)`` qualifier.  ``addi rd, x0,
+    imm`` is labelled ``li``.  Any instruction whose immediate exceeds the
+    compact encoding threshold (see ``_imm_is_big``) gains a ``(big)``
+    suffix.  Instructions with no immediate, or whose immediates are
+    structurally always large (lui, auipc) or always small (shifts), return
+    their plain mnemonic.
     """
-    Return the tally key for *instr*.
+    mn  = instr.mnemonic
+    big = _imm_is_big(instr)
 
-    Loads and stores with sp (x2) as their base register use the qualified
-    form ``mnemonic(sp)`` (e.g. ``lw(sp)``, ``sw(sp)``).  Stack-relative
-    accesses are subject to different pairing constraints from heap/data
-    accesses and benefit from being counted separately.
-
-    ``addi`` is split into three forms:
-    - ``li``         — ``addi rd, x0, imm`` (x0 filtered → uses=[])
-    - ``addi(big)``  — ``addi`` with imm outside −16..+15
-    - ``addi``       — ``addi`` with small imm (−16..+15), includes mv (imm=0)
-
-    All other instructions return their plain mnemonic.
-    """
+    # Stack-relative memory: qualify with (sp) then optionally (big).
     if instr.mem is not None and instr.mem[1] == "x2":
-        return f"{instr.mnemonic}(sp)"
-    if instr.mnemonic == "addi":
-        imm = instr.imm
-        small = imm is not None and -16 <= imm <= 15
-        if not instr.uses:                          # addi rd, x0, imm  →  li
-            return "li" if small else "li(big)"
-        if not small:                               # large immediate
-            return "addi(big)"
-        return "addi"
-    return instr.mnemonic
+        base = f"{mn}(sp)"
+        return f"{base}(big)" if big else base
+
+    # addi rd, x0, imm → li form.
+    if mn == "addi" and not instr.uses:
+        return "li(big)" if big else "li"
+
+    return f"{mn}(big)" if big else mn
 
 # ---------------------------------------------------------------------------
 # ABI-based block boundary liveness
