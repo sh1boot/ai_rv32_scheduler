@@ -155,7 +155,8 @@ class PairStats:
         )
 
     def summary_lines(self, opcode_tally: bool = False,
-                      grid_rows: int = 20, grid_cols: int = 20) -> list:
+                      grid_rows: int = 20, grid_cols: int = 20,
+                      show_big: bool = False) -> list:
         """Return comment lines suitable for appending to assembly output.
 
         opcode_tally: when True, append the singleton opcode-pair tally and
@@ -228,27 +229,37 @@ class PairStats:
         )
         if opcode_tally:
             lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
-                                                   grid_cols=grid_cols))
+                                                   grid_cols=grid_cols,
+                                                   show_big=show_big))
         return lines
 
-    def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20) -> list:
+    def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
+                            show_big: bool = False) -> list:
         """
         Format the unpaired-opcode cross-tab grid.
 
         Rows are the top *grid_rows* opcodes sorted by rvc-eligible unpaired
-        count (descending), then total (descending).  Two fixed leading columns
-        show ``total`` and ``rvc`` counts; the remaining *grid_cols* columns
-        are the most frequent successor opcodes.
+        count (descending), then total (descending).  One fixed leading column
+        shows the ``total`` count; the remaining *grid_cols* columns are the
+        most frequent successor opcodes.
+
+        When *show_big* is False (default), labels ending in ``(big)`` and
+        the ``auipc`` / ``lui`` mnemonics are excluded from both rows and
+        columns.
         """
         if not self.singleton_tally and not self.unpaired_opcode_tally:
             return []
 
         lines = []
 
+        def _exclude(mn: str) -> bool:
+            return not show_big and (mn.endswith("(big)")
+                                     or mn in ("auipc", "lui"))
+
         # All mnemonics from either tally, sorted rvc-desc then total-desc.
         all_mn = set(self.unpaired_rvc_opcode_tally) | set(self.unpaired_opcode_tally)
         row_ops = sorted(
-            all_mn,
+            (mn for mn in all_mn if not _exclude(mn)),
             key=lambda mn: (
                 -self.unpaired_rvc_opcode_tally.get(mn, 0),
                 -self.unpaired_opcode_tally.get(mn, 0),
@@ -257,11 +268,11 @@ class PairStats:
 
         # Top N column opcodes ranked by pairing value: frequency after
         # rvc-eligible rows, scaled by the successor's own rvc-eligible fraction.
-        # This penalises non-rvc successors (auipc, li(big) …) that happen to
-        # appear often after rvc rows but cannot themselves form compact pairs.
+        # This penalises non-rvc successors that happen to appear often after
+        # rvc rows but cannot themselves form compact pairs.
         col_score: dict = {}
         for (mn_a, mn_b), cnt in self.singleton_rvc_tally.items():
-            if mn_b:
+            if mn_b and not _exclude(mn_b):
                 rvc_b   = self.unpaired_rvc_opcode_tally.get(mn_b, 0)
                 total_b = self.unpaired_opcode_tally.get(mn_b, 0)
                 frac    = rvc_b / total_b if total_b else 0.0
@@ -806,6 +817,7 @@ class AssemblyScheduler:
         same_base_reorder:  bool = False,
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
+        show_big:           bool = False,
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -1071,7 +1083,8 @@ class AssemblyScheduler:
         # Append the file-wide summary as assembly comments.
         for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
                                                   grid_rows=grid_rows,
-                                                  grid_cols=grid_cols):
+                                                  grid_cols=grid_cols,
+                                                  show_big=show_big):
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1119,6 +1132,10 @@ def main():
                     help="Append a ranked tally of unpaired opcode combinations "
                          "to the output and stderr report. Use this to identify "
                          "the best candidates for new pairing rules.")
+    ap.add_argument("--show-big", action="store_true",
+                    help="Include large-immediate variants (labels ending in "
+                         "'(big)'), lui, and auipc in the --opcode-tally grid. "
+                         "Hidden by default to focus on compact-encodable forms.")
     ap.add_argument("--same-base-reorder", action="store_true",
                     help="(Experimental) Allow loads/stores to reorder past each "
                          "other when they share the same base register, the base "
@@ -1170,6 +1187,7 @@ def main():
         same_base_reorder = args.same_base_reorder,
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
+        show_big          = args.show_big,
     )
 
     if sched.last_stats is not None:
@@ -1178,7 +1196,8 @@ def main():
         print(f"\n# --- report: {args.scorer}  {src_label} ---", file=sys.stderr)
         for line in st.summary_lines(opcode_tally=args.opcode_tally,
                                      grid_rows=args.grid_rows,
-                                     grid_cols=args.grid_cols):
+                                     grid_cols=args.grid_cols,
+                                     show_big=args.show_big):
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
