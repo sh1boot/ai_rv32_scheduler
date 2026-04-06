@@ -718,6 +718,75 @@ def _rule_dual_arith(a: "Instruction", b: "Instruction",
     return a.dual_arith_ok and b.dual_arith_ok
 
 
+# Arithmetic group for arith_mem: addi (6-bit imm), add, sub, and, or;
+# all in RSD form (rs1 == rd) with all registers in x0..x15.
+_ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
+
+def _is_arith_mem_a(instr: "Instruction") -> bool:
+    """
+    True if *instr* qualifies as the A slot of an arith_mem pair.
+
+    Constraints:
+    - mnemonic in {addi, add, sub, and, or}
+    - RSD form: rs1 == rd
+    - all registers (rd, rs1, rs2) in x0..x15
+    - addi: immediate in -64..63
+    """
+    mn = instr.mnemonic
+    if mn not in _ARITH_MEM_MN:
+        return False
+    rd = instr.defs[0] if instr.defs else None
+    if rd is None or rd not in _REG4:
+        return False
+    if not instr.uses or instr.uses[0] != rd:   # rsd constraint
+        return False
+    if mn == "addi":
+        imm = instr.imm
+        return imm is not None and -64 <= imm <= 63
+    else:
+        # add, sub, and, or: rs2 must also be in x0..x15
+        rs2 = instr.uses[1] if len(instr.uses) > 1 else None
+        return rs2 is not None and rs2 in _REG4
+
+
+def _mem_small_offset_ok(instr: "Instruction") -> bool:
+    """
+    True if *instr* is a load or store with an aligned offset in
+    0 .. 3 × access_width (i.e., a 2-bit scaled field).
+    """
+    if instr.mnemonic not in _MEM_OPS:
+        return False
+    mem = instr.mem
+    if mem is None:
+        return False
+    off, _base = mem
+    if off is None or off < 0:
+        return False
+    width = _MEM_WIDTH.get(instr.mnemonic, 0)
+    return width != 0 and off % width == 0 and off <= 3 * width
+
+
+def _rule_arith_mem(a: "Instruction", b: "Instruction",
+                    liveness: dict) -> bool:
+    """
+    Arithmetic (RSD form, x0..x15 regs) followed by a load or store with a
+    small aligned offset (0 .. 3 × access width).
+
+    A slot: addi rsd, rsd, imm  (imm in -64..63)
+         or add / sub / and / or  rsd, rsd, rs2
+         all registers in x0..x15.
+
+    B slot: any load or store whose offset is a non-negative multiple of its
+        access width and fits in a 2-bit scaled field (0, 1×w, 2×w, 3×w).
+
+    No producer-consumer relationship between A and B is required — the
+    pairing is structural, encoding two independent operations together.
+    The dep graph still prevents scheduling A before B when a true dependency
+    exists.
+    """
+    return _is_arith_mem_a(a) and _mem_small_offset_ok(b)
+
+
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
                             liveness: dict) -> bool:
     """
@@ -947,6 +1016,7 @@ COMPACT32_RULES: list = [
     ("op_pair",             _rule_op_pair),
     ("op_pair_chain",       _rule_op_pair_chain),
     ("dual_arith",          _rule_dual_arith),
+    ("arith_mem",           _rule_arith_mem),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_jump",          _rule_arith_jump),
     ("arith_branch",        _rule_arith_branch),
@@ -1000,6 +1070,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
+        if _is_arith_mem_a(a):
+            eligible.add("arith_mem")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
