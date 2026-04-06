@@ -1072,8 +1072,8 @@ def main():
                          "the same object to be moved together for pairing.")
     ap.add_argument("--grid-rows", type=int, default=20, metavar="N",
                     help="Number of rows in the --opcode-tally grid (default: 20)")
-    _default_grid_cols = max(5, (shutil.get_terminal_size(fallback=(80, 24)).columns
-                                 - 20) * 3 // 20)
+    _default_grid_cols = max(5, (shutil.get_terminal_size(fallback=(120, 24)).columns
+                                 - 20) // 10)
     ap.add_argument("--grid-cols", type=int, default=_default_grid_cols, metavar="N",
                     help=f"Number of successor columns in the --opcode-tally grid "
                          f"(default: {_default_grid_cols}, derived from terminal width)")
