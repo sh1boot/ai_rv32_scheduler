@@ -371,10 +371,11 @@ def _tally_label(instr: "Instruction") -> str:
     if instr.mem is not None and instr.mem[1] == "x2":
         return f"{instr.mnemonic}(sp)"
     if instr.mnemonic == "addi":
-        if not instr.uses:                          # addi rd, x0, imm  →  li
-            return "li"
         imm = instr.imm
-        if imm is None or imm < -16 or imm > 15:   # large immediate
+        small = imm is not None and -16 <= imm <= 15
+        if not instr.uses:                          # addi rd, x0, imm  →  li
+            return "li" if small else "li(big)"
+        if not small:                               # large immediate
             return "addi(big)"
         return "addi"
     return instr.mnemonic
