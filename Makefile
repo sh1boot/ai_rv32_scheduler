@@ -12,5 +12,8 @@ clean:
 %.out.s: %.s $(SOURCES)
 	python ./rv32_scheduler.py --same-base-reorder --opcode-tally $< > $@
 
+%.unpaired.s: %.out.s
+	sed "s/^.*# PAIR.*$$/----/" < $< | uniq > $@
+
 %.s: %.objdump rv32_objdump.py
 	python ./rv32_objdump.py $< > $@
