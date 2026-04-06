@@ -845,10 +845,11 @@ _OP_PAIR_TABLE: dict = {
     "maxu":   frozenset({"minu"}),
     "and":    frozenset({"andn"}),
     "andn":   frozenset({"and"}),
-    # mv (addi rd, rs, 0) and li (addi rd, x0, imm) both canonicalise to addi.
-    # mv+mv pairs two independent copies (any sources); li+li pairs two
-    # constant loads.  mv+li is excluded — handled by the rule directly.
-    "addi":   frozenset({"addi"}),
+    # mv (addi rd, rs, 0) and li (addi rd, x0, imm) both canonicalise to addi,
+    # but those cases are handled by the _is_mv/_is_li early return above and
+    # never reach the table.  addi is intentionally absent here so that general
+    # arithmetic addi instructions (non-zero imm, non-x0 source) do not
+    # spuriously match after register renaming makes two addis share a source.
 }
 
 
@@ -995,7 +996,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("pre_increment")
         if _is_mem_op(a):
             eligible.add("post_increment")
-        if a.mnemonic in _OP_PAIR_TABLE:
+        if a.mnemonic in _OP_PAIR_TABLE or _is_mv(a) or _is_li(a):
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
