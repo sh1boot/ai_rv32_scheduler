@@ -359,11 +359,24 @@ def _tally_label(instr: "Instruction") -> str:
     Loads and stores with sp (x2) as their base register use the qualified
     form ``mnemonic(sp)`` (e.g. ``lw(sp)``, ``sw(sp)``).  Stack-relative
     accesses are subject to different pairing constraints from heap/data
-    accesses and benefit from being counted separately.  All other
-    instructions return their plain mnemonic.
+    accesses and benefit from being counted separately.
+
+    ``addi`` is split into three forms:
+    - ``li``         — ``addi rd, x0, imm`` (x0 filtered → uses=[])
+    - ``addi(big)``  — ``addi`` with imm outside −16..+15
+    - ``addi``       — ``addi`` with small imm (−16..+15), includes mv (imm=0)
+
+    All other instructions return their plain mnemonic.
     """
     if instr.mem is not None and instr.mem[1] == "x2":
         return f"{instr.mnemonic}(sp)"
+    if instr.mnemonic == "addi":
+        if not instr.uses:                          # addi rd, x0, imm  →  li
+            return "li"
+        imm = instr.imm
+        if imm is None or imm < -16 or imm > 15:   # large immediate
+            return "addi(big)"
+        return "addi"
     return instr.mnemonic
 
 # ---------------------------------------------------------------------------
