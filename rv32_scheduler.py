@@ -277,23 +277,20 @@ class PairStats:
         row_w   = max((len(mn) for mn in row_ops), default=4)
         total_w = max(5, max((len(str(self.unpaired_opcode_tally.get(mn, 0)))
                                for mn in row_ops), default=1))
-        rvc_w   = max(3, max((len(str(self.unpaired_rvc_opcode_tally.get(mn, 0)))
-                               for mn in row_ops), default=1))
 
-        # Header line: total and rvc lead, then successor columns.
-        header = f"# {'':>{row_w}}  {'total':>{total_w}}  {'rvc':>{rvc_w}}"
+        # Header line: total leads, then successor columns (rvc hidden).
+        header = f"# {'':>{row_w}}  {'total':>{total_w}}"
         if col_ops:
             header += "  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
 
         lines.append("# unpaired opcode pair table"
-                     " (rows=unpaired, cols=successor, total/rvc+):")
+                     " (rows=unpaired, cols=successor, +total):")
         lines.append(header)
 
         # Data rows
         for mn_a in row_ops:
             total_cnt = self.unpaired_opcode_tally.get(mn_a, 0)
-            rvc_cnt   = self.unpaired_rvc_opcode_tally.get(mn_a, 0)
-            row = f"# {mn_a:<{row_w}}  {total_cnt:>{total_w}d}  {rvc_cnt:>{rvc_w}d}"
+            row = f"# {mn_a:<{row_w}}  {total_cnt:>{total_w}d}"
             if col_ops:
                 cells = []
                 for mn_b in col_ops:
@@ -1076,7 +1073,7 @@ def main():
     ap.add_argument("--grid-rows", type=int, default=20, metavar="N",
                     help="Number of rows in the --opcode-tally grid (default: 20)")
     _default_grid_cols = max(5, (shutil.get_terminal_size(fallback=(80, 24)).columns
-                                 - 20) // 10)
+                                 - 20) * 3 // 20)
     ap.add_argument("--grid-cols", type=int, default=_default_grid_cols, metavar="N",
                     help=f"Number of successor columns in the --opcode-tally grid "
                          f"(default: {_default_grid_cols}, derived from terminal width)")
