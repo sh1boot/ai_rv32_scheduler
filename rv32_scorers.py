@@ -1022,30 +1022,45 @@ COMPACT32_RULES: list = [
     ("addi_branch",         _rule_addi_branch),
 ]
 
+# Secondary rules: opt-in via CLI flags, tried only after all primary rules
+# have failed.  They cannot displace primary-rule pairs.  Intended for
+# statistics gathering — to quantify how many additional pairs a candidate
+# rule would create without committing it to the main rule set.
+#
+# Each entry is (name, rule_fn).  The CLI flag is --<name with _ replaced by ->.
+# Multiple secondary rules can be enabled; their relative priority on the
+# command line determines evaluation order.
+SECONDARY_RULES: list = [
+    ("arith_mem", _rule_arith_mem),
+]
+
 
 # ---------------------------------------------------------------------------
 # Compact-32 scorer factory
 # ---------------------------------------------------------------------------
 
 def make_compact32_scorer(liveness: dict,
-                          arith_mem: bool = False) -> "PairScoreFn":
+                          secondary_rules: "list[str]" = []) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
     The scorer holds its liveness reference in a mutable cell so that
     the streaming processor can refresh it per block after renaming.
 
-    arith_mem
-        If True, enable the experimental arith_mem rule: arithmetic in RSD
-        form (x0..x15) paired before a load/store with a small aligned offset.
-        Off by default; enable with ``--arith-mem``.
+    secondary_rules
+        Ordered list of secondary rule names to activate (see SECONDARY_RULES).
+        Each name corresponds to a rule that is tried only after all primary
+        rules have failed.  Order matches CLI flag order.  Enable individual
+        rules with their corresponding ``--<rule-name>`` flags.
     """
     cell: list = [liveness]
 
-    rules: list = list(COMPACT32_RULES)
-    if arith_mem:
-        idx = next(i for i, (n, _) in enumerate(rules) if n == "dual_arith_chain")
-        rules.insert(idx, ("arith_mem", _rule_arith_mem))
+    _sec_by_name = {name: fn for name, fn in SECONDARY_RULES}
+    active_secondary: list = [
+        (name, _sec_by_name[name])
+        for name in secondary_rules
+        if name in _sec_by_name
+    ]
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
@@ -1080,8 +1095,6 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
-        if arith_mem and _is_arith_mem_a(a):
-            eligible.add("arith_mem")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
@@ -1103,11 +1116,14 @@ def make_compact32_scorer(liveness: dict,
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0
         elig = _get_eligible(a)
-        if not elig:
-            return 0.0
-        for _name, rule in rules:
-            if _name in elig and rule(a, b, cell[0]):
-                return 1.0
+        if elig:
+            for _name, rule in COMPACT32_RULES:
+                if _name in elig and rule(a, b, cell[0]):
+                    return 1.0
+        if active_secondary:
+            for _name, rule in active_secondary:
+                if rule(a, b, cell[0]):
+                    return 1.0
         return 0.0
 
     def _describe(a: "Instruction", b: "Instruction") -> str:
@@ -1117,12 +1133,15 @@ def make_compact32_scorer(liveness: dict,
         for name, rule in COMPACT32_RULES:
             if name in elig and rule(a, b, cell[0]):
                 return name
+        for name, rule in active_secondary:
+            if rule(a, b, cell[0]):
+                return name
         return ""
 
     _score._liveness_cell = cell
     _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
     _score._describe_pair = _describe
-    _score._rule_list = rules
+    _score._rule_list     = list(COMPACT32_RULES) + active_secondary
     return _score
 
 

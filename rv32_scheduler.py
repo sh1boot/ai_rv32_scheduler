@@ -30,7 +30,8 @@ from rv32_analysis import (
     _classify_labels, build_cfg_liveness, _LABEL_DEF,
 )
 from rv32_scorers import (
-    PairScoreFn, can_compress, _compress_pair_score, COMPACT32_RULES, SCORERS,
+    PairScoreFn, can_compress, _compress_pair_score,
+    COMPACT32_RULES, SECONDARY_RULES, SCORERS,
     make_compact32_scorer, _MEM_WIDTH,
 )
 from rv32_rename import (
@@ -1259,12 +1260,20 @@ def main():
                     help="Include large-immediate variants (labels ending in "
                          "'(big)'), lui, and auipc in the --opcode-tally grid. "
                          "Hidden by default to focus on compact-encodable forms.")
-    ap.add_argument("--arith-mem", action="store_true",
-                    help="(Experimental) Enable the arith_mem pairing rule: "
-                         "arithmetic in RSD form (x0..x15, addi imm -64..63) "
-                         "followed by a load/store with offset 0..3× access "
-                         "width. Off by default. Only applies with --scorer "
-                         "compact32.")
+    _sec_rule_names = {name: f"--{name.replace('_', '-')}"
+                       for name, _ in SECONDARY_RULES}
+    for _sec_name, _sec_flag in _sec_rule_names.items():
+        _sec_fn = next(fn for n, fn in SECONDARY_RULES if n == _sec_name)
+        _sec_doc = (_sec_fn.__doc__ or "").strip().splitlines()[0]
+        ap.add_argument(
+            _sec_flag,
+            dest="secondary_rules",
+            action="append_const",
+            const=_sec_name,
+            default=[],
+            help=f"(Secondary rule) {_sec_doc}  Only applies with "
+                 f"--scorer compact32; evaluated after all primary rules fail.",
+        )
     ap.add_argument("--chain-reorder", action="store_true",
                     help="(Experimental) After scheduling, reorder unpaired "
                          "singleton instructions within each run to maximise "
@@ -1296,6 +1305,12 @@ def main():
         for name, fn in COMPACT32_RULES:
             doc = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:26s}  {doc}")
+        print()
+        print("compact32 secondary rules (opt-in, after primary rules fail):")
+        for name, fn in SECONDARY_RULES:
+            flag = f"--{name.replace('_', '-')}"
+            doc  = (fn.__doc__ or "").strip().splitlines()[0]
+            print(f"  {name:26s}  {flag:16s}  {doc}")
         return
 
     if args.scorer not in SCORERS:
@@ -1311,7 +1326,8 @@ def main():
 
     factory, _ = SCORERS[args.scorer]
     if args.scorer == "compact32":
-        pair_score = make_compact32_scorer({}, arith_mem=args.arith_mem)
+        pair_score = make_compact32_scorer(
+            {}, secondary_rules=args.secondary_rules or [])
     else:
         pair_score = factory()
 
