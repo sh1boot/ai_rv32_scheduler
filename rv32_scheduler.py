@@ -42,7 +42,7 @@ from rv32_rename import (
     _swap_raw, _apply_rename, _undo_rename,
     rename_destinations, count_pairs,
 )
-from rv32_bnb import _bnb_schedule, _BNB_WINDOW
+from rv32_bnb import _bnb_schedule, _bnb_schedule_window, _BNB_WINDOW
 
 @dataclass
 class PairStats:
@@ -160,7 +160,7 @@ class PairStats:
 
     def summary_lines(self, opcode_tally: bool = False,
                       grid_rows: int = 20, grid_cols: int = 20,
-                      show_big: bool = False) -> list:
+                      tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"})) -> list:
         """Return comment lines suitable for appending to assembly output.
 
         opcode_tally: when True, append the singleton opcode-pair tally and
@@ -233,7 +233,7 @@ class PairStats:
         )
         if opcode_tally and self.secondary_singleton_tally:
             lines.extend(self._opcode_tally_lines(
-                grid_rows=grid_rows, grid_cols=grid_cols, show_big=show_big,
+                grid_rows=grid_rows, grid_cols=grid_cols, tally_exclude=tally_exclude,
                 singleton_tally=self.secondary_singleton_tally,
                 opcode_tally=self.secondary_opcode_tally,
                 header="secondary rule opcode pair table"
@@ -241,11 +241,11 @@ class PairStats:
         if opcode_tally:
             lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
                                                    grid_cols=grid_cols,
-                                                   show_big=show_big))
+                                                   tally_exclude=tally_exclude))
         return lines
 
     def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
-                            show_big: bool = False,
+                            tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
                             singleton_tally: "dict | None" = None,
                             opcode_tally: "dict | None" = None,
                             header: str = "unpaired opcode pair table"
@@ -260,8 +260,14 @@ class PairStats:
 
         Rows are the top *grid_rows* opcodes by total count (descending).
         One fixed leading column shows the ``total``; the remaining *grid_cols*
-        columns are the most frequent B-side opcodes.  When *show_big* is
-        False (default), ``(big)`` labels and ``auipc``/``lui`` are excluded.
+        columns are the most frequent B-side opcodes.
+
+        tally_exclude
+            Set of category names to hide from the table.  Recognised tokens:
+            ``"big"``   — labels ending in ``(big)``
+            ``"lui"``   — the ``lui`` mnemonic
+            ``"auipc"`` — the ``auipc`` mnemonic
+            Default excludes all three.  Pass an empty frozenset to show all.
         """
         st = self.singleton_tally   if singleton_tally is None else singleton_tally
         ot = self.unpaired_opcode_tally if opcode_tally is None else opcode_tally
@@ -271,12 +277,16 @@ class PairStats:
         lines = []
 
         def _exclude(mn: str) -> bool:
-            return not show_big and (mn.endswith("(big)")
-                                     or mn in ("auipc", "lui"))
+            if "big" in tally_exclude and mn.endswith("(big)"):
+                return True
+            if mn in tally_exclude:   # covers "lui" and "auipc" directly
+                return True
+            return False
 
-        all_mn     = set(ot)
-        visible_mn = [mn for mn in all_mn if not _exclude(mn)]
-        row_ops    = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
+        all_mn      = set(ot)
+        actual_total = sum(ot.values())
+        visible_mn  = [mn for mn in all_mn if not _exclude(mn)]
+        row_ops     = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
 
         tbl = {(a, b): c for (a, b), c in st.items()}
 
@@ -287,18 +297,21 @@ class PairStats:
                       sorted(col_totals_all.items(), key=lambda kv: -kv[1])[:grid_cols]]
         col_totals = {mn_b: col_totals_all[mn_b] for mn_b in col_ops}
         grand_total = sum(ot.get(mn, 0) for mn in visible_mn)
+        hidden      = actual_total - grand_total
 
         col_w   = max((len(mn) for mn in col_ops), default=4)
         row_w   = max((len(mn) for mn in row_ops), default=4)
         total_w = max(5, max((len(str(ot.get(mn, 0))) for mn in row_ops), default=1))
-        total_w = max(total_w, len(str(grand_total)))
+        total_w = max(total_w, len(str(actual_total)))
 
         lines.append(f"# {header}")
+        if hidden:
+            lines.append(f"#   ({hidden} of {actual_total} hidden — use --tally-exclude= to see all)")
         lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
                      + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
                         if col_ops else ""))
 
-        tot_row = f"# {'':>{row_w}}  {grand_total:>{total_w}d}"
+        tot_row = f"# {'':>{row_w}}  {actual_total:>{total_w}d}"
         if col_ops:
             tot_row += "  " + "  ".join(
                 f"{col_totals[mn_b]:>{col_w}d}" if col_totals[mn_b]
@@ -459,6 +472,16 @@ def _tally_label(instr: "Instruction") -> str:
     return f"{mn}(big)" if big else mn
 
 
+def _tally_excluded(instr: "Instruction", tally_exclude: "frozenset[str]") -> bool:
+    """Return True if *instr* would be excluded from opcode-tally tables."""
+    if not tally_exclude:
+        return False
+    mn = _tally_label(instr)
+    if "big" in tally_exclude and mn.endswith("(big)"):
+        return True
+    return mn in tally_exclude   # e.g. "lui", "auipc"
+
+
 # ---------------------------------------------------------------------------
 # Chain-reorder helpers
 # ---------------------------------------------------------------------------
@@ -569,6 +592,55 @@ def _chain_reorder_singletons(
     return result
 
 
+def _secondary_bnb_reorder(
+    real_scheduled:     list,
+    pair_start_set:     set,
+    pair_end_set:       set,
+    graph:              "DepGraph",
+    secondary_rule_list: list,
+    liveness_snap:      dict,
+    tally_exclude:      "frozenset[str]",
+) -> list:
+    """
+    Re-run BnB on each singleton run using secondary rules as the score.
+
+    After the primary greedy walk has fixed all primary pairs, each maximal
+    run of consecutive unpaired instructions is independently rescheduled
+    via ``_bnb_schedule_window`` with a scorer built from *secondary_rule_list*.
+    Paired positions are left untouched.
+
+    This gives secondary rules the same BnB advantage that primary rules
+    receive, producing a fairer estimate of how many pairs a candidate rule
+    would achieve if promoted to primary.
+    """
+    def _secondary_score(a: "Instruction", b: "Instruction") -> float:
+        if _tally_excluded(a, tally_exclude) or _tally_excluded(b, tally_exclude):
+            return 0.0
+        for _name, fn in secondary_rule_list:
+            if fn(a, b, liveness_snap):
+                return 1.0
+        return 0.0
+
+    result: list = []
+    run:    list = []
+
+    def _flush_run():
+        if len(run) >= 2:
+            result.extend(_bnb_schedule_window(run, graph, _secondary_score))
+        else:
+            result.extend(run)
+        run.clear()
+
+    for pos, instr in enumerate(real_scheduled):
+        if pos in pair_start_set or pos in pair_end_set:
+            _flush_run()
+            result.append(instr)
+        else:
+            run.append(instr)
+    _flush_run()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ABI-based block boundary liveness
 # ---------------------------------------------------------------------------
@@ -645,8 +717,10 @@ def _process_block(
     is_function_entry: bool = False,
     block_live_in:     frozenset = frozenset(),
     cfg_live_out:      frozenset = frozenset(),
-    same_base_reorder: bool = False,
-    chain_reorder:     bool = False,
+    same_base_reorder:    bool = False,
+    chain_reorder:        bool = False,
+    secondary_bnb_reorder: bool = False,
+    tally_exclude:        "frozenset[str]" = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -797,6 +871,16 @@ def _process_block(
                     continue
         i += 1
 
+    # ── Optional BnB reorder of singleton runs for secondary rules ───────
+    # Reschedule each singleton run using secondary rules as the score so
+    # that secondary rules get the same BnB advantage as primary rules.
+    # Paired positions are left untouched; only unpaired runs are reordered.
+    if secondary_bnb_reorder and secondary_rule_list:
+        real_scheduled = _secondary_bnb_reorder(
+            real_scheduled, pair_start_set, pair_end_set,
+            graph, secondary_rule_list, liveness_snap, tally_exclude)
+        real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
+
     # ── Secondary rule scan: positions left unpaired by the primary walk ──
     # Secondary rules run on a fully-settled primary schedule, so they
     # cannot displace primary pairs or affect BnB scheduling.  They only
@@ -812,6 +896,10 @@ def _process_block(
                     and i + 1 not in pair_start_set
                     and i + 1 not in pair_end_set):
                 a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
+                if (_tally_excluded(a_s, tally_exclude)
+                        or _tally_excluded(b_s, tally_exclude)):
+                    i += 1
+                    continue
                 matching_secondary = [rn for rn, rf in secondary_rule_list
                                       if rf(a_s, b_s, liveness_snap)]
                 if matching_secondary:
@@ -982,11 +1070,12 @@ class AssemblyScheduler:
         opcode_tally:       bool = False,
         out                      = None,
         verbose:            bool = False,
-        same_base_reorder:  bool = False,
-        chain_reorder:      bool = False,
+        same_base_reorder:      bool = False,
+        chain_reorder:          bool = False,
+        secondary_bnb_reorder:  bool = False,
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
-        show_big:           bool = False,
+        tally_exclude:      "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -1068,8 +1157,10 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
-                same_base_reorder  = same_base_reorder,
-                chain_reorder      = chain_reorder,
+                same_base_reorder      = same_base_reorder,
+                chain_reorder          = chain_reorder,
+                secondary_bnb_reorder  = secondary_bnb_reorder,
+                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1136,8 +1227,10 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
-                same_base_reorder  = same_base_reorder,
-                chain_reorder      = chain_reorder,
+                same_base_reorder      = same_base_reorder,
+                chain_reorder          = chain_reorder,
+                secondary_bnb_reorder  = secondary_bnb_reorder,
+                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1255,7 +1348,7 @@ class AssemblyScheduler:
         for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
                                                   grid_rows=grid_rows,
                                                   grid_cols=grid_cols,
-                                                  show_big=show_big):
+                                                  tally_exclude=tally_exclude):
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1303,30 +1396,50 @@ def main():
                     help="Append a ranked tally of unpaired opcode combinations "
                          "to the output and stderr report. Use this to identify "
                          "the best candidates for new pairing rules.")
-    ap.add_argument("--show-big", action="store_true",
-                    help="Include large-immediate variants (labels ending in "
-                         "'(big)'), lui, and auipc in the --opcode-tally grid. "
-                         "Hidden by default to focus on compact-encodable forms.")
-    _sec_rule_names = {name: f"--{name.replace('_', '-')}"
-                       for name, _ in SECONDARY_RULES}
-    for _sec_name, _sec_flag in _sec_rule_names.items():
-        _sec_fn = next(fn for n, fn in SECONDARY_RULES if n == _sec_name)
-        _sec_doc = (_sec_fn.__doc__ or "").strip().splitlines()[0]
-        ap.add_argument(
-            _sec_flag,
-            dest="secondary_rules",
-            action="append_const",
-            const=_sec_name,
-            default=[],
-            help=f"(Secondary rule) {_sec_doc}  Only applies with "
-                 f"--scorer compact32; evaluated after all primary rules fail.",
-        )
+    _tally_exclude_default = "big,lui,auipc"
+    ap.add_argument("--tally-exclude",
+                    default=_tally_exclude_default,
+                    metavar="CATEGORIES",
+                    help="Comma-separated list of opcode categories to hide from "
+                         "--opcode-tally tables.  Recognised tokens: "
+                         "big (labels ending in '(big)'), lui, auipc.  "
+                         f"Default: {_tally_exclude_default!r}.  "
+                         "Pass an empty string to show all entries.")
+    ap.add_argument("--wide-dual-arith", action="store_true",
+                    help="Relax the dual-arith register constraint from x0..x15 "
+                         "to all 32 integer registers.  Quantifies the pairing "
+                         "gain if the encoding were extended to 5-bit register "
+                         "fields for the dual-arith rule family.")
+    _sec_valid = [name for name, _ in SECONDARY_RULES]
+    _sec_default = ",".join(_sec_valid)
+    _sec_doc_lines = [
+        f"  {name}: {(fn.__doc__ or '').strip().splitlines()[0]}"
+        for name, fn in SECONDARY_RULES
+    ]
+    ap.add_argument(
+        "--secondary",
+        dest="secondary_rules",
+        default=_sec_default,
+        metavar="RULES",
+        help=f"Comma-separated list of secondary rules to enable, in priority order. "
+             f"Evaluated after all primary rules fail; never displaces primary pairs. "
+             f"Default: all rules in their natural order. "
+             f"Pass an empty string to disable all secondary rules. "
+             f"Valid names (use hyphens or underscores): "
+             + ", ".join(_sec_valid),
+    )
     ap.add_argument("--chain-reorder", action="store_true",
                     help="(Experimental) After scheduling, reorder unpaired "
                          "singleton instructions within each run to maximise "
                          "producer-consumer adjacency.  Updates the opcode-tally "
                          "table to reflect the reordered sequence, helping identify "
                          "instruction pairs that naturally follow each other.")
+    ap.add_argument("--secondary-reorder", action="store_true",
+                    help="(Experimental) Before the secondary rule scan, re-run BnB "
+                         "on each singleton run using secondary rules as the score "
+                         "function.  Gives secondary rules the same scheduling "
+                         "advantage as primary rules, producing a fairer estimate of "
+                         "how many pairs a candidate rule would achieve if promoted.")
     ap.add_argument("--same-base-reorder", action="store_true",
                     help="(Experimental) Allow loads/stores to reorder past each "
                          "other when they share the same base register, the base "
@@ -1360,6 +1473,10 @@ def main():
             print(f"  {name:26s}  {flag:16s}  {doc}")
         return
 
+    args.tally_exclude = frozenset(
+        t.strip() for t in args.tally_exclude.split(",") if t.strip()
+    )
+
     if args.scorer not in SCORERS:
         ap.error(f"Unknown scorer {args.scorer!r}. "
                  f"Available: {list(SCORERS)}")
@@ -1373,8 +1490,21 @@ def main():
 
     factory, _ = SCORERS[args.scorer]
     if args.scorer == "compact32":
+        _sec_by_name = {name: name for name, _ in SECONDARY_RULES}
+        _sec_by_name.update({name.replace("_", "-"): name for name, _ in SECONDARY_RULES})
+        _sec_requested = []
+        for _tok in (t.strip() for t in args.secondary_rules.split(",")):
+            if not _tok:
+                continue
+            if _tok in _sec_by_name:
+                _sec_requested.append(_sec_by_name[_tok])
+            else:
+                print(f"warning: unknown secondary rule {_tok!r}; "
+                      f"valid names: {', '.join(n for n, _ in SECONDARY_RULES)}",
+                      file=sys.stderr)
         pair_score = make_compact32_scorer(
-            {}, secondary_rules=args.secondary_rules or [])
+            {}, secondary_rules=_sec_requested,
+            wide_dual_arith=args.wide_dual_arith)
     else:
         pair_score = factory()
 
@@ -1386,10 +1516,11 @@ def main():
         out               = sys.stdout,
         verbose           = args.verbose,
         same_base_reorder = args.same_base_reorder,
-        chain_reorder     = args.chain_reorder,
+        chain_reorder          = args.chain_reorder,
+        secondary_bnb_reorder  = args.secondary_reorder,
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
-        show_big          = args.show_big,
+        tally_exclude     = args.tally_exclude,
     )
 
     if sched.last_stats is not None:
@@ -1399,7 +1530,7 @@ def main():
         for line in st.summary_lines(opcode_tally=args.opcode_tally,
                                      grid_rows=args.grid_rows,
                                      grid_cols=args.grid_cols,
-                                     show_big=args.show_big):
+                                     tally_exclude=args.tally_exclude):
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
