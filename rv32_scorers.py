@@ -722,9 +722,9 @@ def _rule_dual_arith(a: "Instruction", b: "Instruction",
 # all in RSD form (rs1 == rd) with all registers in x0..x15.
 _ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
 
-def _is_arith_mem_b(instr: "Instruction") -> bool:
+def _is_arith_mem_a(instr: "Instruction") -> bool:
     """
-    True if *instr* qualifies as the B slot of a mem_arith pair.
+    True if *instr* qualifies as the A slot of an arith_mem pair.
 
     Constraints:
     - mnemonic in {addi, add, sub, and, or}
@@ -766,24 +766,25 @@ def _mem_small_offset_ok(instr: "Instruction") -> bool:
     return width != 0 and off % width == 0 and off <= 3 * width
 
 
-def _rule_mem_arith(a: "Instruction", b: "Instruction",
+def _rule_arith_mem(a: "Instruction", b: "Instruction",
                     liveness: dict) -> bool:
     """
-    Load or store with a small aligned offset followed by arithmetic in RSD form.
+    Arithmetic (RSD form, x0..x15 regs) followed by a load or store with a
+    small aligned offset (0 .. 3 × access width).
 
-    A slot: any load or store whose offset is a non-negative multiple of its
-        access width and fits in a 2-bit scaled field (0, 1×w, 2×w, 3×w).
-
-    B slot: addi rsd, rsd, imm  (imm in -64..63)
+    A slot: addi rsd, rsd, imm  (imm in -64..63)
          or add / sub / and / or  rsd, rsd, rs2
          all registers in x0..x15.
+
+    B slot: any load or store whose offset is a non-negative multiple of its
+        access width and fits in a 2-bit scaled field (0, 1×w, 2×w, 3×w).
 
     No producer-consumer relationship between A and B is required — the
     pairing is structural, encoding two independent operations together.
     The dep graph still prevents scheduling A before B when a true dependency
     exists.
     """
-    return _mem_small_offset_ok(a) and _is_arith_mem_b(b)
+    return _is_arith_mem_a(a) and _mem_small_offset_ok(b)
 
 
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
@@ -1015,7 +1016,6 @@ COMPACT32_RULES: list = [
     ("op_pair",             _rule_op_pair),
     ("op_pair_chain",       _rule_op_pair_chain),
     ("dual_arith",          _rule_dual_arith),
-    ("mem_arith",           _rule_mem_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_jump",          _rule_arith_jump),
     ("arith_branch",        _rule_arith_branch),
@@ -1027,14 +1027,25 @@ COMPACT32_RULES: list = [
 # Compact-32 scorer factory
 # ---------------------------------------------------------------------------
 
-def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
+def make_compact32_scorer(liveness: dict,
+                          arith_mem: bool = False) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
     The scorer holds its liveness reference in a mutable cell so that
     the streaming processor can refresh it per block after renaming.
+
+    arith_mem
+        If True, enable the experimental arith_mem rule: arithmetic in RSD
+        form (x0..x15) paired before a load/store with a small aligned offset.
+        Off by default; enable with ``--arith-mem``.
     """
     cell: list = [liveness]
+
+    rules: list = list(COMPACT32_RULES)
+    if arith_mem:
+        idx = next(i for i, (n, _) in enumerate(rules) if n == "dual_arith_chain")
+        rules.insert(idx, ("arith_mem", _rule_arith_mem))
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
@@ -1069,8 +1080,8 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
-        if _mem_small_offset_ok(a):
-            eligible.add("mem_arith")
+        if arith_mem and _is_arith_mem_a(a):
+            eligible.add("arith_mem")
         if _dual_arith_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
@@ -1094,7 +1105,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         elig = _get_eligible(a)
         if not elig:
             return 0.0
-        for _name, rule in COMPACT32_RULES:
+        for _name, rule in rules:
             if _name in elig and rule(a, b, cell[0]):
                 return 1.0
         return 0.0
@@ -1111,7 +1122,7 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
     _score._liveness_cell = cell
     _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
     _score._describe_pair = _describe
-    _score._rule_list = COMPACT32_RULES
+    _score._rule_list = rules
     return _score
 
 

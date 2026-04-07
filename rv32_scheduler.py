@@ -1259,6 +1259,12 @@ def main():
                     help="Include large-immediate variants (labels ending in "
                          "'(big)'), lui, and auipc in the --opcode-tally grid. "
                          "Hidden by default to focus on compact-encodable forms.")
+    ap.add_argument("--arith-mem", action="store_true",
+                    help="(Experimental) Enable the arith_mem pairing rule: "
+                         "arithmetic in RSD form (x0..x15, addi imm -64..63) "
+                         "followed by a load/store with offset 0..3× access "
+                         "width. Off by default. Only applies with --scorer "
+                         "compact32.")
     ap.add_argument("--chain-reorder", action="store_true",
                     help="(Experimental) After scheduling, reorder unpaired "
                          "singleton instructions within each run to maximise "
@@ -1304,7 +1310,10 @@ def main():
     sched = AssemblyScheduler(source)
 
     factory, _ = SCORERS[args.scorer]
-    pair_score = factory()
+    if args.scorer == "compact32":
+        pair_score = make_compact32_scorer({}, arith_mem=args.arith_mem)
+    else:
+        pair_score = factory()
 
     # Stream output directly to stdout; summary printed at end of process().
     sched.process(
