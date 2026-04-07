@@ -274,9 +274,10 @@ class PairStats:
             return not show_big and (mn.endswith("(big)")
                                      or mn in ("auipc", "lui"))
 
-        all_mn     = set(ot)
-        visible_mn = [mn for mn in all_mn if not _exclude(mn)]
-        row_ops    = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
+        all_mn      = set(ot)
+        actual_total = sum(ot.values())
+        visible_mn  = [mn for mn in all_mn if not _exclude(mn)]
+        row_ops     = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
 
         tbl = {(a, b): c for (a, b), c in st.items()}
 
@@ -287,18 +288,21 @@ class PairStats:
                       sorted(col_totals_all.items(), key=lambda kv: -kv[1])[:grid_cols]]
         col_totals = {mn_b: col_totals_all[mn_b] for mn_b in col_ops}
         grand_total = sum(ot.get(mn, 0) for mn in visible_mn)
+        hidden      = actual_total - grand_total
 
         col_w   = max((len(mn) for mn in col_ops), default=4)
         row_w   = max((len(mn) for mn in row_ops), default=4)
         total_w = max(5, max((len(str(ot.get(mn, 0))) for mn in row_ops), default=1))
-        total_w = max(total_w, len(str(grand_total)))
+        total_w = max(total_w, len(str(actual_total)))
 
         lines.append(f"# {header}")
+        if hidden:
+            lines.append(f"#   ({hidden} of {actual_total} hidden — use --show-big to see all)")
         lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
                      + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
                         if col_ops else ""))
 
-        tot_row = f"# {'':>{row_w}}  {grand_total:>{total_w}d}"
+        tot_row = f"# {'':>{row_w}}  {actual_total:>{total_w}d}"
         if col_ops:
             tot_row += "  " + "  ".join(
                 f"{col_totals[mn_b]:>{col_w}d}" if col_totals[mn_b]
