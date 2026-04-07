@@ -42,7 +42,7 @@ from rv32_rename import (
     _swap_raw, _apply_rename, _undo_rename,
     rename_destinations, count_pairs,
 )
-from rv32_bnb import _bnb_schedule, _BNB_WINDOW
+from rv32_bnb import _bnb_schedule, _bnb_schedule_window, _BNB_WINDOW
 
 @dataclass
 class PairStats:
@@ -592,6 +592,55 @@ def _chain_reorder_singletons(
     return result
 
 
+def _secondary_bnb_reorder(
+    real_scheduled:     list,
+    pair_start_set:     set,
+    pair_end_set:       set,
+    graph:              "DepGraph",
+    secondary_rule_list: list,
+    liveness_snap:      dict,
+    tally_exclude:      "frozenset[str]",
+) -> list:
+    """
+    Re-run BnB on each singleton run using secondary rules as the score.
+
+    After the primary greedy walk has fixed all primary pairs, each maximal
+    run of consecutive unpaired instructions is independently rescheduled
+    via ``_bnb_schedule_window`` with a scorer built from *secondary_rule_list*.
+    Paired positions are left untouched.
+
+    This gives secondary rules the same BnB advantage that primary rules
+    receive, producing a fairer estimate of how many pairs a candidate rule
+    would achieve if promoted to primary.
+    """
+    def _secondary_score(a: "Instruction", b: "Instruction") -> float:
+        if _tally_excluded(a, tally_exclude) or _tally_excluded(b, tally_exclude):
+            return 0.0
+        for _name, fn in secondary_rule_list:
+            if fn(a, b, liveness_snap):
+                return 1.0
+        return 0.0
+
+    result: list = []
+    run:    list = []
+
+    def _flush_run():
+        if len(run) >= 2:
+            result.extend(_bnb_schedule_window(run, graph, _secondary_score))
+        else:
+            result.extend(run)
+        run.clear()
+
+    for pos, instr in enumerate(real_scheduled):
+        if pos in pair_start_set or pos in pair_end_set:
+            _flush_run()
+            result.append(instr)
+        else:
+            run.append(instr)
+    _flush_run()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ABI-based block boundary liveness
 # ---------------------------------------------------------------------------
@@ -668,9 +717,10 @@ def _process_block(
     is_function_entry: bool = False,
     block_live_in:     frozenset = frozenset(),
     cfg_live_out:      frozenset = frozenset(),
-    same_base_reorder: bool = False,
-    chain_reorder:     bool = False,
-    tally_exclude:     "frozenset[str]" = frozenset(),
+    same_base_reorder:    bool = False,
+    chain_reorder:        bool = False,
+    secondary_bnb_reorder: bool = False,
+    tally_exclude:        "frozenset[str]" = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -820,6 +870,16 @@ def _process_block(
                     i += 2
                     continue
         i += 1
+
+    # ── Optional BnB reorder of singleton runs for secondary rules ───────
+    # Reschedule each singleton run using secondary rules as the score so
+    # that secondary rules get the same BnB advantage as primary rules.
+    # Paired positions are left untouched; only unpaired runs are reordered.
+    if secondary_bnb_reorder and secondary_rule_list:
+        real_scheduled = _secondary_bnb_reorder(
+            real_scheduled, pair_start_set, pair_end_set,
+            graph, secondary_rule_list, liveness_snap, tally_exclude)
+        real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
 
     # ── Secondary rule scan: positions left unpaired by the primary walk ──
     # Secondary rules run on a fully-settled primary schedule, so they
@@ -1010,8 +1070,9 @@ class AssemblyScheduler:
         opcode_tally:       bool = False,
         out                      = None,
         verbose:            bool = False,
-        same_base_reorder:  bool = False,
-        chain_reorder:      bool = False,
+        same_base_reorder:      bool = False,
+        chain_reorder:          bool = False,
+        secondary_bnb_reorder:  bool = False,
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
         tally_exclude:      "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
@@ -1096,9 +1157,10 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
-                same_base_reorder  = same_base_reorder,
-                chain_reorder      = chain_reorder,
-                tally_exclude      = tally_exclude,
+                same_base_reorder      = same_base_reorder,
+                chain_reorder          = chain_reorder,
+                secondary_bnb_reorder  = secondary_bnb_reorder,
+                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1165,9 +1227,10 @@ class AssemblyScheduler:
                 block_live_in      = current_block_live_in,
                 cfg_live_out       = cfg_live_out_table.get(current_block_label,
                                                             frozenset()),
-                same_base_reorder  = same_base_reorder,
-                chain_reorder      = chain_reorder,
-                tally_exclude      = tally_exclude,
+                same_base_reorder      = same_base_reorder,
+                chain_reorder          = chain_reorder,
+                secondary_bnb_reorder  = secondary_bnb_reorder,
+                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1371,6 +1434,12 @@ def main():
                          "producer-consumer adjacency.  Updates the opcode-tally "
                          "table to reflect the reordered sequence, helping identify "
                          "instruction pairs that naturally follow each other.")
+    ap.add_argument("--secondary-reorder", action="store_true",
+                    help="(Experimental) Before the secondary rule scan, re-run BnB "
+                         "on each singleton run using secondary rules as the score "
+                         "function.  Gives secondary rules the same scheduling "
+                         "advantage as primary rules, producing a fairer estimate of "
+                         "how many pairs a candidate rule would achieve if promoted.")
     ap.add_argument("--same-base-reorder", action="store_true",
                     help="(Experimental) Allow loads/stores to reorder past each "
                          "other when they share the same base register, the base "
@@ -1447,7 +1516,8 @@ def main():
         out               = sys.stdout,
         verbose           = args.verbose,
         same_base_reorder = args.same_base_reorder,
-        chain_reorder     = args.chain_reorder,
+        chain_reorder          = args.chain_reorder,
+        secondary_bnb_reorder  = args.secondary_reorder,
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
         tally_exclude     = args.tally_exclude,
