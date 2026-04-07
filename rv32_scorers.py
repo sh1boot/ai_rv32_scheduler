@@ -718,6 +718,75 @@ def _rule_dual_arith(a: "Instruction", b: "Instruction",
     return a.dual_arith_ok and b.dual_arith_ok
 
 
+# Arithmetic group for arith_mem: addi (6-bit imm), add, sub, and, or;
+# all in RSD form (rs1 == rd) with all registers in x0..x15.
+_ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
+
+def _is_arith_mem_a(instr: "Instruction") -> bool:
+    """
+    True if *instr* qualifies as the A slot of an arith_mem pair.
+
+    Constraints:
+    - mnemonic in {addi, add, sub, and, or}
+    - RSD form: rs1 == rd
+    - all registers (rd, rs1, rs2) in x0..x15
+    - addi: immediate in -64..63
+    """
+    mn = instr.mnemonic
+    if mn not in _ARITH_MEM_MN:
+        return False
+    rd = instr.defs[0] if instr.defs else None
+    if rd is None or rd not in _REG4:
+        return False
+    if not instr.uses or instr.uses[0] != rd:   # rsd constraint
+        return False
+    if mn == "addi":
+        imm = instr.imm
+        return imm is not None and -64 <= imm <= 63
+    else:
+        # add, sub, and, or: rs2 must also be in x0..x15
+        rs2 = instr.uses[1] if len(instr.uses) > 1 else None
+        return rs2 is not None and rs2 in _REG4
+
+
+def _mem_small_offset_ok(instr: "Instruction") -> bool:
+    """
+    True if *instr* is a load or store with an aligned offset in
+    0 .. 3 × access_width (i.e., a 2-bit scaled field).
+    """
+    if instr.mnemonic not in _MEM_OPS:
+        return False
+    mem = instr.mem
+    if mem is None:
+        return False
+    off, _base = mem
+    if off is None or off < 0:
+        return False
+    width = _MEM_WIDTH.get(instr.mnemonic, 0)
+    return width != 0 and off % width == 0 and off <= 3 * width
+
+
+def _rule_arith_mem(a: "Instruction", b: "Instruction",
+                    liveness: dict) -> bool:
+    """
+    Arithmetic (RSD form, x0..x15 regs) followed by a load or store with a
+    small aligned offset (0 .. 3 × access width).
+
+    A slot: addi rsd, rsd, imm  (imm in -64..63)
+         or add / sub / and / or  rsd, rsd, rs2
+         all registers in x0..x15.
+
+    B slot: any load or store whose offset is a non-negative multiple of its
+        access width and fits in a 2-bit scaled field (0, 1×w, 2×w, 3×w).
+
+    No producer-consumer relationship between A and B is required — the
+    pairing is structural, encoding two independent operations together.
+    The dep graph still prevents scheduling A before B when a true dependency
+    exists.
+    """
+    return _is_arith_mem_a(a) and _mem_small_offset_ok(b)
+
+
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
                             liveness: dict) -> bool:
     """
@@ -953,19 +1022,45 @@ COMPACT32_RULES: list = [
     ("addi_branch",         _rule_addi_branch),
 ]
 
+# Secondary rules: opt-in via CLI flags, tried only after all primary rules
+# have failed.  They cannot displace primary-rule pairs.  Intended for
+# statistics gathering — to quantify how many additional pairs a candidate
+# rule would create without committing it to the main rule set.
+#
+# Each entry is (name, rule_fn).  The CLI flag is --<name with _ replaced by ->.
+# Multiple secondary rules can be enabled; their relative priority on the
+# command line determines evaluation order.
+SECONDARY_RULES: list = [
+    ("arith_mem", _rule_arith_mem),
+]
+
 
 # ---------------------------------------------------------------------------
 # Compact-32 scorer factory
 # ---------------------------------------------------------------------------
 
-def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
+def make_compact32_scorer(liveness: dict,
+                          secondary_rules: "list[str]" = []) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
     The scorer holds its liveness reference in a mutable cell so that
     the streaming processor can refresh it per block after renaming.
+
+    secondary_rules
+        Ordered list of secondary rule names to activate (see SECONDARY_RULES).
+        Each name corresponds to a rule that is tried only after all primary
+        rules have failed.  Order matches CLI flag order.  Enable individual
+        rules with their corresponding ``--<rule-name>`` flags.
     """
     cell: list = [liveness]
+
+    _sec_by_name = {name: fn for name, fn in SECONDARY_RULES}
+    active_secondary: list = [
+        (name, _sec_by_name[name])
+        for name in secondary_rules
+        if name in _sec_by_name
+    ]
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
@@ -1021,11 +1116,14 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0
         elig = _get_eligible(a)
-        if not elig:
-            return 0.0
-        for _name, rule in COMPACT32_RULES:
-            if _name in elig and rule(a, b, cell[0]):
-                return 1.0
+        if elig:
+            for _name, rule in COMPACT32_RULES:
+                if _name in elig and rule(a, b, cell[0]):
+                    return 1.0
+        if active_secondary:
+            for _name, rule in active_secondary:
+                if rule(a, b, cell[0]):
+                    return 1.0
         return 0.0
 
     def _describe(a: "Instruction", b: "Instruction") -> str:
@@ -1035,12 +1133,15 @@ def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
         for name, rule in COMPACT32_RULES:
             if name in elig and rule(a, b, cell[0]):
                 return name
+        for name, rule in active_secondary:
+            if rule(a, b, cell[0]):
+                return name
         return ""
 
     _score._liveness_cell = cell
     _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
     _score._describe_pair = _describe
-    _score._rule_list = COMPACT32_RULES
+    _score._rule_list     = list(COMPACT32_RULES) + active_secondary
     return _score
 
 
