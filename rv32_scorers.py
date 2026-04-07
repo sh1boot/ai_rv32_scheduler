@@ -1095,15 +1095,13 @@ def _rule_arith_return(a: "Instruction", b: "Instruction",
     return True
 
 
-# Secondary rules: opt-in via CLI flags, tried only after all primary rules
+# Tally rules: opt-in via --tally=, tried only after all primary rules
 # have failed.  They cannot displace primary-rule pairs.  Intended for
 # statistics gathering — to quantify how many additional pairs a candidate
 # rule would create without committing it to the main rule set.
 #
-# Each entry is (name, rule_fn).  The CLI flag is --<name with _ replaced by ->.
-# Multiple secondary rules can be enabled; their relative priority on the
-# command line determines evaluation order.
-SECONDARY_RULES: list = [
+# Each entry is (name, rule_fn).
+TALLY_RULES: list = [
     ("arith_mem",    _rule_arith_mem),
     ("chain",        _rule_chain),
     ("rsd_live",     _rule_rsd_live),
@@ -1116,7 +1114,7 @@ SECONDARY_RULES: list = [
 # ---------------------------------------------------------------------------
 
 def make_compact32_scorer(liveness: dict,
-                          secondary_rules: "list[str]" = [],
+                          tally_rules: "list[str]" = [],
                           wide_dual_arith: bool = False) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
@@ -1124,11 +1122,10 @@ def make_compact32_scorer(liveness: dict,
     The scorer holds its liveness reference in a mutable cell so that
     the streaming processor can refresh it per block after renaming.
 
-    secondary_rules
-        Ordered list of secondary rule names to activate (see SECONDARY_RULES).
+    tally_rules
+        Ordered list of tally rule names to activate (see TALLY_RULES).
         Each name corresponds to a rule that is tried only after all primary
-        rules have failed.  Order matches CLI flag order.  Enable individual
-        rules with their corresponding ``--<rule-name>`` flags.
+        rules have failed.  Order matches --tally= list order.
 
     wide_dual_arith
         When True, relax the register constraint for the dual-arith rule family
@@ -1136,11 +1133,11 @@ def make_compact32_scorer(liveness: dict,
     """
     cell: list = [liveness]
 
-    _sec_by_name = {name: fn for name, fn in SECONDARY_RULES}
-    active_secondary: list = [
-        (name, _sec_by_name[name])
-        for name in secondary_rules
-        if name in _sec_by_name
+    _tally_by_name = {name: fn for name, fn in TALLY_RULES}
+    active_tally: list = [
+        (name, _tally_by_name[name])
+        for name in tally_rules
+        if name in _tally_by_name
     ]
 
     # Select the dual-arith eligibility check according to the register-range flag.
@@ -1252,7 +1249,7 @@ def make_compact32_scorer(liveness: dict,
         return _elig_cache[idx]
 
     def _score(a: "Instruction", b: "Instruction") -> float:
-        """Score for BnB scheduling — primary rules only, no secondary rules."""
+        """Score for BnB scheduling — primary rules only, no tally rules."""
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0
         elig = _get_eligible(a)
@@ -1272,11 +1269,11 @@ def make_compact32_scorer(liveness: dict,
                 return name
         return ""
 
-    _score._liveness_cell       = cell
-    _score._elig_cache          = _elig_cache   # exposed so the renamer can invalidate
-    _score._describe_pair       = _describe
-    _score._rule_list           = rules          # primary only (wide-aware)
-    _score._secondary_rule_list = active_secondary
+    _score._liveness_cell   = cell
+    _score._elig_cache      = _elig_cache   # exposed so the renamer can invalidate
+    _score._describe_pair   = _describe
+    _score._rule_list       = rules          # primary only (wide-aware)
+    _score._tally_rule_list = active_tally
     return _score
 
 
