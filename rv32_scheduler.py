@@ -749,12 +749,13 @@ def _process_block(
     pair_end_set:   set  = set()
     pair_rules:     dict = {}
 
-    rule_list     = getattr(pair_score, "_rule_list", None)
-    describe_fn   = getattr(pair_score, "_describe_pair", None)
+    rule_list           = getattr(pair_score, "_rule_list", None)
+    secondary_rule_list = getattr(pair_score, "_secondary_rule_list", [])
+    describe_fn         = getattr(pair_score, "_describe_pair", None)
     liveness_snap = (pair_score._liveness_cell[0]
                      if hasattr(pair_score, "_liveness_cell") else {})
 
-    # ── Greedy-advance walk: identify pairs ──────────────────────────────
+    # ── Greedy-advance walk: identify primary pairs ───────────────────────
     # pair_start_set / pair_end_set hold *positions* in real_scheduled.
     i = 0
     while i < total_instrs:
@@ -763,17 +764,17 @@ def _process_block(
             slot_scores = pair_score(a_s, b_s) > 0
 
             if rule_list is not None:
-                matching_rules = [rn for rn, rf in rule_list
-                                  if rf(a_s, b_s, liveness_snap)]
-                if matching_rules:
-                    winner = matching_rules[0]
+                matching_primary = [rn for rn, rf in rule_list
+                                    if rf(a_s, b_s, liveness_snap)]
+                if matching_primary:
+                    winner = matching_primary[0]
                     if slot_scores:
                         pair_start_set.add(i)
                         pair_end_set.add(i + 1)
                         pair_rules[i] = winner
                         successful += 1
                         rule_counts[winner] += 1
-                        for rn in matching_rules[1:]:
+                        for rn in matching_primary[1:]:
                             rule_shadow[rn] += 1
                         i += 2
                         continue
@@ -790,6 +791,35 @@ def _process_block(
                     i += 2
                     continue
         i += 1
+
+    # ── Secondary rule scan: positions left unpaired by the primary walk ──
+    # Secondary rules run on a fully-settled primary schedule, so they
+    # cannot displace primary pairs or affect BnB scheduling.  They only
+    # claim adjacent positions that are both still unpaired.
+    if secondary_rule_list:
+        i = 0
+        while i < total_instrs:
+            if i in pair_start_set or i in pair_end_set:
+                i += 1
+                continue
+            if (i + 1 < total_instrs
+                    and i + 1 not in pair_start_set
+                    and i + 1 not in pair_end_set):
+                a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
+                matching_secondary = [rn for rn, rf in secondary_rule_list
+                                      if rf(a_s, b_s, liveness_snap)]
+                if matching_secondary:
+                    winner = matching_secondary[0]
+                    pair_start_set.add(i)
+                    pair_end_set.add(i + 1)
+                    pair_rules[i] = winner
+                    successful += 1
+                    rule_counts[winner] += 1
+                    for rn in matching_secondary[1:]:
+                        rule_shadow[rn] += 1
+                    i += 2
+                    continue
+            i += 1
 
     # ── Optional chain-reorder of singleton runs ─────────────────────────
     if chain_reorder:
