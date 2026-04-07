@@ -1316,20 +1316,24 @@ def main():
                          "to all 32 integer registers.  Quantifies the pairing "
                          "gain if the encoding were extended to 5-bit register "
                          "fields for the dual-arith rule family.")
-    _sec_rule_names = {name: f"--{name.replace('_', '-')}"
-                       for name, _ in SECONDARY_RULES}
-    for _sec_name, _sec_flag in _sec_rule_names.items():
-        _sec_fn = next(fn for n, fn in SECONDARY_RULES if n == _sec_name)
-        _sec_doc = (_sec_fn.__doc__ or "").strip().splitlines()[0]
-        ap.add_argument(
-            _sec_flag,
-            dest="secondary_rules",
-            action="append_const",
-            const=_sec_name,
-            default=[],
-            help=f"(Secondary rule) {_sec_doc}  Only applies with "
-                 f"--scorer compact32; evaluated after all primary rules fail.",
-        )
+    _sec_valid = [name for name, _ in SECONDARY_RULES]
+    _sec_default = ",".join(_sec_valid)
+    _sec_doc_lines = [
+        f"  {name}: {(fn.__doc__ or '').strip().splitlines()[0]}"
+        for name, fn in SECONDARY_RULES
+    ]
+    ap.add_argument(
+        "--secondary",
+        dest="secondary_rules",
+        default=_sec_default,
+        metavar="RULES",
+        help=f"Comma-separated list of secondary rules to enable, in priority order. "
+             f"Evaluated after all primary rules fail; never displaces primary pairs. "
+             f"Default: all rules in their natural order. "
+             f"Pass an empty string to disable all secondary rules. "
+             f"Valid names (use hyphens or underscores): "
+             + ", ".join(_sec_valid),
+    )
     ap.add_argument("--chain-reorder", action="store_true",
                     help="(Experimental) After scheduling, reorder unpaired "
                          "singleton instructions within each run to maximise "
@@ -1382,8 +1386,20 @@ def main():
 
     factory, _ = SCORERS[args.scorer]
     if args.scorer == "compact32":
+        _sec_by_name = {name: name for name, _ in SECONDARY_RULES}
+        _sec_by_name.update({name.replace("_", "-"): name for name, _ in SECONDARY_RULES})
+        _sec_requested = []
+        for _tok in (t.strip() for t in args.secondary_rules.split(",")):
+            if not _tok:
+                continue
+            if _tok in _sec_by_name:
+                _sec_requested.append(_sec_by_name[_tok])
+            else:
+                print(f"warning: unknown secondary rule {_tok!r}; "
+                      f"valid names: {', '.join(n for n, _ in SECONDARY_RULES)}",
+                      file=sys.stderr)
         pair_score = make_compact32_scorer(
-            {}, secondary_rules=args.secondary_rules or [],
+            {}, secondary_rules=_sec_requested,
             wide_dual_arith=args.wide_dual_arith)
     else:
         pair_score = factory()
