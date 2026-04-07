@@ -472,6 +472,16 @@ def _tally_label(instr: "Instruction") -> str:
     return f"{mn}(big)" if big else mn
 
 
+def _tally_excluded(instr: "Instruction", tally_exclude: "frozenset[str]") -> bool:
+    """Return True if *instr* would be excluded from opcode-tally tables."""
+    if not tally_exclude:
+        return False
+    mn = _tally_label(instr)
+    if "big" in tally_exclude and mn.endswith("(big)"):
+        return True
+    return mn in tally_exclude   # e.g. "lui", "auipc"
+
+
 # ---------------------------------------------------------------------------
 # Chain-reorder helpers
 # ---------------------------------------------------------------------------
@@ -660,6 +670,7 @@ def _process_block(
     cfg_live_out:      frozenset = frozenset(),
     same_base_reorder: bool = False,
     chain_reorder:     bool = False,
+    tally_exclude:     "frozenset[str]" = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -825,6 +836,10 @@ def _process_block(
                     and i + 1 not in pair_start_set
                     and i + 1 not in pair_end_set):
                 a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
+                if (_tally_excluded(a_s, tally_exclude)
+                        or _tally_excluded(b_s, tally_exclude)):
+                    i += 1
+                    continue
                 matching_secondary = [rn for rn, rf in secondary_rule_list
                                       if rf(a_s, b_s, liveness_snap)]
                 if matching_secondary:
@@ -1083,6 +1098,7 @@ class AssemblyScheduler:
                                                             frozenset()),
                 same_base_reorder  = same_base_reorder,
                 chain_reorder      = chain_reorder,
+                tally_exclude      = tally_exclude,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1151,6 +1167,7 @@ class AssemblyScheduler:
                                                             frozenset()),
                 same_base_reorder  = same_base_reorder,
                 chain_reorder      = chain_reorder,
+                tally_exclude      = tally_exclude,
             )
             all_stats.append(st)
             instructions.clear()
