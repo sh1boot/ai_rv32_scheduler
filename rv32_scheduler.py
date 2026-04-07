@@ -136,6 +136,11 @@ class PairStats:
     # Per-mnemonic count of unpaired rvc-eligible instructions.
     # Parallel to unpaired_opcode_tally but restricted to can_compress() == True.
     unpaired_rvc_opcode_tally: dict = field(default_factory=dict)
+    # Secondary-rule pair tallies: same structure as singleton_tally /
+    # unpaired_opcode_tally but counting the A-side instructions of pairs
+    # claimed by secondary rules.  Empty when no secondary rules are active.
+    secondary_singleton_tally: dict = field(default_factory=dict)
+    secondary_opcode_tally:    dict = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "PairStats":
@@ -150,6 +155,7 @@ class PairStats:
             singleton_tally={}, unpaired_opcode_tally={},
             unpaired_rvc=0, unpaired_non_rvc=0,
             unpaired_rvc_opcode_tally={},
+            secondary_singleton_tally={}, secondary_opcode_tally={},
         )
 
     def summary_lines(self, opcode_tally: bool = False,
@@ -225,6 +231,13 @@ class PairStats:
             f"  (baseline {self.baseline_bytes},"
             f" saving {self.saving_bytes} = {self.saving_pct:.1f}%)"
         )
+        if opcode_tally and self.secondary_singleton_tally:
+            lines.extend(self._opcode_tally_lines(
+                grid_rows=grid_rows, grid_cols=grid_cols, show_big=show_big,
+                singleton_tally=self.secondary_singleton_tally,
+                opcode_tally=self.secondary_opcode_tally,
+                header="secondary rule opcode pair table"
+                       " (rows=A-side, cols=B-side, +total):"))
         if opcode_tally:
             lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
                                                    grid_cols=grid_cols,
@@ -232,20 +245,27 @@ class PairStats:
         return lines
 
     def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
-                            show_big: bool = False) -> list:
+                            show_big: bool = False,
+                            singleton_tally: "dict | None" = None,
+                            opcode_tally: "dict | None" = None,
+                            header: str = "unpaired opcode pair table"
+                                          " (rows=unpaired, cols=successor, +total):",
+                            ) -> list:
         """
-        Format the unpaired-opcode cross-tab grid.
+        Format an opcode cross-tab grid.
 
-        Rows are the top *grid_rows* opcodes sorted by rvc-eligible unpaired
-        count (descending), then total (descending).  One fixed leading column
-        shows the ``total`` count; the remaining *grid_cols* columns are the
-        most frequent successor opcodes.
+        When *singleton_tally* and *opcode_tally* are None (the default) the
+        instance's own unpaired tallies are used.  Pass the secondary tallies
+        to render the secondary-match table instead.
 
-        When *show_big* is False (default), labels ending in ``(big)`` and
-        the ``auipc`` / ``lui`` mnemonics are excluded from both rows and
-        columns.
+        Rows are the top *grid_rows* opcodes by total count (descending).
+        One fixed leading column shows the ``total``; the remaining *grid_cols*
+        columns are the most frequent B-side opcodes.  When *show_big* is
+        False (default), ``(big)`` labels and ``auipc``/``lui`` are excluded.
         """
-        if not self.singleton_tally and not self.unpaired_opcode_tally:
+        st = self.singleton_tally   if singleton_tally is None else singleton_tally
+        ot = self.unpaired_opcode_tally if opcode_tally is None else opcode_tally
+        if not st and not ot:
             return []
 
         lines = []
@@ -254,44 +274,30 @@ class PairStats:
             return not show_big and (mn.endswith("(big)")
                                      or mn in ("auipc", "lui"))
 
-        # All non-excluded mnemonics, sorted by their own total count descending.
-        all_mn = set(self.unpaired_rvc_opcode_tally) | set(self.unpaired_opcode_tally)
+        all_mn     = set(ot)
         visible_mn = [mn for mn in all_mn if not _exclude(mn)]
-        row_ops = sorted(
-            visible_mn,
-            key=lambda mn: -self.unpaired_opcode_tally.get(mn, 0),
-        )[:grid_rows]
+        row_ops    = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
 
-        # Build lookup: (row, col) -> count
-        tbl = {(a, b): c for (a, b), c in self.singleton_tally.items()}
+        tbl = {(a, b): c for (a, b), c in st.items()}
 
-        # Column totals over all non-excluded rows; use them to rank columns.
-        all_col_mn = {mn_b for (_, mn_b) in self.singleton_tally if mn_b and not _exclude(mn_b)}
+        all_col_mn     = {mn_b for (_, mn_b) in st if mn_b and not _exclude(mn_b)}
         col_totals_all = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
                           for mn_b in all_col_mn}
-        col_ops = [mn for mn, _ in
-                   sorted(col_totals_all.items(),
-                          key=lambda kv: -kv[1])[:grid_cols]]
+        col_ops    = [mn for mn, _ in
+                      sorted(col_totals_all.items(), key=lambda kv: -kv[1])[:grid_cols]]
         col_totals = {mn_b: col_totals_all[mn_b] for mn_b in col_ops}
-        grand_total = sum(self.unpaired_opcode_tally.get(mn, 0)
-                          for mn in visible_mn)
+        grand_total = sum(ot.get(mn, 0) for mn in visible_mn)
 
         col_w   = max((len(mn) for mn in col_ops), default=4)
         row_w   = max((len(mn) for mn in row_ops), default=4)
-        total_w = max(5, max((len(str(self.unpaired_opcode_tally.get(mn, 0)))
-                               for mn in row_ops), default=1))
+        total_w = max(5, max((len(str(ot.get(mn, 0))) for mn in row_ops), default=1))
         total_w = max(total_w, len(str(grand_total)))
 
-        # Header line
-        header = f"# {'':>{row_w}}  {'total':>{total_w}}"
-        if col_ops:
-            header += "  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
+        lines.append(f"# {header}")
+        lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
+                     + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
+                        if col_ops else ""))
 
-        lines.append("# unpaired opcode pair table"
-                     " (rows=unpaired, cols=successor, +total):")
-        lines.append(header)
-
-        # Totals row
         tot_row = f"# {'':>{row_w}}  {grand_total:>{total_w}d}"
         if col_ops:
             tot_row += "  " + "  ".join(
@@ -300,15 +306,12 @@ class PairStats:
                 for mn_b in col_ops)
         lines.append(tot_row)
 
-        # Data rows
         for mn_a in row_ops:
-            total_cnt = self.unpaired_opcode_tally.get(mn_a, 0)
-            row = f"# {mn_a:<{row_w}}  {total_cnt:>{total_w}d}"
+            row = f"# {mn_a:<{row_w}}  {ot.get(mn_a, 0):>{total_w}d}"
             if col_ops:
-                cells = []
-                for mn_b in col_ops:
-                    v = tbl.get((mn_a, mn_b), 0)
-                    cells.append(f"{v:>{col_w}d}" if v else " " * col_w)
+                cells = [f"{tbl.get((mn_a, mn_b), 0):>{col_w}d}"
+                         if tbl.get((mn_a, mn_b), 0) else " " * col_w
+                         for mn_b in col_ops]
                 row += "  " + "  ".join(cells)
             lines.append(row)
 
@@ -364,6 +367,8 @@ class PairStats:
             unpaired_rvc     = unpaired_rvc,
             unpaired_non_rvc = unpaired_non_rvc,
             unpaired_rvc_opcode_tally = _merge_dicts("unpaired_rvc_opcode_tally"),
+            secondary_singleton_tally = _merge_dicts("secondary_singleton_tally"),
+            secondary_opcode_tally    = _merge_dicts("secondary_opcode_tally"),
         )
 
 # ---------------------------------------------------------------------------
@@ -749,12 +754,13 @@ def _process_block(
     pair_end_set:   set  = set()
     pair_rules:     dict = {}
 
-    rule_list     = getattr(pair_score, "_rule_list", None)
-    describe_fn   = getattr(pair_score, "_describe_pair", None)
+    rule_list           = getattr(pair_score, "_rule_list", None)
+    secondary_rule_list = getattr(pair_score, "_secondary_rule_list", [])
+    describe_fn         = getattr(pair_score, "_describe_pair", None)
     liveness_snap = (pair_score._liveness_cell[0]
                      if hasattr(pair_score, "_liveness_cell") else {})
 
-    # ── Greedy-advance walk: identify pairs ──────────────────────────────
+    # ── Greedy-advance walk: identify primary pairs ───────────────────────
     # pair_start_set / pair_end_set hold *positions* in real_scheduled.
     i = 0
     while i < total_instrs:
@@ -763,17 +769,17 @@ def _process_block(
             slot_scores = pair_score(a_s, b_s) > 0
 
             if rule_list is not None:
-                matching_rules = [rn for rn, rf in rule_list
-                                  if rf(a_s, b_s, liveness_snap)]
-                if matching_rules:
-                    winner = matching_rules[0]
+                matching_primary = [rn for rn, rf in rule_list
+                                    if rf(a_s, b_s, liveness_snap)]
+                if matching_primary:
+                    winner = matching_primary[0]
                     if slot_scores:
                         pair_start_set.add(i)
                         pair_end_set.add(i + 1)
                         pair_rules[i] = winner
                         successful += 1
                         rule_counts[winner] += 1
-                        for rn in matching_rules[1:]:
+                        for rn in matching_primary[1:]:
                             rule_shadow[rn] += 1
                         i += 2
                         continue
@@ -790,6 +796,45 @@ def _process_block(
                     i += 2
                     continue
         i += 1
+
+    # ── Secondary rule scan: positions left unpaired by the primary walk ──
+    # Secondary rules run on a fully-settled primary schedule, so they
+    # cannot displace primary pairs or affect BnB scheduling.  They only
+    # claim adjacent positions that are both still unpaired.
+    secondary_pair_starts: set = set()
+    if secondary_rule_list:
+        i = 0
+        while i < total_instrs:
+            if i in pair_start_set or i in pair_end_set:
+                i += 1
+                continue
+            if (i + 1 < total_instrs
+                    and i + 1 not in pair_start_set
+                    and i + 1 not in pair_end_set):
+                a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
+                matching_secondary = [rn for rn, rf in secondary_rule_list
+                                      if rf(a_s, b_s, liveness_snap)]
+                if matching_secondary:
+                    winner = matching_secondary[0]
+                    pair_start_set.add(i)
+                    pair_end_set.add(i + 1)
+                    secondary_pair_starts.add(i)
+                    pair_rules[i] = winner
+                    successful += 1
+                    rule_counts[winner] += 1
+                    for rn in matching_secondary[1:]:
+                        rule_shadow[rn] += 1
+                    i += 2
+                    continue
+            i += 1
+
+    secondary_singleton_tally: Counter = Counter()
+    secondary_opcode_tally: Counter = Counter()
+    for i in sorted(secondary_pair_starts):
+        mn_a = _tally_label(real_scheduled[i])
+        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
+        secondary_singleton_tally[(mn_a, mn_b)] += 1
+        secondary_opcode_tally[mn_a] += 1
 
     # ── Optional chain-reorder of singleton runs ─────────────────────────
     if chain_reorder:
@@ -862,6 +907,8 @@ def _process_block(
         unpaired_rvc              = unpaired_rvc_count,
         unpaired_non_rvc          = unpaired_non_rvc_count,
         unpaired_rvc_opcode_tally = unpaired_rvc_opcode_tally,
+        secondary_singleton_tally = secondary_singleton_tally,
+        secondary_opcode_tally    = secondary_opcode_tally,
     )
 
 # ---------------------------------------------------------------------------

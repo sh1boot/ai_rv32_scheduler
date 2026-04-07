@@ -1022,6 +1022,79 @@ COMPACT32_RULES: list = [
     ("addi_branch",         _rule_addi_branch),
 ]
 
+def _is_return_instr(instr: "Instruction") -> bool:
+    """True if *instr* is a return: ``ret`` or ``jalr`` using ra (x1) as base."""
+    if instr.mnemonic == "ret":
+        return True
+    if instr.mnemonic == "jalr":
+        if instr.mem is not None and instr.mem[1] == "x1":
+            return True
+        if "x1" in instr.uses and (not instr.defs or instr.defs[0] == "x0"):
+            return True
+    return False
+
+
+def _rule_chain(a: "Instruction", b: "Instruction",
+                liveness: dict) -> bool:
+    """
+    Generic chain: A defines a register that B consumes and is dead after B.
+
+    Matches any producer-consumer adjacent pair where A's result register is
+    used by B and not live after B.  Catches patterns not covered by the more
+    specific primary chain rules (addr_chain, op_pair_chain, …).
+    """
+    if not a.defs:
+        return False
+    rd = a.defs[0]
+    if rd == "x0":
+        return False
+    if rd not in b.uses:
+        return False
+    return rd in liveness.get(b.index, frozenset())
+
+
+def _rule_rsd_live(a: "Instruction", b: "Instruction",
+                   liveness: dict) -> bool:
+    """
+    RSD-form update feeding B where A's result stays live after B.
+
+    A is in RSD form (rs1 == rd): it updates a register in-place.  B reads
+    that register, but the value is still needed afterwards (not dead).
+    Contrasts with the chain rules where the value is dead after B.
+    """
+    if not a.defs or not a.uses:
+        return False
+    rd = a.defs[0]
+    if rd == "x0":
+        return False
+    if a.uses[0] != rd:          # rsd constraint: rs1 == rd
+        return False
+    if rd not in b.uses:
+        return False
+    return rd not in liveness.get(b.index, frozenset())  # NOT dead after B
+
+
+def _rule_arith_return(a: "Instruction", b: "Instruction",
+                       liveness: dict) -> bool:
+    """
+    Any arithmetic before a function return (ret or jalr-as-return).
+
+    Catches the common pattern of computing a return value immediately before
+    returning.  A may be any instruction that defines a register and is not
+    itself a branch, memory access, or return.
+    """
+    if not _is_return_instr(b):
+        return False
+    if not a.defs:
+        return False
+    if a.mnemonic in _COMPACT32_BRANCH_MN or _is_mem_op(a):
+        return False
+    if a.mnemonic in ("nop", "ret", "tail", "call", "ecall", "ebreak",
+                      "fence", "fence.i"):
+        return False
+    return True
+
+
 # Secondary rules: opt-in via CLI flags, tried only after all primary rules
 # have failed.  They cannot displace primary-rule pairs.  Intended for
 # statistics gathering — to quantify how many additional pairs a candidate
@@ -1031,7 +1104,10 @@ COMPACT32_RULES: list = [
 # Multiple secondary rules can be enabled; their relative priority on the
 # command line determines evaluation order.
 SECONDARY_RULES: list = [
-    ("arith_mem", _rule_arith_mem),
+    ("arith_mem",    _rule_arith_mem),
+    ("chain",        _rule_chain),
+    ("rsd_live",     _rule_rsd_live),
+    ("arith_return", _rule_arith_return),
 ]
 
 
@@ -1113,17 +1189,15 @@ def make_compact32_scorer(liveness: dict,
         return _elig_cache[idx]
 
     def _score(a: "Instruction", b: "Instruction") -> float:
+        """Score for BnB scheduling — primary rules only, no secondary rules."""
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0
         elig = _get_eligible(a)
-        if elig:
-            for _name, rule in COMPACT32_RULES:
-                if _name in elig and rule(a, b, cell[0]):
-                    return 1.0
-        if active_secondary:
-            for _name, rule in active_secondary:
-                if rule(a, b, cell[0]):
-                    return 1.0
+        if not elig:
+            return 0.0
+        for _name, rule in COMPACT32_RULES:
+            if _name in elig and rule(a, b, cell[0]):
+                return 1.0
         return 0.0
 
     def _describe(a: "Instruction", b: "Instruction") -> str:
@@ -1133,15 +1207,13 @@ def make_compact32_scorer(liveness: dict,
         for name, rule in COMPACT32_RULES:
             if name in elig and rule(a, b, cell[0]):
                 return name
-        for name, rule in active_secondary:
-            if rule(a, b, cell[0]):
-                return name
         return ""
 
-    _score._liveness_cell = cell
-    _score._elig_cache    = _elig_cache   # exposed so the renamer can invalidate
-    _score._describe_pair = _describe
-    _score._rule_list     = list(COMPACT32_RULES) + active_secondary
+    _score._liveness_cell      = cell
+    _score._elig_cache         = _elig_cache   # exposed so the renamer can invalidate
+    _score._describe_pair      = _describe
+    _score._rule_list          = list(COMPACT32_RULES)   # primary only
+    _score._secondary_rule_list = active_secondary
     return _score
 
 
