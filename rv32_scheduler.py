@@ -32,7 +32,7 @@ from rv32_analysis import (
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score,
     COMPACT32_RULES, SECONDARY_RULES, SCORERS,
-    make_compact32_scorer, _MEM_WIDTH,
+    make_compact32_scorer, _MEM_WIDTH, _MEM_OPS,
 )
 from rv32_rename import (
     _ALL_INT_REGS, _ALL_FP_REGS, _TEMPORARIES, _RESERVED,
@@ -276,11 +276,15 @@ class PairStats:
 
         lines = []
 
-        def _exclude(mn: str) -> bool:
-            if "big" in tally_exclude and mn.endswith("(big)"):
+        def _exclude(label: str) -> bool:
+            if "big" in tally_exclude and label.endswith("(big)"):
                 return True
-            if mn in tally_exclude:   # covers "lui" and "auipc" directly
+            base = _tally_base(label)
+            if base in tally_exclude:          # e.g. "lui", "auipc"
                 return True
+            for group, mn_set in _TALLY_GROUP.items():
+                if group in tally_exclude and base in mn_set:
+                    return True
             return False
 
         all_mn      = set(ot)
@@ -447,6 +451,70 @@ def _imm_is_big(instr: "Instruction", n: int = _IMM_BITS) -> bool:
     return not (lo_s <= imm <= hi_s)
 
 
+# ---------------------------------------------------------------------------
+# Tally-exclude group membership sets
+# ---------------------------------------------------------------------------
+# Used by --tally-exclude to hide whole instruction classes from opcode
+# tally tables and the secondary rule scan.
+
+# Arithmetic and logic: integer ALU, shifts, multiply/divide, bit-manip.
+# Does NOT include lui/auipc (handled as separate tokens) or mem/control.
+_TALLY_ARITH_MN: frozenset = frozenset({
+    "add",  "addw",  "sub",  "subw",  "neg",  "negw",
+    "addi", "addiw",
+    "and",  "or",  "xor",  "not",
+    "andi", "ori", "xori",
+    "sll",  "sllw", "srl",  "srlw", "sra",  "sraw",
+    "slli", "slliw","srli", "srliw","srai", "sraiw",
+    "slt",  "sltu", "slti", "sltiu",
+    "seqz", "snez", "sltz", "sgtz",
+    "mul",  "mulh", "mulhu","mulhsu","mulw",
+    "div",  "divu", "rem",  "remu",
+    "divw", "divuw","remw", "remuw",
+    "mv", "li",
+    # Zb* bit-manipulation
+    "bic",  "andn", "xnor",
+    "sh1add","sh2add","sh3add",
+    "min",  "minu", "max",  "maxu",
+    "clz",  "ctz",  "cpop", "rev8",
+    "sext.b","sext.h","zext.h",
+    "bset", "bclr", "binv", "bext",
+    "bseti","bclri","binvi","bexti",
+    "ror",  "rol",  "rori", "orc.b",
+})
+
+# Control flow: conditional branches, jumps, calls, returns, traps.
+_TALLY_CONTROL_MN: frozenset = frozenset({
+    "beq",  "bne",  "blt",  "bge",  "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "j",    "jal",  "jalr", "jr",
+    "ret",  "call", "tail",
+    "ecall","ebreak","nop",
+    "fence","fence.i","sfence.vma",
+    "mret", "sret", "uret",
+    "c.beqz","c.bnez","c.j","c.jal","c.jalr","c.jr",
+})
+
+# Memory: loads and stores (derived from the scorer's _MEM_OPS set).
+_TALLY_MEM_MN: frozenset = _MEM_OPS
+
+# Map token → set, used for both the label-based and instr-based checks.
+_TALLY_GROUP: dict = {
+    "arith":   _TALLY_ARITH_MN,
+    "mem":     _TALLY_MEM_MN,
+    "control": _TALLY_CONTROL_MN,
+}
+
+
+def _tally_base(label: str) -> str:
+    """Strip ``(sp)`` and ``(big)`` qualifiers from a tally label."""
+    if label.endswith("(big)"):
+        label = label[:-5]
+    if label.endswith("(sp)"):
+        label = label[:-4]
+    return label
+
+
 def _tally_label(instr: "Instruction") -> str:
     """Return the tally key for *instr*.
 
@@ -476,10 +544,16 @@ def _tally_excluded(instr: "Instruction", tally_exclude: "frozenset[str]") -> bo
     """Return True if *instr* would be excluded from opcode-tally tables."""
     if not tally_exclude:
         return False
-    mn = _tally_label(instr)
-    if "big" in tally_exclude and mn.endswith("(big)"):
+    label = _tally_label(instr)
+    if "big" in tally_exclude and label.endswith("(big)"):
         return True
-    return mn in tally_exclude   # e.g. "lui", "auipc"
+    if _tally_base(label) in tally_exclude:   # e.g. "lui", "auipc"
+        return True
+    mn = instr.mnemonic
+    for group, mn_set in _TALLY_GROUP.items():
+        if group in tally_exclude and mn in mn_set:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1401,8 +1475,12 @@ def main():
                     default=_tally_exclude_default,
                     metavar="CATEGORIES",
                     help="Comma-separated list of opcode categories to hide from "
-                         "--opcode-tally tables.  Recognised tokens: "
-                         "big (labels ending in '(big)'), lui, auipc.  "
+                         "--opcode-tally tables and the secondary rule scan.  "
+                         "Individual tokens: big (labels ending in '(big)'), "
+                         "lui, auipc, or any bare mnemonic.  "
+                         "Group tokens: arith (integer ALU/shift/mul/div), "
+                         "mem (loads and stores), "
+                         "control (branches/jumps/calls/returns).  "
                          f"Default: {_tally_exclude_default!r}.  "
                          "Pass an empty string to show all entries.")
     ap.add_argument("--wide-dual-arith", action="store_true",
