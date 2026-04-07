@@ -711,8 +711,9 @@ def parse_line(index: int, line: str):
         if _m:
             instr.imm = int(_m.group(1))
 
-    # Pre-compute dual-arith eligibility flag.
-    instr.dual_arith_ok = _dual_arith_ok(instr)
+    # Pre-compute dual-arith eligibility flags.
+    instr.dual_arith_ok      = _dual_arith_ok(instr)
+    instr.dual_arith_ok_wide = _dual_arith_ok_wide(instr)
     return instr
 
 # ---------------------------------------------------------------------------
@@ -756,6 +757,30 @@ def _dual_arith_ok(instr: "Instruction") -> bool:
     if rd != rs1 or rd not in _REG4:
         return False
     if len(instr.uses) >= 2 and instr.uses[1] not in _REG4:
+        return False
+    if mn in _IMM_FORMS:
+        imm = instr.imm
+        if imm is None:
+            return False
+        limit = 31 if mn == "addi" else 15
+        if imm < -(limit + 1) or imm > limit:
+            return False
+    return True
+
+
+def _dual_arith_ok_wide(instr: "Instruction") -> bool:
+    """Like _dual_arith_ok but accepts any of x0..x31 (no _REG4 constraint)."""
+    mn = instr.mnemonic
+    if mn not in _DUAL_ARITH_MN:
+        return False
+    rd  = instr.defs[0] if instr.defs else None
+    rs1 = instr.uses[0] if instr.uses else None
+    if rd is None or rs1 is None:
+        return False
+    if mn == "addi" and rs1 == "x2" and rd != "x2":
+        imm = instr.imm
+        return imm is not None and imm > 0 and imm % 4 == 0 and imm <= 124
+    if rd != rs1:
         return False
     if mn in _IMM_FORMS:
         imm = instr.imm

@@ -1311,6 +1311,11 @@ def main():
                     help="Include large-immediate variants (labels ending in "
                          "'(big)'), lui, and auipc in the --opcode-tally grid. "
                          "Hidden by default to focus on compact-encodable forms.")
+    ap.add_argument("--wide-dual-arith", action="store_true",
+                    help="Relax the dual-arith register constraint from x0..x15 "
+                         "to all 32 integer registers.  Quantifies the pairing "
+                         "gain if the encoding were extended to 5-bit register "
+                         "fields for the dual-arith rule family.")
     _sec_rule_names = {name: f"--{name.replace('_', '-')}"
                        for name, _ in SECONDARY_RULES}
     for _sec_name, _sec_flag in _sec_rule_names.items():
@@ -1378,7 +1383,8 @@ def main():
     factory, _ = SCORERS[args.scorer]
     if args.scorer == "compact32":
         pair_score = make_compact32_scorer(
-            {}, secondary_rules=args.secondary_rules or [])
+            {}, secondary_rules=args.secondary_rules or [],
+            wide_dual_arith=args.wide_dual_arith)
     else:
         pair_score = factory()
 

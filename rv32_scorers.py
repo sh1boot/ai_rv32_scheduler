@@ -35,7 +35,7 @@ from typing import Callable
 from rv32_core import (
     Instruction,
     _DUAL_ARITH_MN, _REG4, _IMM_FORMS,
-    _dual_arith_ok,
+    _dual_arith_ok, _dual_arith_ok_wide,
 )
 
 # ---------------------------------------------------------------------------
@@ -1116,7 +1116,8 @@ SECONDARY_RULES: list = [
 # ---------------------------------------------------------------------------
 
 def make_compact32_scorer(liveness: dict,
-                          secondary_rules: "list[str]" = []) -> "PairScoreFn":
+                          secondary_rules: "list[str]" = [],
+                          wide_dual_arith: bool = False) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
@@ -1128,6 +1129,10 @@ def make_compact32_scorer(liveness: dict,
         Each name corresponds to a rule that is tried only after all primary
         rules have failed.  Order matches CLI flag order.  Enable individual
         rules with their corresponding ``--<rule-name>`` flags.
+
+    wide_dual_arith
+        When True, relax the register constraint for the dual-arith rule family
+        from x0..x15 to all 32 integer registers.  Enabled by --wide-dual-arith.
     """
     cell: list = [liveness]
 
@@ -1137,6 +1142,64 @@ def make_compact32_scorer(liveness: dict,
         for name in secondary_rules
         if name in _sec_by_name
     ]
+
+    # Select the dual-arith eligibility check according to the register-range flag.
+    _da_ok = _dual_arith_ok_wide if wide_dual_arith else _dual_arith_ok
+
+    # When wide_dual_arith is set, build local rule functions that use the
+    # widened eligibility check and drop the _REG4 register constraints.
+    if wide_dual_arith:
+        def _rule_dual_arith_w(a, b, liveness):
+            return _da_ok(a) and _da_ok(b)
+
+        def _rule_dual_arith_chain_w(a, b, liveness):
+            if not _da_ok(a):
+                return False
+            rd_a = a.defs[0]
+            if b.mnemonic not in _DUAL_ARITH_MN:
+                return False
+            if not b.uses or b.uses[0] != rd_a:
+                return False
+            rd_b = b.defs[0] if b.defs else None
+            if rd_b is None:
+                return False
+            if b.mnemonic in _IMM_FORMS:
+                imm = b.imm
+                if imm is None or imm < -16 or imm > 15:
+                    return False
+            if rd_a not in liveness.get(b.index, frozenset()):
+                return False
+            return True
+
+        def _rule_arith_jump_w(a, b, liveness):
+            return _da_ok(a) and b.mnemonic in ("jal", "jalr")
+
+        def _rule_arith_branch_w(a, b, liveness):
+            if not _da_ok(a):
+                return False
+            rd = a.defs[0] if a.defs else None
+            if rd is None or b.mnemonic not in ("beqz", "bnez"):
+                return False
+            return (b.uses[0] if b.uses else None) == rd
+
+        def _rule_addi_branch_w(a, b, liveness):
+            if not _da_ok(a) or a.mnemonic != "addi":
+                return False
+            rsd = a.defs[0]
+            if b.mnemonic not in ("beq", "bne"):
+                return False
+            return rsd in b.uses
+
+        _wide_overrides = {
+            "dual_arith":       _rule_dual_arith_w,
+            "dual_arith_chain": _rule_dual_arith_chain_w,
+            "arith_jump":       _rule_arith_jump_w,
+            "arith_branch":     _rule_arith_branch_w,
+            "addi_branch":      _rule_addi_branch_w,
+        }
+        rules = [(name, _wide_overrides.get(name, fn)) for name, fn in COMPACT32_RULES]
+    else:
+        rules = list(COMPACT32_RULES)
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
@@ -1171,7 +1234,7 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
-        if _dual_arith_ok(a):
+        if _da_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
             eligible.add("arith_jump")
@@ -1195,7 +1258,7 @@ def make_compact32_scorer(liveness: dict,
         elig = _get_eligible(a)
         if not elig:
             return 0.0
-        for _name, rule in COMPACT32_RULES:
+        for _name, rule in rules:
             if _name in elig and rule(a, b, cell[0]):
                 return 1.0
         return 0.0
@@ -1204,15 +1267,15 @@ def make_compact32_scorer(liveness: dict,
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return ""
         elig = _get_eligible(a)
-        for name, rule in COMPACT32_RULES:
+        for name, rule in rules:
             if name in elig and rule(a, b, cell[0]):
                 return name
         return ""
 
-    _score._liveness_cell      = cell
-    _score._elig_cache         = _elig_cache   # exposed so the renamer can invalidate
-    _score._describe_pair      = _describe
-    _score._rule_list          = list(COMPACT32_RULES)   # primary only
+    _score._liveness_cell       = cell
+    _score._elig_cache          = _elig_cache   # exposed so the renamer can invalidate
+    _score._describe_pair       = _describe
+    _score._rule_list           = rules          # primary only (wide-aware)
     _score._secondary_rule_list = active_secondary
     return _score
 
