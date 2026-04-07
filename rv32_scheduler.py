@@ -160,7 +160,7 @@ class PairStats:
 
     def summary_lines(self, opcode_tally: bool = False,
                       grid_rows: int = 20, grid_cols: int = 20,
-                      show_big: bool = False) -> list:
+                      tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"})) -> list:
         """Return comment lines suitable for appending to assembly output.
 
         opcode_tally: when True, append the singleton opcode-pair tally and
@@ -233,7 +233,7 @@ class PairStats:
         )
         if opcode_tally and self.secondary_singleton_tally:
             lines.extend(self._opcode_tally_lines(
-                grid_rows=grid_rows, grid_cols=grid_cols, show_big=show_big,
+                grid_rows=grid_rows, grid_cols=grid_cols, tally_exclude=tally_exclude,
                 singleton_tally=self.secondary_singleton_tally,
                 opcode_tally=self.secondary_opcode_tally,
                 header="secondary rule opcode pair table"
@@ -241,11 +241,11 @@ class PairStats:
         if opcode_tally:
             lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
                                                    grid_cols=grid_cols,
-                                                   show_big=show_big))
+                                                   tally_exclude=tally_exclude))
         return lines
 
     def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
-                            show_big: bool = False,
+                            tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
                             singleton_tally: "dict | None" = None,
                             opcode_tally: "dict | None" = None,
                             header: str = "unpaired opcode pair table"
@@ -260,8 +260,14 @@ class PairStats:
 
         Rows are the top *grid_rows* opcodes by total count (descending).
         One fixed leading column shows the ``total``; the remaining *grid_cols*
-        columns are the most frequent B-side opcodes.  When *show_big* is
-        False (default), ``(big)`` labels and ``auipc``/``lui`` are excluded.
+        columns are the most frequent B-side opcodes.
+
+        tally_exclude
+            Set of category names to hide from the table.  Recognised tokens:
+            ``"big"``   — labels ending in ``(big)``
+            ``"lui"``   — the ``lui`` mnemonic
+            ``"auipc"`` — the ``auipc`` mnemonic
+            Default excludes all three.  Pass an empty frozenset to show all.
         """
         st = self.singleton_tally   if singleton_tally is None else singleton_tally
         ot = self.unpaired_opcode_tally if opcode_tally is None else opcode_tally
@@ -271,8 +277,11 @@ class PairStats:
         lines = []
 
         def _exclude(mn: str) -> bool:
-            return not show_big and (mn.endswith("(big)")
-                                     or mn in ("auipc", "lui"))
+            if "big" in tally_exclude and mn.endswith("(big)"):
+                return True
+            if mn in tally_exclude:   # covers "lui" and "auipc" directly
+                return True
+            return False
 
         all_mn      = set(ot)
         actual_total = sum(ot.values())
@@ -297,7 +306,7 @@ class PairStats:
 
         lines.append(f"# {header}")
         if hidden:
-            lines.append(f"#   ({hidden} of {actual_total} hidden — use --show-big to see all)")
+            lines.append(f"#   ({hidden} of {actual_total} hidden — use --tally-exclude= to see all)")
         lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
                      + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
                         if col_ops else ""))
@@ -990,7 +999,7 @@ class AssemblyScheduler:
         chain_reorder:      bool = False,
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
-        show_big:           bool = False,
+        tally_exclude:      "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -1259,7 +1268,7 @@ class AssemblyScheduler:
         for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
                                                   grid_rows=grid_rows,
                                                   grid_cols=grid_cols,
-                                                  show_big=show_big):
+                                                  tally_exclude=tally_exclude):
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1307,10 +1316,15 @@ def main():
                     help="Append a ranked tally of unpaired opcode combinations "
                          "to the output and stderr report. Use this to identify "
                          "the best candidates for new pairing rules.")
-    ap.add_argument("--show-big", action="store_true",
-                    help="Include large-immediate variants (labels ending in "
-                         "'(big)'), lui, and auipc in the --opcode-tally grid. "
-                         "Hidden by default to focus on compact-encodable forms.")
+    _tally_exclude_default = "big,lui,auipc"
+    ap.add_argument("--tally-exclude",
+                    default=_tally_exclude_default,
+                    metavar="CATEGORIES",
+                    help="Comma-separated list of opcode categories to hide from "
+                         "--opcode-tally tables.  Recognised tokens: "
+                         "big (labels ending in '(big)'), lui, auipc.  "
+                         f"Default: {_tally_exclude_default!r}.  "
+                         "Pass an empty string to show all entries.")
     ap.add_argument("--wide-dual-arith", action="store_true",
                     help="Relax the dual-arith register constraint from x0..x15 "
                          "to all 32 integer registers.  Quantifies the pairing "
@@ -1373,6 +1387,10 @@ def main():
             print(f"  {name:26s}  {flag:16s}  {doc}")
         return
 
+    args.tally_exclude = frozenset(
+        t.strip() for t in args.tally_exclude.split(",") if t.strip()
+    )
+
     if args.scorer not in SCORERS:
         ap.error(f"Unknown scorer {args.scorer!r}. "
                  f"Available: {list(SCORERS)}")
@@ -1415,7 +1433,7 @@ def main():
         chain_reorder     = args.chain_reorder,
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
-        show_big          = args.show_big,
+        tally_exclude     = args.tally_exclude,
     )
 
     if sched.last_stats is not None:
@@ -1425,7 +1443,7 @@ def main():
         for line in st.summary_lines(opcode_tally=args.opcode_tally,
                                      grid_rows=args.grid_rows,
                                      grid_cols=args.grid_cols,
-                                     show_big=args.show_big):
+                                     tally_exclude=args.tally_exclude):
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
