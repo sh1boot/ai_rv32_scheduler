@@ -399,7 +399,6 @@ class Instruction:
     mem:        object = None  # (offset:int, base:str) for load/store, else None
     dual_arith_ok:       bool = False
     dual_arith_ok_wide:  bool = False
-    dual_arith2_ok:      bool = False
     # Source lines (label definitions) that must be emitted immediately before
     # this instruction wherever it is scheduled.  Used for non-barrier labels
     # such as .Lpcrel_hi* that must stay anchored to the instruction they
@@ -716,7 +715,6 @@ def parse_line(index: int, line: str):
     # Pre-compute dual-arith eligibility flags.
     instr.dual_arith_ok      = _dual_arith_ok(instr)
     instr.dual_arith_ok_wide = _dual_arith_ok_wide(instr)
-    instr.dual_arith2_ok     = _dual_arith2_ok(instr)
     return instr
 
 # ---------------------------------------------------------------------------
@@ -729,6 +727,7 @@ _DUAL_ARITH_MN = frozenset({
     "sub",  "subw",
     "and",  "bic",  "andn",
     "or",   "xor",
+    "slli", "srli",              # shift-immediate (moved from dual_arith2)
 })
 # R-type instructions whose rs1/rs2 can be swapped without changing the result.
 _COMMUTATIVE_BINOP = frozenset({
@@ -740,7 +739,7 @@ _COMMUTATIVE_BINOP = frozenset({
 })
 _REG4      = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
-_IMM_FORMS = frozenset({"addi", "addiw", "andi"})
+_IMM_FORMS = frozenset({"addi", "addiw", "andi", "slli", "srli"})
 
 def _dual_arith_ok(instr: "Instruction") -> bool:
     mn  = instr.mnemonic
@@ -765,9 +764,13 @@ def _dual_arith_ok(instr: "Instruction") -> bool:
         imm = instr.imm
         if imm is None:
             return False
-        limit = 31 if mn == "addi" else 15
-        if imm < -(limit + 1) or imm > limit:
-            return False
+        if mn in ("slli", "srli"):
+            if imm < 1 or imm > 31:
+                return False
+        else:
+            limit = 31 if mn in ("addi", "addiw") else 15
+            if imm < -(limit + 1) or imm > limit:
+                return False
     return True
 
 
@@ -789,60 +792,12 @@ def _dual_arith_ok_wide(instr: "Instruction") -> bool:
         imm = instr.imm
         if imm is None:
             return False
-        limit = 31 if mn == "addi" else 15
-        if imm < -(limit + 1) or imm > limit:
-            return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Extended dual-arith set: next 12 most-frequent arithmetic opcodes not
-# covered by _DUAL_ARITH_MN, ranked by observed unpaired frequency.
-# ---------------------------------------------------------------------------
-# Shifts (3), compare (2), multiply (2), remainder (1), immediate (2):
-_DUAL_ARITH2_MN = frozenset({
-    "slli", "srli", "srai",          # shift-immediate (RSD: rd==rs1)
-    "sll",  "srl",                    # shift-register  (RSD: rd==rs1)
-    "xori", "slti",                   # bitwise/compare immediate
-    "slt",  "sltu",                   # compare register
-    "mul",  "mulhu",                  # multiply
-    "rem",                            # remainder
-})
-# Subset of _DUAL_ARITH2_MN that carry an explicit immediate field.
-_IMM_FORMS2 = frozenset({"slli", "srli", "srai", "xori", "slti"})
-
-
-def _dual_arith2_ok(instr: "Instruction") -> bool:
-    """
-    Return True if *instr* qualifies for the extended dual-arith encoding slot.
-
-    Same structural constraints as _dual_arith_ok (RSD form, x0..x15) applied
-    to the second-tier opcode set (_DUAL_ARITH2_MN).
-
-    Immediate bounds:
-      shifts (slli/srli/srai)  — 1..31  (shift of 0 is a no-op)
-      xori, slti               — −16..+15
-    """
-    mn = instr.mnemonic
-    if mn not in _DUAL_ARITH2_MN:
-        return False
-    rd  = instr.defs[0] if instr.defs else None
-    rs1 = instr.uses[0] if instr.uses else None
-    if rd is None or rs1 is None:
-        return False
-    if rd != rs1 or rd not in _REG4:
-        return False
-    if len(instr.uses) >= 2 and instr.uses[1] not in _REG4:
-        return False
-    if mn in _IMM_FORMS2:
-        imm = instr.imm
-        if imm is None:
-            return False
-        if mn in ("slli", "srli", "srai"):
+        if mn in ("slli", "srli"):
             if imm < 1 or imm > 31:
                 return False
-        else:                          # xori, slti
-            if imm < -16 or imm > 15:
+        else:
+            limit = 31 if mn in ("addi", "addiw") else 15
+            if imm < -(limit + 1) or imm > limit:
                 return False
     return True
 
