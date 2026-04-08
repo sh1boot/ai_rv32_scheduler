@@ -10,7 +10,7 @@ clean:
 	rm -f *.out.s
 
 %.out.s: %.s $(SOURCES)
-	python ./rv32_scheduler.py --same-base-reorder --opcode-tally $< > $@
+	python ./rv32_scheduler.py --wide-dual-arith --same-base-reorder $< > $@
 
 %.unpaired.s: %.out.s
 	sed "s/^.*# PAIR.*$$/----/" < $< | uniq > $@
