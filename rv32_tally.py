@@ -153,16 +153,18 @@ _TALLY_MEM_MN: frozenset = frozenset({
     "fsw", "fsd",
 })
 
+# lui and auipc are the canonical "big-immediate" mnemonics: they always carry
+# a 20-bit upper immediate.  Other instructions may also be tagged CLASS:big
+# (when their immediate exceeds the compact 5-bit threshold), but those are
+# identified by their CLASS annotation rather than by mnemonic alone.
+_TALLY_BIG_MN: frozenset = frozenset({"lui", "auipc"})
+
 _TALLY_GROUP: dict = {
     "arith":   _TALLY_ARITH_MN,
     "mem":     _TALLY_MEM_MN,
     "control": _TALLY_CONTROL_MN,
+    "big":     _TALLY_BIG_MN,
 }
-
-
-def _mnemonic_class(mn: str) -> "list[str]":
-    """Return the class names that *mn* belongs to."""
-    return [cls for cls, mn_set in _TALLY_GROUP.items() if mn in mn_set]
 
 
 def _mn_in_group(mn: str, group_tok: str) -> bool:
@@ -177,6 +179,21 @@ def _matches_filter(mn: str, filter_toks: "frozenset[str]") -> bool:
     if not filter_toks:
         return True
     return any(_mn_in_group(mn, tok) for tok in filter_toks)
+
+
+def _instr_excluded(ai: "AnnotatedInstr", exclude: "frozenset[str]") -> bool:
+    """True if *ai* should be excluded based on *exclude* tokens.
+
+    Checks both mnemonic-based group membership (handles lui/auipc etc.) and
+    the CLASS: annotation on the instruction (handles big-immediate instructions
+    of other mnemonics such as ``addi`` with an out-of-range immediate).
+    """
+    if not exclude:
+        return False
+    if any(_mn_in_group(ai.mnemonic, tok) for tok in exclude):
+        return True
+    # CLASS annotation check: covers e.g. addi with big immediate
+    return bool(ai.classes & exclude)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +298,7 @@ def _opcode_tally_lines(
 def analyse(instrs: "list[AnnotatedInstr]",
             rule: str = "",
             cols: "frozenset[str]" = frozenset(),
-            exclude: "frozenset[str]" = frozenset({"lui", "auipc"}),
+            exclude: "frozenset[str]" = frozenset({"big"}),
             pairs_mode: bool = False,
             grid_rows: int = 20,
             grid_cols: int = 20) -> list:
@@ -318,14 +335,15 @@ def analyse(instrs: "list[AnnotatedInstr]",
         if ai.is_pair_a or ai.is_pair_b:
             prev = None
             continue
+        if _instr_excluded(ai, exclude):
+            prev = None
+            continue
         # Determine if this instruction is "interesting" for the requested rule.
         a_ok = (not rule) or (rule in ai.tally_a)
         b_ok = (not rule) or (rule in ai.tally_b)
 
         if a_ok and not pairs_mode:
             opcode_tally[ai.mnemonic] += 1
-            # Record (this, next_unpaired) pair — filled in retrospectively
-            # when we see the next instruction.
 
         if pairs_mode:
             if prev is not None:
@@ -343,6 +361,9 @@ def analyse(instrs: "list[AnnotatedInstr]",
         prev2: "AnnotatedInstr | None" = None
         for ai in instrs:
             if ai.is_pair_a or ai.is_pair_b:
+                prev2 = None
+                continue
+            if _instr_excluded(ai, exclude):
                 prev2 = None
                 continue
             a_ok = (not rule) or (rule in ai.tally_a)
@@ -385,12 +406,14 @@ def main():
                          "TALLY:<RULE>:A or TALLY:<RULE>:B.  Empty = all unpaired.")
     ap.add_argument("--cols", default="", metavar="CATEGORIES",
                     help="Restrict B-side columns to these class/mnemonic tokens. "
-                         "Group tokens: arith, mem, control.  "
+                         "Group tokens: arith, mem, control, big.  "
                          "Or bare mnemonics.  Comma-separated.  "
                          "Empty (default) = all columns.")
-    ap.add_argument("--exclude", default="lui,auipc", metavar="CATEGORIES",
+    ap.add_argument("--exclude", default="big", metavar="CATEGORIES",
                     help="Hide these class/mnemonic tokens from rows and columns. "
-                         "Same tokens as --cols.  Default: 'lui,auipc'.")
+                         "Same tokens as --cols.  'big' excludes lui, auipc, and "
+                         "any instruction annotated CLASS:big (large immediate).  "
+                         "Default: 'big'.")
     ap.add_argument("--pairs", action="store_true",
                     help="Count adjacent (A-eligible, B-eligible) pairs rather "
                          "than individual A-side instructions.")

@@ -273,7 +273,47 @@ _TALLY_CONTROL_MN: frozenset = frozenset({
 # Memory: loads and stores (derived from the scorer's _MEM_OPS set).
 _TALLY_MEM_MN: frozenset = _MEM_OPS
 
+# Upper-immediate instructions are always "big" (20-bit immediate).
+_UPPER_IMM_MN: frozenset = frozenset({"lui", "auipc"})
+
+# Shift-amount fields are structurally bounded (1..31) and never "big".
+_SHIFT_MN: frozenset = frozenset({
+    "slli", "srli", "srai", "slliw", "srliw", "sraiw",
+})
+
+
+def _imm_is_big(instr: "Instruction") -> bool:
+    """Return True if *instr* carries a large immediate.
+
+    ``lui`` and ``auipc`` are always considered big (20-bit immediate).
+    Shift-amount fields are always small (structurally bounded 1..31).
+    Memory ops use a 5-bit signed field scaled by data width (±16 elements).
+    ``addi rd, sp, imm`` uses a 5-bit unsigned field scaled by 4.
+    All other immediates use a plain 5-bit signed check (−16..+15).
+    Returns False for instructions that carry no immediate.
+    """
+    mn = instr.mnemonic
+    if mn in _UPPER_IMM_MN:
+        return True
+    if mn in _SHIFT_MN:
+        return False
+    if instr.mem is not None:
+        off = instr.mem[0]
+        if off is None:
+            return False
+        scale = _MEM_WIDTH.get(mn, 1)
+        return not (off % scale == 0 and -16 * scale <= off <= 15 * scale)
+    imm = instr.imm
+    if imm is None:
+        return False
+    if mn == "addi" and instr.uses and instr.uses[0] == "x2":
+        return not (0 <= imm and imm % 4 == 0 and imm <= 124)
+    return not (-16 <= imm <= 15)
+
+
 # Map class name → mnemonic set, used for CLASS: annotation generation.
+# "big" is handled separately via _imm_is_big() since it is not purely
+# mnemonic-based; _UPPER_IMM_MN lists the mnemonics that are always big.
 _TALLY_GROUP: dict = {
     "arith":   _TALLY_ARITH_MN,
     "mem":     _TALLY_MEM_MN,
@@ -624,7 +664,7 @@ def _process_block(
     # For each instruction that was not claimed by a primary rule, compute:
     #   TALLY:<rule>:A  — eligible as first instruction (A-side) of that rule
     #   TALLY:<rule>:B  — eligible as second instruction (B-side) of that rule
-    #   CLASS:<cls>     — instruction class membership (arith/mem/control)
+    #   CLASS:<cls>     — instruction class membership (arith/mem/control/big)
     # Multiple tags may appear.  These annotations are written into the output
     # as assembly comments and parsed by the rv32_tally.py analysis tool.
     tally_annots: dict = {}   # {instruction.index: "TAG1 TAG2 …"}
@@ -639,6 +679,8 @@ def _process_block(
                 tags.append(f"TALLY:{name}:B")
         classes = [cls for cls, mn_set in _TALLY_GROUP.items()
                    if instr.mnemonic in mn_set]
+        if _imm_is_big(instr):
+            classes.append("big")
         if classes:
             tags.append("CLASS:" + ",".join(sorted(classes)))
         if tags:
