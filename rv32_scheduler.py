@@ -160,7 +160,8 @@ class PairStats:
 
     def summary_lines(self, opcode_tally: bool = False,
                       grid_rows: int = 20, grid_cols: int = 20,
-                      tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"})) -> list:
+                      tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
+                      tally_col_include: "frozenset[str]" = frozenset()) -> list:
         """Return comment lines suitable for appending to assembly output.
 
         opcode_tally: when True, append the singleton opcode-pair tally and
@@ -233,19 +234,21 @@ class PairStats:
         )
         if opcode_tally and self.tally_singleton_tally:
             lines.extend(self._opcode_tally_lines(
-                grid_rows=grid_rows, grid_cols=grid_cols, tally_exclude=tally_exclude,
+                grid_rows=grid_rows, grid_cols=grid_cols,
+                tally_exclude=tally_exclude, tally_col_include=tally_col_include,
                 singleton_tally=self.tally_singleton_tally,
                 opcode_tally=self.tally_opcode_tally,
                 header="tally rule opcode pair table"
                        " (rows=A-side, cols=B-side, +total):"))
         if opcode_tally:
-            lines.extend(self._opcode_tally_lines(grid_rows=grid_rows,
-                                                   grid_cols=grid_cols,
-                                                   tally_exclude=tally_exclude))
+            lines.extend(self._opcode_tally_lines(
+                grid_rows=grid_rows, grid_cols=grid_cols,
+                tally_exclude=tally_exclude, tally_col_include=tally_col_include))
         return lines
 
     def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
                             tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
+                            tally_col_include: "frozenset[str]" = frozenset(),
                             singleton_tally: "dict | None" = None,
                             opcode_tally: "dict | None" = None,
                             header: str = "unpaired opcode pair table"
@@ -268,6 +271,10 @@ class PairStats:
             ``"lui"``   — the ``lui`` mnemonic
             ``"auipc"`` — the ``auipc`` mnemonic
             Default excludes all three.  Pass an empty frozenset to show all.
+
+        tally_col_include
+            If non-empty, restrict columns to mnemonics in these groups.
+            Tokens same as *tally_exclude*.  Empty = all columns (default).
         """
         st = self.singleton_tally   if singleton_tally is None else singleton_tally
         ot = self.unpaired_opcode_tally if opcode_tally is None else opcode_tally
@@ -280,21 +287,46 @@ class PairStats:
             if "big" in tally_exclude and label.endswith("(big)"):
                 return True
             base = _tally_base(label)
-            if base in tally_exclude:          # e.g. "lui", "auipc"
+            if base in tally_exclude:
                 return True
             for group, mn_set in _TALLY_GROUP.items():
                 if group in tally_exclude and base in mn_set:
                     return True
             return False
 
-        all_mn      = set(ot)
+        def _include_col(label: str) -> bool:
+            if not tally_col_include:
+                return True
+            base = _tally_base(label)
+            if base in tally_col_include:
+                return True
+            for group, mn_set in _TALLY_GROUP.items():
+                if group in tally_col_include and base in mn_set:
+                    return True
+            return False
+
+        def _row_group(label: str) -> int:
+            """Return sort key (group index) for a row mnemonic."""
+            base = _tally_base(label)
+            for i, g in enumerate(("arith", "mem", "control")):
+                if base in _TALLY_GROUP[g]:
+                    return i
+            return 3   # "other"
+
+        _GROUP_LABELS = ("arith", "mem", "control", "other")
+
+        all_mn       = set(ot)
         actual_total = sum(ot.values())
-        visible_mn  = [mn for mn in all_mn if not _exclude(mn)]
-        row_ops     = sorted(visible_mn, key=lambda mn: -ot.get(mn, 0))[:grid_rows]
+        visible_mn   = [mn for mn in all_mn if not _exclude(mn)]
+        # Sort by group first, then descending total within group.
+        # Take up to grid_rows but preserve group boundaries.
+        visible_mn.sort(key=lambda mn: (_row_group(mn), -ot.get(mn, 0)))
+        row_ops = visible_mn[:grid_rows]
 
         tbl = {(a, b): c for (a, b), c in st.items()}
 
-        all_col_mn     = {mn_b for (_, mn_b) in st if mn_b and not _exclude(mn_b)}
+        all_col_mn     = {mn_b for (_, mn_b) in st
+                          if mn_b and not _exclude(mn_b) and _include_col(mn_b)}
         col_totals_all = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
                           for mn_b in all_col_mn}
         col_ops    = [mn for mn, _ in
@@ -310,7 +342,11 @@ class PairStats:
 
         lines.append(f"# {header}")
         if hidden:
-            lines.append(f"#   ({hidden} of {actual_total} hidden — use --tally-exclude= to see all)")
+            lines.append(f"#   ({hidden} of {actual_total} hidden"
+                         f" — use --tally-exclude= to see all)")
+        if tally_col_include:
+            included = ", ".join(sorted(tally_col_include))
+            lines.append(f"#   (columns restricted to: {included})")
         lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
                      + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
                         if col_ops else ""))
@@ -323,7 +359,13 @@ class PairStats:
                 for mn_b in col_ops)
         lines.append(tot_row)
 
+        # Emit rows grouped by instruction class with separator headers.
+        current_group = -1
         for mn_a in row_ops:
+            g = _row_group(mn_a)
+            if g != current_group:
+                current_group = g
+                lines.append(f"# {'--- ' + _GROUP_LABELS[g] + ' ---':>{row_w + total_w + 3}}")
             row = f"# {mn_a:<{row_w}}  {ot.get(mn_a, 0):>{total_w}d}"
             if col_ops:
                 cells = [f"{tbl.get((mn_a, mn_b), 0):>{col_w}d}"
@@ -1150,6 +1192,7 @@ class AssemblyScheduler:
         grid_rows:          int  = 20,
         grid_cols:          int  = 20,
         tally_exclude:      "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
+        tally_col_include:  "frozenset[str]" = frozenset(),
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -1422,7 +1465,8 @@ class AssemblyScheduler:
         for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
                                                   grid_rows=grid_rows,
                                                   grid_cols=grid_cols,
-                                                  tally_exclude=tally_exclude):
+                                                  tally_exclude=tally_exclude,
+                                                  tally_col_include=tally_col_include):
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1483,6 +1527,13 @@ def main():
                          "control (branches/jumps/calls/returns).  "
                          f"Default: {_tally_exclude_default!r}.  "
                          "Pass an empty string to show all entries.")
+    ap.add_argument("--tally-cols",
+                    default="",
+                    metavar="CATEGORIES",
+                    help="Restrict --opcode-tally columns to these categories only. "
+                         "Same tokens as --tally-exclude: group names (arith, mem, "
+                         "control) or individual mnemonics.  "
+                         "Empty (default) = show all column types.")
     ap.add_argument("--wide-dual-arith", action="store_true",
                     help="Relax the dual-arith register constraint from x0..x15 "
                          "to all 32 integer registers.  Quantifies the pairing "
@@ -1549,6 +1600,9 @@ def main():
     args.tally_exclude = frozenset(
         t.strip() for t in args.tally_exclude.split(",") if t.strip()
     )
+    args.tally_col_include = frozenset(
+        t.strip() for t in args.tally_cols.split(",") if t.strip()
+    )
 
     if args.scorer not in SCORERS:
         ap.error(f"Unknown scorer {args.scorer!r}. "
@@ -1594,6 +1648,7 @@ def main():
         grid_rows         = args.grid_rows,
         grid_cols         = args.grid_cols,
         tally_exclude     = args.tally_exclude,
+        tally_col_include = args.tally_col_include,
     )
 
     if sched.last_stats is not None:
@@ -1603,7 +1658,8 @@ def main():
         for line in st.summary_lines(opcode_tally=args.opcode_tally,
                                      grid_rows=args.grid_rows,
                                      grid_cols=args.grid_cols,
-                                     tally_exclude=args.tally_exclude):
+                                     tally_exclude=args.tally_exclude,
+                                     tally_col_include=args.tally_col_include):
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
