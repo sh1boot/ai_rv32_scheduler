@@ -86,7 +86,7 @@ _RE_LABEL_HDR = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$", re.IGNORECASE)
 # terminator prevents all-hex mnemonics like "add" from being consumed as an
 # extra hex group when only one space separates them from the last hex byte.
 _RE_INSTR = re.compile(
-    r"^([0-9a-f]+):\s+"           # address
+    r"^\s*([0-9a-f]+):\s+"        # address
     r"([0-9a-f]{4,8})"            # hex instruction representation
     r"\s*\t"                      # padding then tab separating encoding from mnemonic
     r"(\S.*)$",                   # mnemonic + operands (+ optional comment)
@@ -96,7 +96,7 @@ _RE_INSTR = re.compile(
 # Pure data line (two or more 4-byte words, no mnemonic column):
 #   "ADDR:  WORD  WORD  ..."
 _RE_DATA = re.compile(
-    r"^[0-9a-f]+:\s+((?:[0-9a-f]{8}\s){2,})\s*(.*)$",
+    r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{8}\s){2,})\s*(.*)$",
     re.IGNORECASE,
 )
 
