@@ -398,6 +398,7 @@ class Instruction:
     imm:        object = None  # int immediate if present, else None
     mem:        object = None  # (offset:int, base:str) for load/store, else None
     dual_arith_ok:       bool = False
+    dual_arith_ok_wide:  bool = False
     # Source lines (label definitions) that must be emitted immediately before
     # this instruction wherever it is scheduled.  Used for non-barrier labels
     # such as .Lpcrel_hi* that must stay anchored to the instruction they
@@ -726,6 +727,7 @@ _DUAL_ARITH_MN = frozenset({
     "sub",  "subw",
     "and",  "bic",  "andn",
     "or",   "xor",
+    "slli", "srli",              # shift-immediate (moved from dual_arith2)
 })
 # R-type instructions whose rs1/rs2 can be swapped without changing the result.
 _COMMUTATIVE_BINOP = frozenset({
@@ -737,7 +739,7 @@ _COMMUTATIVE_BINOP = frozenset({
 })
 _REG4      = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
-_IMM_FORMS = frozenset({"addi", "addiw", "andi"})
+_IMM_FORMS = frozenset({"addi", "addiw", "andi", "slli", "srli"})
 
 def _dual_arith_ok(instr: "Instruction") -> bool:
     mn  = instr.mnemonic
@@ -762,9 +764,13 @@ def _dual_arith_ok(instr: "Instruction") -> bool:
         imm = instr.imm
         if imm is None:
             return False
-        limit = 31 if mn == "addi" else 15
-        if imm < -(limit + 1) or imm > limit:
-            return False
+        if mn in ("slli", "srli"):
+            if imm < 1 or imm > 31:
+                return False
+        else:
+            limit = 31 if mn in ("addi", "addiw") else 15
+            if imm < -(limit + 1) or imm > limit:
+                return False
     return True
 
 
@@ -786,8 +792,12 @@ def _dual_arith_ok_wide(instr: "Instruction") -> bool:
         imm = instr.imm
         if imm is None:
             return False
-        limit = 31 if mn == "addi" else 15
-        if imm < -(limit + 1) or imm > limit:
-            return False
+        if mn in ("slli", "srli"):
+            if imm < 1 or imm > 31:
+                return False
+        else:
+            limit = 31 if mn in ("addi", "addiw") else 15
+            if imm < -(limit + 1) or imm > limit:
+                return False
     return True
 

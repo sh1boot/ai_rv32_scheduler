@@ -818,7 +818,12 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
         return False
     if b.mnemonic in _IMM_FORMS:
         imm = b.imm
-        if imm is None or imm < -16 or imm > 15:
+        if imm is None:
+            return False
+        if b.mnemonic in ("slli", "srli"):
+            if imm < 1 or imm > 31:
+                return False
+        elif imm < -16 or imm > 15:
             return False
     # A's result is consumed by B and not needed afterwards.
     if rd_a not in liveness.get(b.index, frozenset()):
@@ -891,7 +896,6 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
         return False
     # rsd must appear as either operand of the branch (commutativity).
     return rsd in b.uses
-
 
 
 # Pairs of mnemonics that consume the same two source registers but produce
