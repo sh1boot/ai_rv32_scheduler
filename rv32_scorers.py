@@ -1099,17 +1099,71 @@ def _rule_arith_return(a: "Instruction", b: "Instruction",
     return True
 
 
-# Tally rules: opt-in via --tally=, tried only after all primary rules
-# have failed.  They cannot displace primary-rule pairs.  Intended for
-# statistics gathering — to quantify how many additional pairs a candidate
-# rule would create without committing it to the main rule set.
+# ---------------------------------------------------------------------------
+# Per-side eligibility predicates for tally rules
+# ---------------------------------------------------------------------------
+# Each function tests whether a single instruction is structurally eligible
+# to occupy the A slot (first/producer) or B slot (second/consumer) of the
+# corresponding tally rule.  These are used to annotate unpaired instructions
+# in the scheduler output; the downstream rv32_tally.py tool reads these
+# annotations to compute statistics without re-running the scheduler.
 #
-# Each entry is (name, rule_fn).
+# Liveness-dependent rules (chain, rsd_live) use loose structural criteria
+# that do not require knowledge of the adjacent instruction.
+
+def _chain_a_eligible(instr: "Instruction") -> bool:
+    """A-eligible for 'chain': defines a non-x0 register (potential producer)."""
+    return bool(instr.defs) and instr.defs[0] != "x0"
+
+
+def _chain_b_eligible(instr: "Instruction") -> bool:
+    """B-eligible for 'chain': has at least one use (potential consumer)."""
+    return bool(instr.uses)
+
+
+def _rsd_live_a_eligible(instr: "Instruction") -> bool:
+    """A-eligible for 'rsd_live': RSD form (rs1 == rd), rd != x0."""
+    if not instr.defs or not instr.uses:
+        return False
+    rd = instr.defs[0]
+    return rd != "x0" and instr.uses[0] == rd
+
+
+def _rsd_live_b_eligible(instr: "Instruction") -> bool:
+    """B-eligible for 'rsd_live': has at least one use (potential consumer)."""
+    return bool(instr.uses)
+
+
+def _arith_return_a_eligible(instr: "Instruction") -> bool:
+    """A-eligible for 'arith_return': defines a register, not branch/mem/return/nop."""
+    if not instr.defs:
+        return False
+    if instr.mnemonic in _COMPACT32_BRANCH_MN or _is_mem_op(instr):
+        return False
+    if instr.mnemonic in ("nop", "ret", "tail", "call", "ecall", "ebreak",
+                          "fence", "fence.i"):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Tally rules
+# ---------------------------------------------------------------------------
+# Candidate pairing rules used for statistics gathering only.  They are never
+# activated during scheduling; instead, unpaired instructions in the scheduler
+# output are annotated with TALLY:name:A / TALLY:name:B tags indicating which
+# rules each instruction is eligible for on each side.
+#
+# Each entry is (name, pair_fn, a_eligible_fn, b_eligible_fn).
+#   name           : short identifier, used in annotations and --list-rules
+#   pair_fn        : full rule predicate (a, b, liveness) -> bool
+#   a_eligible_fn  : per-instruction A-side structural check (instr) -> bool
+#   b_eligible_fn  : per-instruction B-side structural check (instr) -> bool
 TALLY_RULES: list = [
-    ("arith_mem",    _rule_arith_mem),
-    ("chain",        _rule_chain),
-    ("rsd_live",     _rule_rsd_live),
-    ("arith_return", _rule_arith_return),
+    ("arith_mem",    _rule_arith_mem,    _is_arith_mem_a,          _mem_small_offset_ok),
+    ("chain",        _rule_chain,        _chain_a_eligible,        _chain_b_eligible),
+    ("rsd_live",     _rule_rsd_live,     _rsd_live_a_eligible,     _rsd_live_b_eligible),
+    ("arith_return", _rule_arith_return, _arith_return_a_eligible, _is_return_instr),
 ]
 
 
@@ -1137,7 +1191,7 @@ def make_compact32_scorer(liveness: dict,
     """
     cell: list = [liveness]
 
-    _tally_by_name = {name: fn for name, fn in TALLY_RULES}
+    _tally_by_name = {name: fn for name, fn, _a, _b in TALLY_RULES}
     active_tally: list = [
         (name, _tally_by_name[name])
         for name in tally_rules

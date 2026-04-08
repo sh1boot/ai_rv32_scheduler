@@ -6,19 +6,22 @@ RV32 instruction scheduler: reads assembly source,
 reorders instructions within basic blocks to maximise pairing opportunities,
 and emits the reordered assembly with PAIR+ annotations.
 
+Unpaired instructions are annotated with TALLY:/CLASS: tags indicating which
+secondary pairing rules (see TALLY_RULES in rv32_scorers.py) they are
+eligible for on each side.  Use rv32_tally.py to analyse these annotations.
+
 Usage
 -----
     python rv32_scheduler.py input.s
     python rv32_scheduler.py input.s --scorer compact32
-    python rv32_scheduler.py input.s --scorer compact32 --opcode-tally
     python rv32_scheduler.py input.s --no-rename -v
     python rv32_scheduler.py --list-rules
     python rv32_scheduler.py -          # read from stdin
 
 """
-import re, io, sys, copy, argparse, shutil
+import re, io, sys, copy, argparse
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from rv32_core import (
@@ -83,29 +86,6 @@ class PairStats:
         Reference ceiling: floor(rvc_eligible / 2) is the maximum achievable
         RVC pairs if every eligible instruction could be matched with another.
 
-    singleton_tally : {(label_a, label_b): int}
-        For every position i where instruction i ended up as a singleton and
-        i+1 exists, record (label(i), label(i+1)).  This is exactly the (a, b)
-        pair the scorer tested and rejected.  Sorted by count descending, this
-        reveals which opcode combinations are most often adjacent but unpairable
-        — the highest-count entries are the best candidates for new pairing rules.
-
-        Labels are the instruction mnemonic, except that loads and stores with
-        sp (x2) as their base register use the qualified form ``mnemonic(sp)``
-        (e.g. ``lw(sp)``, ``sw(sp)``).  Stack-relative accesses are subject to
-        different pairing constraints than heap/data accesses and benefit from
-        being counted separately.
-
-        Note: the last instruction in the sequence (no successor) contributes
-        a (label, "") entry — i.e. it is counted as a singleton with an empty
-        partner label, since there is no adjacent instruction to compare against.
-
-    unpaired_opcode_tally : {label: int}
-        Flat count of instructions that ended up unpaired, keyed by the same
-        qualified label used in singleton_tally (``lw(sp)`` etc. for
-        stack-relative accesses, plain mnemonic otherwise).  Useful for "which
-        opcodes most often miss pairing" without worrying about the partner.
-
     Size estimate
     -------------
     estimated_bytes : 4 bytes per successful pair + 4 bytes per unpaired instr
@@ -126,21 +106,6 @@ class PairStats:
     baseline_bytes:   int
     saving_bytes:     int
     saving_pct:       float
-    singleton_tally:        dict   # {(mn_a, mn_b): count} — unpaired adjacent pairs
-    unpaired_opcode_tally:  dict   # {mnemonic: count} — flat singleton opcode counts
-    # Unpaired instructions split by rvc eligibility.
-    # unpaired_rvc     : unpaired instructions that satisfy can_compress()
-    # unpaired_non_rvc : unpaired instructions that do not
-    unpaired_rvc:     int = 0
-    unpaired_non_rvc: int = 0
-    # Per-mnemonic count of unpaired rvc-eligible instructions.
-    # Parallel to unpaired_opcode_tally but restricted to can_compress() == True.
-    unpaired_rvc_opcode_tally: dict = field(default_factory=dict)
-    # Tally-rule pair tallies: same structure as singleton_tally /
-    # unpaired_opcode_tally but counting the A-side instructions of pairs
-    # claimed by tally rules.  Empty when no tally rules are active.
-    tally_singleton_tally: dict = field(default_factory=dict)
-    tally_opcode_tally:    dict = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "PairStats":
@@ -152,22 +117,10 @@ class PairStats:
             rvc_eligible=0,
             estimated_bytes=0, baseline_bytes=0,
             saving_bytes=0, saving_pct=0.0,
-            singleton_tally={}, unpaired_opcode_tally={},
-            unpaired_rvc=0, unpaired_non_rvc=0,
-            unpaired_rvc_opcode_tally={},
-            tally_singleton_tally={}, tally_opcode_tally={},
         )
 
-    def summary_lines(self, opcode_tally: bool = False,
-                      grid_rows: int = 20, grid_cols: int = 20,
-                      tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
-                      tally_col_include: "frozenset[str]" = frozenset()) -> list:
+    def summary_lines(self) -> list:
         """Return comment lines suitable for appending to assembly output.
-
-        opcode_tally: when True, append the singleton opcode-pair tally and
-            the unpaired-opcode grid.  Omitted by default to keep output concise.
-        grid_rows, grid_cols: dimensions of the cross-tab grid (number of rows
-            and columns shown).
 
         Output structure
         ----------------
@@ -181,11 +134,11 @@ class PairStats:
         E = rvc_eligible.  Both rows share the same /N denominator and the
         same "of T" total so the numbers are immediately comparable.
 
-        Rule rows follow at one level of indentation, then the unpaired
-        breakdown, then the size estimate.
+        Rule rows follow at one level of indentation, then the size estimate.
+        Opcode tally tables have moved to the rv32_tally.py tool, which reads
+        TALLY:/CLASS: annotations from the scheduler output.
         """
         # ── Header rows: pairs achieved vs rvc ceiling ───────────────────
-        # Pad the shorter label so the numeric columns align.
         lbl_pairs = "pairs:"
         lbl_rvc   = "rvc ceiling:"
         hdr_w     = max(len(lbl_pairs), len(lbl_rvc))
@@ -219,161 +172,15 @@ class PairStats:
             if missed: parts.append(f"{missed} missed")
             lines.append(f"#   {label}: {'  '.join(parts)}")
 
-        # ── Unpaired breakdown ───────────────────────────────────────────
+        # ── Unpaired count and size estimate ─────────────────────────────
         if self.unpaired_instrs:
-            lines.append(
-                f"# unpaired:  {self.unpaired_instrs} total"
-                f"  —  {self.unpaired_rvc} rvc-eligible,"
-                f"  {self.unpaired_non_rvc} not"
-            )
+            lines.append(f"# unpaired:  {self.unpaired_instrs}")
 
         lines.append(
             f"# size est:  {self.estimated_bytes} bytes"
             f"  (baseline {self.baseline_bytes},"
             f" saving {self.saving_bytes} = {self.saving_pct:.1f}%)"
         )
-        if opcode_tally and self.tally_singleton_tally:
-            lines.extend(self._opcode_tally_lines(
-                grid_rows=grid_rows, grid_cols=grid_cols,
-                tally_exclude=tally_exclude, tally_col_include=tally_col_include,
-                singleton_tally=self.tally_singleton_tally,
-                opcode_tally=self.tally_opcode_tally,
-                header="tally rule opcode pair table"
-                       " (rows=A-side, cols=B-side, +total):"))
-        if opcode_tally:
-            lines.extend(self._opcode_tally_lines(
-                grid_rows=grid_rows, grid_cols=grid_cols,
-                tally_exclude=tally_exclude, tally_col_include=tally_col_include))
-        return lines
-
-    def _opcode_tally_lines(self, grid_rows: int = 20, grid_cols: int = 20,
-                            tally_exclude: "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
-                            tally_col_include: "frozenset[str]" = frozenset(),
-                            singleton_tally: "dict | None" = None,
-                            opcode_tally: "dict | None" = None,
-                            header: str = "unpaired opcode pair table"
-                                          " (rows=unpaired, cols=successor, +total):",
-                            ) -> list:
-        """
-        Format an opcode cross-tab grid.
-
-        When *singleton_tally* and *opcode_tally* are None (the default) the
-        instance's own unpaired tallies are used.  Pass the tally-rule tallies
-        to render the tally-rule match table instead.
-
-        Rows are the top *grid_rows* opcodes by total count (descending).
-        One fixed leading column shows the ``total``; the remaining *grid_cols*
-        columns are the most frequent B-side opcodes.
-
-        tally_exclude
-            Set of category names to hide from the table.  Recognised tokens:
-            ``"big"``   — labels ending in ``(big)``
-            ``"lui"``   — the ``lui`` mnemonic
-            ``"auipc"`` — the ``auipc`` mnemonic
-            Default excludes all three.  Pass an empty frozenset to show all.
-
-        tally_col_include
-            If non-empty, restrict columns to mnemonics in these groups.
-            Tokens same as *tally_exclude*.  Empty = all columns (default).
-        """
-        st = self.singleton_tally   if singleton_tally is None else singleton_tally
-        ot = self.unpaired_opcode_tally if opcode_tally is None else opcode_tally
-        if not st and not ot:
-            return []
-
-        lines = []
-
-        def _exclude(label: str) -> bool:
-            if "big" in tally_exclude and label.endswith("(big)"):
-                return True
-            base = _tally_base(label)
-            if base in tally_exclude:
-                return True
-            for group, mn_set in _TALLY_GROUP.items():
-                if group in tally_exclude and base in mn_set:
-                    return True
-            return False
-
-        def _include_col(label: str) -> bool:
-            if not tally_col_include:
-                return True
-            base = _tally_base(label)
-            if base in tally_col_include:
-                return True
-            for group, mn_set in _TALLY_GROUP.items():
-                if group in tally_col_include and base in mn_set:
-                    return True
-            return False
-
-        def _row_group(label: str) -> int:
-            """Return sort key (group index) for a row mnemonic."""
-            base = _tally_base(label)
-            for i, g in enumerate(("arith", "mem", "control")):
-                if base in _TALLY_GROUP[g]:
-                    return i
-            return 3   # "other"
-
-        _GROUP_LABELS = ("arith", "mem", "control", "other")
-
-        all_mn       = set(ot)
-        actual_total = sum(ot.values())
-        visible_mn   = [mn for mn in all_mn if not _exclude(mn)]
-        # Sort by group first, then descending total within group.
-        # Take up to grid_rows but preserve group boundaries.
-        visible_mn.sort(key=lambda mn: (_row_group(mn), -ot.get(mn, 0)))
-        row_ops = visible_mn[:grid_rows]
-
-        tbl = {(a, b): c for (a, b), c in st.items()}
-
-        all_col_mn     = {mn_b for (_, mn_b) in st
-                          if mn_b and not _exclude(mn_b) and _include_col(mn_b)}
-        col_totals_all = {mn_b: sum(tbl.get((mn_a, mn_b), 0) for mn_a in visible_mn)
-                          for mn_b in all_col_mn}
-        col_ops    = [mn for mn, _ in
-                      sorted(col_totals_all.items(), key=lambda kv: -kv[1])[:grid_cols]]
-        col_totals = {mn_b: col_totals_all[mn_b] for mn_b in col_ops}
-        grand_total = sum(ot.get(mn, 0) for mn in visible_mn)
-        hidden      = actual_total - grand_total
-
-        col_w   = max((len(mn) for mn in col_ops), default=4)
-        row_w   = max((len(mn) for mn in row_ops), default=4)
-        total_w = max(5, max((len(str(ot.get(mn, 0))) for mn in row_ops), default=1))
-        total_w = max(total_w, len(str(actual_total)))
-
-        lines.append(f"# {header}")
-        if hidden:
-            lines.append(f"#   ({hidden} of {actual_total} hidden"
-                         f" — use --tally-exclude= to see all)")
-        if tally_col_include:
-            included = ", ".join(sorted(tally_col_include))
-            lines.append(f"#   (columns restricted to: {included})")
-        lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
-                     + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
-                        if col_ops else ""))
-
-        tot_row = f"# {'':>{row_w}}  {actual_total:>{total_w}d}"
-        if col_ops:
-            tot_row += "  " + "  ".join(
-                f"{col_totals[mn_b]:>{col_w}d}" if col_totals[mn_b]
-                else " " * col_w
-                for mn_b in col_ops)
-        lines.append(tot_row)
-
-        # Emit rows grouped by instruction class with separator headers.
-        current_group = -1
-        for mn_a in row_ops:
-            g = _row_group(mn_a)
-            if g != current_group:
-                current_group = g
-                lines.append(f"# {'--- ' + _GROUP_LABELS[g] + ' ---':>{row_w + total_w + 3}}")
-            row = f"# {mn_a:<{row_w}}  {ot.get(mn_a, 0):>{total_w}d}"
-            if col_ops:
-                cells = [f"{tbl.get((mn_a, mn_b), 0):>{col_w}d}"
-                         if tbl.get((mn_a, mn_b), 0) else " " * col_w
-                         for mn_b in col_ops]
-                row += "  " + "  ".join(cells)
-            lines.append(row)
-
         return lines
 
     @classmethod
@@ -404,8 +211,6 @@ class PairStats:
         saving_bytes     = sum(s.saving_bytes      for s in stats)
         saving_pct       = ((saving_bytes / baseline_bytes * 100)
                             if baseline_bytes else 0.0)
-        unpaired_rvc     = sum(s.unpaired_rvc      for s in stats)
-        unpaired_non_rvc = sum(s.unpaired_non_rvc  for s in stats)
 
         return cls(
             total_instrs     = total_instrs,
@@ -421,83 +226,11 @@ class PairStats:
             baseline_bytes   = baseline_bytes,
             saving_bytes     = saving_bytes,
             saving_pct       = saving_pct,
-            singleton_tally        = _merge_dicts("singleton_tally"),
-            unpaired_opcode_tally  = _merge_dicts("unpaired_opcode_tally"),
-            unpaired_rvc     = unpaired_rvc,
-            unpaired_non_rvc = unpaired_non_rvc,
-            unpaired_rvc_opcode_tally = _merge_dicts("unpaired_rvc_opcode_tally"),
-            tally_singleton_tally = _merge_dicts("tally_singleton_tally"),
-            tally_opcode_tally    = _merge_dicts("tally_opcode_tally"),
         )
 
 # ---------------------------------------------------------------------------
-# Tally helpers (module-level so they can be used by the streaming processor)
+# Instruction class sets (used for CLASS: annotations on unpaired instructions)
 # ---------------------------------------------------------------------------
-
-# Default bit width for the "small immediate" threshold.
-# An immediate fits when its encoded value (after dividing by any scale
-# factor) lies in the signed range [-(2^(n-1)), 2^(n-1)-1], i.e. -16..+15
-# for n=5, or the unsigned range [0, 2^n - 1] = 0..31 where noted.
-_IMM_BITS = 5
-
-# Shift-amount fields are structurally 0..(2^n - 1) and are never big.
-_SHIFT_MN = frozenset({"slli", "srli", "srai", "slliw", "srliw", "sraiw"})
-
-# Upper-immediate instructions have no "small" form and are excluded from
-# the big/small split (they would always be classified as big).
-_UPPER_IMM_MN = frozenset({"lui", "auipc"})
-
-
-def _imm_is_big(instr: "Instruction", n: int = _IMM_BITS) -> bool:
-    """Return True if *instr*'s immediate exceeds the compact n-bit threshold.
-
-    Memory ops scale the threshold by data width so naturally-aligned
-    accesses within ±2^(n-1) elements are considered small
-    (e.g. ``lw rd, -64(rb)`` is small for n=5: −64 = −16×4).
-
-    ``addi rd, sp, imm`` uses an unsigned scale-4 check (stack frame
-    indexing: non-negative multiples of 4 up to 4×(2^n − 1)).
-
-    Shift-amount fields (slli/srli/srai …) and upper-immediate instructions
-    (lui/auipc) are excluded and always return False.
-
-    Returns False for instructions that carry no immediate.
-    """
-    mn = instr.mnemonic
-
-    if mn in _UPPER_IMM_MN or mn in _SHIFT_MN:
-        return False
-
-    lo_s = -(1 << (n - 1))          # −16 for n=5
-    hi_s =  (1 << (n - 1)) - 1      #  +15 for n=5
-    hi_u =  (1 << n) - 1            #  +31 for n=5
-
-    # Memory ops: offset scaled by data width.
-    if instr.mem is not None:
-        offset = instr.mem[0]
-        if offset is None:
-            return False
-        scale = _MEM_WIDTH.get(mn, 1)
-        return not (offset % scale == 0
-                    and lo_s * scale <= offset <= hi_s * scale)
-
-    imm = instr.imm
-    if imm is None:
-        return False
-
-    # addi rd, sp, imm: unsigned, scale 4 (stack frame addressing).
-    if mn == "addi" and instr.uses and instr.uses[0] == "x2":
-        return not (0 <= imm and imm % 4 == 0 and imm <= hi_u * 4)
-
-    # General signed n-bit check.
-    return not (lo_s <= imm <= hi_s)
-
-
-# ---------------------------------------------------------------------------
-# Tally-exclude group membership sets
-# ---------------------------------------------------------------------------
-# Used by --tally-exclude to hide whole instruction classes from opcode
-# tally tables and the tally rule scan.
 
 # Arithmetic and logic: integer ALU, shifts, multiply/divide, bit-manip.
 # Does NOT include lui/auipc (handled as separate tokens) or mem/control.
@@ -540,62 +273,12 @@ _TALLY_CONTROL_MN: frozenset = frozenset({
 # Memory: loads and stores (derived from the scorer's _MEM_OPS set).
 _TALLY_MEM_MN: frozenset = _MEM_OPS
 
-# Map token → set, used for both the label-based and instr-based checks.
+# Map class name → mnemonic set, used for CLASS: annotation generation.
 _TALLY_GROUP: dict = {
     "arith":   _TALLY_ARITH_MN,
     "mem":     _TALLY_MEM_MN,
     "control": _TALLY_CONTROL_MN,
 }
-
-
-def _tally_base(label: str) -> str:
-    """Strip ``(sp)`` and ``(big)`` qualifiers from a tally label."""
-    if label.endswith("(big)"):
-        label = label[:-5]
-    if label.endswith("(sp)"):
-        label = label[:-4]
-    return label
-
-
-def _tally_label(instr: "Instruction") -> str:
-    """Return the tally key for *instr*.
-
-    Stack-relative loads/stores gain a ``(sp)`` qualifier.  ``addi rd, x0,
-    imm`` is labelled ``li``.  Any instruction whose immediate exceeds the
-    compact encoding threshold (see ``_imm_is_big``) gains a ``(big)``
-    suffix.  Instructions with no immediate, or whose immediates are
-    structurally always large (lui, auipc) or always small (shifts), return
-    their plain mnemonic.
-    """
-    mn  = instr.mnemonic
-    big = _imm_is_big(instr)
-
-    # Stack-relative memory: qualify with (sp) then optionally (big).
-    if instr.mem is not None and instr.mem[1] == "x2":
-        base = f"{mn}(sp)"
-        return f"{base}(big)" if big else base
-
-    # addi rd, x0, imm → li form.
-    if mn == "addi" and not instr.uses:
-        return "li(big)" if big else "li"
-
-    return f"{mn}(big)" if big else mn
-
-
-def _tally_excluded(instr: "Instruction", tally_exclude: "frozenset[str]") -> bool:
-    """Return True if *instr* would be excluded from opcode-tally tables."""
-    if not tally_exclude:
-        return False
-    label = _tally_label(instr)
-    if "big" in tally_exclude and label.endswith("(big)"):
-        return True
-    if _tally_base(label) in tally_exclude:   # e.g. "lui", "auipc"
-        return True
-    mn = instr.mnemonic
-    for group, mn_set in _TALLY_GROUP.items():
-        if group in tally_exclude and mn in mn_set:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -708,54 +391,6 @@ def _chain_reorder_singletons(
     return result
 
 
-def _tally_bnb_reorder(
-    real_scheduled:     list,
-    pair_start_set:     set,
-    pair_end_set:       set,
-    graph:              "DepGraph",
-    tally_rule_list: list,
-    liveness_snap:      dict,
-    tally_exclude:      "frozenset[str]",
-) -> list:
-    """
-    Re-run BnB on each singleton run using tally rules as the score.
-
-    After the primary greedy walk has fixed all primary pairs, each maximal
-    run of consecutive unpaired instructions is independently rescheduled
-    via ``_bnb_schedule_window`` with a scorer built from *tally_rule_list*.
-    Paired positions are left untouched.
-
-    This gives tally rules the same BnB advantage that primary rules
-    receive, producing a fairer estimate of how many pairs a candidate rule
-    would achieve if promoted to primary.
-    """
-    def _tally_score(a: "Instruction", b: "Instruction") -> float:
-        if _tally_excluded(a, tally_exclude) or _tally_excluded(b, tally_exclude):
-            return 0.0
-        for _name, fn in tally_rule_list:
-            if fn(a, b, liveness_snap):
-                return 1.0
-        return 0.0
-
-    result: list = []
-    run:    list = []
-
-    def _flush_run():
-        if len(run) >= 2:
-            result.extend(_bnb_schedule_window(run, graph, _tally_score))
-        else:
-            result.extend(run)
-        run.clear()
-
-    for pos, instr in enumerate(real_scheduled):
-        if pos in pair_start_set or pos in pair_end_set:
-            _flush_run()
-            result.append(instr)
-        else:
-            run.append(instr)
-    _flush_run()
-    return result
-
 
 # ---------------------------------------------------------------------------
 # ABI-based block boundary liveness
@@ -835,8 +470,6 @@ def _process_block(
     cfg_live_out:      frozenset = frozenset(),
     same_base_reorder:    bool = False,
     chain_reorder:        bool = False,
-    tally_bnb_reorder: bool = False,
-    tally_exclude:        "frozenset[str]" = frozenset(),
 ) -> "PairStats":
     """
     Schedule, annotate, and emit one basic block, then return its PairStats.
@@ -931,22 +564,16 @@ def _process_block(
     total_instrs = len(real_scheduled)
     successful   = 0
 
-    rule_counts:           Counter = Counter()
-    rule_shadow:           Counter = Counter()
-    rule_missed:           Counter = Counter()
-    singleton_tally:           Counter = Counter()
-    unpaired_opcode_tally:     Counter = Counter()
-    unpaired_rvc_opcode_tally: Counter = Counter()
-    unpaired_rvc_count:    int     = 0
-    unpaired_non_rvc_count: int    = 0
+    rule_counts:  Counter = Counter()
+    rule_shadow:  Counter = Counter()
+    rule_missed:  Counter = Counter()
 
     pair_start_set: set  = set()
     pair_end_set:   set  = set()
     pair_rules:     dict = {}
 
-    rule_list           = getattr(pair_score, "_rule_list", None)
-    tally_rule_list = getattr(pair_score, "_tally_rule_list", [])
-    describe_fn         = getattr(pair_score, "_describe_pair", None)
+    rule_list     = getattr(pair_score, "_rule_list", None)
+    describe_fn   = getattr(pair_score, "_describe_pair", None)
     liveness_snap = (pair_score._liveness_cell[0]
                      if hasattr(pair_score, "_liveness_cell") else {})
 
@@ -987,78 +614,35 @@ def _process_block(
                     continue
         i += 1
 
-    # ── Optional BnB reorder of singleton runs for tally rules ───────────
-    # Reschedule each singleton run using tally rules as the score so
-    # that tally rules get the same BnB advantage as primary rules.
-    # Paired positions are left untouched; only unpaired runs are reordered.
-    if tally_bnb_reorder and tally_rule_list:
-        real_scheduled = _tally_bnb_reorder(
-            real_scheduled, pair_start_set, pair_end_set,
-            graph, tally_rule_list, liveness_snap, tally_exclude)
-        real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
-
-    # ── Secondary rule scan: positions left unpaired by the primary walk ──
-    # Secondary rules run on a fully-settled primary schedule, so they
-    # cannot displace primary pairs or affect BnB scheduling.  They only
-    # claim adjacent positions that are both still unpaired.
-    tally_pair_starts: set = set()
-    if tally_rule_list:
-        i = 0
-        while i < total_instrs:
-            if i in pair_start_set or i in pair_end_set:
-                i += 1
-                continue
-            if (i + 1 < total_instrs
-                    and i + 1 not in pair_start_set
-                    and i + 1 not in pair_end_set):
-                a_s, b_s = real_scheduled[i], real_scheduled[i + 1]
-                if (_tally_excluded(a_s, tally_exclude)
-                        or _tally_excluded(b_s, tally_exclude)):
-                    i += 1
-                    continue
-                matching_tally = [rn for rn, rf in tally_rule_list
-                                      if rf(a_s, b_s, liveness_snap)]
-                if matching_tally:
-                    winner = matching_tally[0]
-                    pair_start_set.add(i)
-                    pair_end_set.add(i + 1)
-                    tally_pair_starts.add(i)
-                    pair_rules[i] = winner
-                    successful += 1
-                    rule_counts[winner] += 1
-                    for rn in matching_tally[1:]:
-                        rule_shadow[rn] += 1
-                    i += 2
-                    continue
-            i += 1
-
-    tally_singleton_tally: Counter = Counter()
-    tally_opcode_tally: Counter = Counter()
-    for i in sorted(tally_pair_starts):
-        mn_a = _tally_label(real_scheduled[i])
-        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
-        tally_singleton_tally[(mn_a, mn_b)] += 1
-        tally_opcode_tally[mn_a] += 1
-
     # ── Optional chain-reorder of singleton runs ─────────────────────────
     if chain_reorder:
         real_scheduled = _chain_reorder_singletons(
             real_scheduled, pair_start_set, pair_end_set, graph)
         real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
 
-    # ── Tally pass over the (possibly reordered) sequence ────────────────
+    # ── Annotate each unpaired instruction with TALLY and CLASS tags ──────
+    # For each instruction that was not claimed by a primary rule, compute:
+    #   TALLY:<rule>:A  — eligible as first instruction (A-side) of that rule
+    #   TALLY:<rule>:B  — eligible as second instruction (B-side) of that rule
+    #   CLASS:<cls>     — instruction class membership (arith/mem/control)
+    # Multiple tags may appear.  These annotations are written into the output
+    # as assembly comments and parsed by the rv32_tally.py analysis tool.
+    tally_annots: dict = {}   # {instruction.index: "TAG1 TAG2 …"}
     for i, instr in enumerate(real_scheduled):
         if i in pair_start_set or i in pair_end_set:
             continue
-        mn_a = _tally_label(instr)
-        mn_b = _tally_label(real_scheduled[i + 1]) if i + 1 < total_instrs else ""
-        singleton_tally[(mn_a, mn_b)] += 1
-        unpaired_opcode_tally[mn_a]   += 1
-        if can_compress(instr):
-            unpaired_rvc_count             += 1
-            unpaired_rvc_opcode_tally[mn_a] += 1
-        else:
-            unpaired_non_rvc_count += 1
+        tags: list = []
+        for name, _pair_fn, a_fn, b_fn in TALLY_RULES:
+            if a_fn(instr):
+                tags.append(f"TALLY:{name}:A")
+            if b_fn(instr):
+                tags.append(f"TALLY:{name}:B")
+        classes = [cls for cls, mn_set in _TALLY_GROUP.items()
+                   if instr.mnemonic in mn_set]
+        if classes:
+            tags.append("CLASS:" + ",".join(sorted(classes)))
+        if tags:
+            tally_annots[instr.index] = " ".join(tags)
 
     # ── Emit annotated output ─────────────────────────────────────────────
     # Walk `scheduled` (sentinels included) in order.  Sentinels are barriers
@@ -1080,7 +664,8 @@ def _process_block(
             elif rp in pair_end_set:
                 print(instr.raw + "  # PAIR=", file=out)
             else:
-                print(instr.raw, file=out)
+                ann = tally_annots.get(instr.index, "")
+                print(instr.raw + (f"  # {ann}" if ann else ""), file=out)
 
     # ── Build and return PairStats ────────────────────────────────────────
     rvc_eligible    = sum(1 for instr in real_scheduled if can_compress(instr))
@@ -1106,13 +691,6 @@ def _process_block(
         baseline_bytes   = baseline_bytes,
         saving_bytes     = saving_bytes,
         saving_pct       = saving_pct,
-        singleton_tally           = singleton_tally,
-        unpaired_opcode_tally     = unpaired_opcode_tally,
-        unpaired_rvc              = unpaired_rvc_count,
-        unpaired_non_rvc          = unpaired_non_rvc_count,
-        unpaired_rvc_opcode_tally = unpaired_rvc_opcode_tally,
-        tally_singleton_tally = tally_singleton_tally,
-        tally_opcode_tally    = tally_opcode_tally,
     )
 
 # ---------------------------------------------------------------------------
@@ -1183,16 +761,10 @@ class AssemblyScheduler:
         self,
         pair_score:         PairScoreFn = None,
         rename:             bool = True,
-        opcode_tally:       bool = False,
         out                      = None,
         verbose:            bool = False,
         same_base_reorder:      bool = False,
         chain_reorder:          bool = False,
-        tally_bnb_reorder:  bool = False,
-        grid_rows:          int  = 20,
-        grid_cols:          int  = 20,
-        tally_exclude:      "frozenset[str]" = frozenset({"big", "lui", "auipc"}),
-        tally_col_include:  "frozenset[str]" = frozenset(),
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -1201,6 +773,10 @@ class AssemblyScheduler:
         is processed and written to *out* before the next block is read.
         Peak memory is O(block_size), not O(file_size).
 
+        Unpaired instructions are annotated with TALLY:/CLASS: tags (see
+        rv32_tally.py) indicating which secondary pairing rules they are
+        eligible for on each side.  Use rv32_tally.py to analyse the output.
+
         Parameters
         ----------
         pair_score
@@ -1208,8 +784,6 @@ class AssemblyScheduler:
             the compact32 scorer (``make_compact32_scorer``).
         rename
             If True, attempt destination-register renaming per block.
-        opcode_tally
-            If True, append the unpaired-opcode tally to the final summary.
         out
             File-like object to write to.  Defaults to ``sys.stdout``.
         verbose
@@ -1276,8 +850,6 @@ class AssemblyScheduler:
                                                             frozenset()),
                 same_base_reorder      = same_base_reorder,
                 chain_reorder          = chain_reorder,
-                tally_bnb_reorder  = tally_bnb_reorder,
-                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             pass_lines.clear()
@@ -1346,8 +918,6 @@ class AssemblyScheduler:
                                                             frozenset()),
                 same_base_reorder      = same_base_reorder,
                 chain_reorder          = chain_reorder,
-                tally_bnb_reorder  = tally_bnb_reorder,
-                tally_exclude          = tally_exclude,
             )
             all_stats.append(st)
             instructions.clear()
@@ -1462,11 +1032,7 @@ class AssemblyScheduler:
         merged = PairStats.merge(all_stats)
 
         # Append the file-wide summary as assembly comments.
-        for summary_line in merged.summary_lines(opcode_tally=opcode_tally,
-                                                  grid_rows=grid_rows,
-                                                  grid_cols=grid_cols,
-                                                  tally_exclude=tally_exclude,
-                                                  tally_col_include=tally_col_include):
+        for summary_line in merged.summary_lines():
             print(summary_line, file=out)
 
         self.last_stats = merged
@@ -1476,7 +1042,6 @@ class AssemblyScheduler:
         self,
         pair_score:   PairScoreFn = None,
         rename:       bool = True,
-        opcode_tally: bool = False,
         verbose:      bool = False,
     ) -> str:
         """
@@ -1489,8 +1054,7 @@ class AssemblyScheduler:
         if pair_score is None:
             pair_score = make_compact32_scorer({})
         buf = io.StringIO()
-        self.process(pair_score=pair_score, rename=rename,
-                     opcode_tally=opcode_tally, out=buf, verbose=verbose)
+        self.process(pair_score=pair_score, rename=rename, out=buf, verbose=verbose)
         return buf.getvalue().rstrip("\n")
 
 # ---------------------------------------------------------------------------
@@ -1509,75 +1073,22 @@ def main():
                     help=f"Scoring function to use. "
                          f"Choices: {list(SCORERS)}. Default: compact32")
     ap.add_argument("--list-rules", action="store_true",
-                    help="List available scorers and compact32 rules, then exit")
-    ap.add_argument("--opcode-tally", action="store_true",
-                    help="Append a ranked tally of unpaired opcode combinations "
-                         "to the output and stderr report. Use this to identify "
-                         "the best candidates for new pairing rules.")
-    _tally_exclude_default = "big,lui,auipc"
-    ap.add_argument("--tally-exclude",
-                    default=_tally_exclude_default,
-                    metavar="CATEGORIES",
-                    help="Comma-separated list of opcode categories to hide from "
-                         "--opcode-tally tables and the tally rule scan.  "
-                         "Individual tokens: big (labels ending in '(big)'), "
-                         "lui, auipc, or any bare mnemonic.  "
-                         "Group tokens: arith (integer ALU/shift/mul/div), "
-                         "mem (loads and stores), "
-                         "control (branches/jumps/calls/returns).  "
-                         f"Default: {_tally_exclude_default!r}.  "
-                         "Pass an empty string to show all entries.")
-    ap.add_argument("--tally-cols",
-                    default="",
-                    metavar="CATEGORIES",
-                    help="Restrict --opcode-tally columns to these categories only. "
-                         "Same tokens as --tally-exclude: group names (arith, mem, "
-                         "control) or individual mnemonics.  "
-                         "Empty (default) = show all column types.")
+                    help="List available scorers, compact32 rules, and tally rules, "
+                         "then exit")
     ap.add_argument("--wide-dual-arith", action="store_true",
                     help="Relax the dual-arith register constraint from x0..x15 "
                          "to all 32 integer registers.  Quantifies the pairing "
                          "gain if the encoding were extended to 5-bit register "
                          "fields for the dual-arith rule family.")
-    _tally_valid = [name for name, _ in TALLY_RULES]
-    _tally_default = ",".join(_tally_valid)
-    ap.add_argument(
-        "--tally",
-        dest="tally_rules",
-        default=_tally_default,
-        metavar="RULES",
-        help=f"Comma-separated list of tally rules to enable, in priority order. "
-             f"Evaluated after all primary rules fail; never displaces primary pairs. "
-             f"Default: all rules in their natural order. "
-             f"Pass an empty string to disable all tally rules. "
-             f"Valid names (use hyphens or underscores): "
-             + ", ".join(_tally_valid),
-    )
     ap.add_argument("--chain-reorder", action="store_true",
                     help="(Experimental) After scheduling, reorder unpaired "
                          "singleton instructions within each run to maximise "
-                         "producer-consumer adjacency.  Updates the opcode-tally "
-                         "table to reflect the reordered sequence, helping identify "
-                         "instruction pairs that naturally follow each other.")
-    ap.add_argument("--tally-reorder", action="store_true",
-                    help="(Experimental) Before the tally rule scan, re-run BnB "
-                         "on each singleton run using tally rules as the score "
-                         "function.  Gives tally rules the same scheduling "
-                         "advantage as primary rules, producing a fairer estimate of "
-                         "how many pairs a candidate rule would achieve if promoted.")
+                         "producer-consumer adjacency.")
     ap.add_argument("--same-base-reorder", action="store_true",
                     help="(Experimental) Allow loads/stores to reorder past each "
                          "other when they share the same base register, the base "
                          "is not modified between them, and their address ranges "
-                         "do not overlap.  Enables adjacent loads/stores within "
-                         "the same object to be moved together for pairing.")
-    ap.add_argument("--grid-rows", type=int, default=20, metavar="N",
-                    help="Number of rows in the --opcode-tally grid (default: 20)")
-    _default_grid_cols = max(5, (shutil.get_terminal_size(fallback=(120, 24)).columns
-                                 - 20) // 10)
-    ap.add_argument("--grid-cols", type=int, default=_default_grid_cols, metavar="N",
-                    help=f"Number of successor columns in the --opcode-tally grid "
-                         f"(default: {_default_grid_cols}, derived from terminal width)")
+                         "do not overlap.")
     args = ap.parse_args()
 
     if args.list_rules:
@@ -1591,18 +1102,11 @@ def main():
             doc = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:26s}  {doc}")
         print()
-        print("compact32 tally rules (opt-in via --tally=, after primary rules fail):")
-        for name, fn in TALLY_RULES:
+        print("tally rules (annotated on unpaired instructions as TALLY:name:A/B):")
+        for name, fn, a_fn, b_fn in TALLY_RULES:
             doc  = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:26s}  {doc}")
         return
-
-    args.tally_exclude = frozenset(
-        t.strip() for t in args.tally_exclude.split(",") if t.strip()
-    )
-    args.tally_col_include = frozenset(
-        t.strip() for t in args.tally_cols.split(",") if t.strip()
-    )
 
     if args.scorer not in SCORERS:
         ap.error(f"Unknown scorer {args.scorer!r}. "
@@ -1617,21 +1121,8 @@ def main():
 
     factory, _ = SCORERS[args.scorer]
     if args.scorer == "compact32":
-        _tally_by_name = {name: name for name, _ in TALLY_RULES}
-        _tally_by_name.update({name.replace("_", "-"): name for name, _ in TALLY_RULES})
-        _tally_requested = []
-        for _tok in (t.strip() for t in args.tally_rules.split(",")):
-            if not _tok:
-                continue
-            if _tok in _tally_by_name:
-                _tally_requested.append(_tally_by_name[_tok])
-            else:
-                print(f"warning: unknown tally rule {_tok!r}; "
-                      f"valid names: {', '.join(n for n, _ in TALLY_RULES)}",
-                      file=sys.stderr)
         pair_score = make_compact32_scorer(
-            {}, tally_rules=_tally_requested,
-            wide_dual_arith=args.wide_dual_arith)
+            {}, wide_dual_arith=args.wide_dual_arith)
     else:
         pair_score = factory()
 
@@ -1639,27 +1130,17 @@ def main():
     sched.process(
         pair_score        = pair_score,
         rename            = args.rename,
-        opcode_tally      = args.opcode_tally,
         out               = sys.stdout,
         verbose           = args.verbose,
         same_base_reorder = args.same_base_reorder,
-        chain_reorder          = args.chain_reorder,
-        tally_bnb_reorder  = args.tally_reorder,
-        grid_rows         = args.grid_rows,
-        grid_cols         = args.grid_cols,
-        tally_exclude     = args.tally_exclude,
-        tally_col_include = args.tally_col_include,
+        chain_reorder     = args.chain_reorder,
     )
 
     if sched.last_stats is not None:
         st = sched.last_stats
         src_label = args.input if args.input != "-" else "<stdin>"
         print(f"\n# --- report: {args.scorer}  {src_label} ---", file=sys.stderr)
-        for line in st.summary_lines(opcode_tally=args.opcode_tally,
-                                     grid_rows=args.grid_rows,
-                                     grid_cols=args.grid_cols,
-                                     tally_exclude=args.tally_exclude,
-                                     tally_col_include=args.tally_col_include):
+        for line in st.summary_lines():
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
