@@ -36,6 +36,7 @@ from rv32_core import (
     Instruction,
     _DUAL_ARITH_MN, _REG4, _IMM_FORMS,
     _dual_arith_ok, _dual_arith_ok_wide,
+    _DUAL_ARITH2_MN, _IMM_FORMS2, _dual_arith2_ok,
 )
 
 # ---------------------------------------------------------------------------
@@ -893,6 +894,99 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
     return rsd in b.uses
 
 
+# ---------------------------------------------------------------------------
+# Extended dual-arith rules (dual_arith2 family)
+# Mirror of the dual_arith / dual_arith_chain / arith_jump / arith_branch
+# rules, applied to the second-tier opcode set (_DUAL_ARITH2_MN):
+#   shifts:   slli, srli, srai, sll, srl
+#   imm ops:  xori, slti
+#   compares: slt, sltu
+#   multiply: mul, mulhu
+#   divide:   rem
+# ---------------------------------------------------------------------------
+
+def _rule_dual_arith2(a: "Instruction", b: "Instruction",
+                      liveness: dict) -> bool:
+    """
+    Two independent extended-arith operations, each satisfying the
+    extended dual-arith constraints (RSD form, x0..x15, bounded immediate).
+
+    Neither instruction may depend on the other.
+    """
+    return a.dual_arith2_ok and b.dual_arith2_ok
+
+
+def _rule_dual_arith2_chain(a: "Instruction", b: "Instruction",
+                             liveness: dict) -> bool:
+    """
+    Extended-arith op A feeding B as its first source (chain form).
+
+    Matches:
+        <arith2 op>  rd_a, rd_a, ...    (A in RSD form; rd_a in x0..x15)
+        <arith2 op>  rd_b, rd_a, ...    (B reads A's result as rs1)
+
+    rd_a must be dead after B.  rd_b and rs2 (if present) must be in x0..x15.
+    """
+    if not a.dual_arith2_ok:
+        return False
+    rd_a = a.defs[0]
+    if b.mnemonic not in _DUAL_ARITH2_MN:
+        return False
+    if not b.uses or b.uses[0] != rd_a:
+        return False
+    rd_b = b.defs[0] if b.defs else None
+    if rd_b is None or rd_b not in _REG4:
+        return False
+    if len(b.uses) >= 2 and b.uses[1] not in _REG4:
+        return False
+    if b.mnemonic in _IMM_FORMS2:
+        imm = b.imm
+        if imm is None:
+            return False
+        if b.mnemonic in ("slli", "srli", "srai"):
+            if imm < 1 or imm > 31:
+                return False
+        else:                          # xori, slti
+            if imm < -16 or imm > 15:
+                return False
+    return rd_a in liveness.get(b.index, frozenset())
+
+
+def _rule_arith2_jump(a: "Instruction", b: "Instruction",
+                      liveness: dict) -> bool:
+    """
+    Extended-arith operation followed by an unconditional call or jump.
+
+    Matches:
+        <arith2 op>  rd, rd, ...   (RSD form, rd in x0..x15)
+        jal / jalr   ...
+    """
+    return a.dual_arith2_ok and b.mnemonic in ("jal", "jalr")
+
+
+def _rule_arith2_branch(a: "Instruction", b: "Instruction",
+                        liveness: dict) -> bool:
+    """
+    Extended-arith operation followed by a conditional branch on the result.
+
+    Matches:
+        <arith2 op>  rd, rd, ...   (RSD form, rd in x0..x15)
+        beqz / bnez  rd, label     (same rd)
+
+    Typical patterns:
+        slt   a0, a0, a1 ; bnez a0, .true
+        sltu  a0, a0, lim; bnez a0, .in_range
+        slli  a0, a0, 1  ; beqz a0, .was_zero
+    """
+    if not a.dual_arith2_ok:
+        return False
+    rd = a.defs[0] if a.defs else None
+    if rd is None:
+        return False
+    if b.mnemonic not in ("beqz", "bnez"):
+        return False
+    return (b.uses[0] if b.uses else None) == rd
+
 
 # Pairs of mnemonics that consume the same two source registers but produce
 # two distinct results, making them natural candidates for dual-issue.
@@ -1020,6 +1114,10 @@ COMPACT32_RULES: list = [
     ("arith_jump",          _rule_arith_jump),
     ("arith_branch",        _rule_arith_branch),
     ("addi_branch",         _rule_addi_branch),
+    ("dual_arith2",         _rule_dual_arith2),
+    ("dual_arith2_chain",   _rule_dual_arith2_chain),
+    ("arith2_jump",         _rule_arith2_jump),
+    ("arith2_branch",       _rule_arith2_branch),
 ]
 
 def _is_return_instr(instr: "Instruction") -> bool:
@@ -1238,6 +1336,11 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
                 eligible.add("addi_branch")
+        if _dual_arith2_ok(a):
+            eligible.add("dual_arith2")
+            eligible.add("dual_arith2_chain")
+            eligible.add("arith2_jump")
+            eligible.add("arith2_branch")
         return frozenset(eligible)
 
     _elig_cache: dict = {}
