@@ -83,10 +83,12 @@ _I = {
     "bltu":  (None, ("rs1","rs2")), "bgeu":  (None, ("rs1","rs2")),
     "lb":    ("rd",  ("mem_base",)), "lh":   ("rd",  ("mem_base",)),
     "lw":    ("rd",  ("mem_base",)), "lbu":  ("rd",  ("mem_base",)),
-    "lhu":   ("rd",  ("mem_base",)),
+    "lhu":   ("rd",  ("mem_base",)), "lwu":  ("rd",  ("mem_base",)),
+    "ld":    ("rd",  ("mem_base",)),
     "sb":    (None, ("rs1","mem_base")),
     "sh":    (None, ("rs1","mem_base")),
     "sw":    (None, ("rs1","mem_base")),
+    "sd":    (None, ("rs1","mem_base")),
     # ── Pseudo-instructions ──────────────────────────────────────────────
     "beqz":  (None, ("rs1",)),      "bnez":  (None, ("rs1",)),
     "blez":  (None, ("rs1",)),      "bgez":  (None, ("rs1",)),
@@ -320,9 +322,9 @@ _BRANCH_MNEMONICS = frozenset({
     "jal", "jalr", "j", "jr",
 })
 _AMO_PREFIXES = ("lr.", "sc.", "amo")
-_LOADS  = frozenset({"lb","lh","lw","lbu","lhu","flw","fld","flq"} |
+_LOADS  = frozenset({"lb","lh","lw","lbu","lhu","lwu","ld","flw","fld","flq"} |
                     {k for k in _V if k.startswith("vle")})
-_STORES = frozenset({"sb","sh","sw","fsw","fsd","fsq"} |
+_STORES = frozenset({"sb","sh","sw","sd","fsw","fsd","fsq"} |
                     {k for k in _V if k.startswith("vse")})
 _AMO_SUFFIX_RE = re.compile(r"\.(aq|rl|aqrl)$")
 
