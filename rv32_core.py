@@ -3,7 +3,9 @@ rv32_core.py
 
 Shared foundations for the RV32 scheduler toolchain:
   - Register name tables and normalisation
-  - ISA opcode tables (I, M, A, F, D, Q, C, Zicsr, Zifencei, Zba/Zbb/Zbc/Zbs, V)
+  - ISA opcode tables (I, M, A, F, D, Q, C, Zicsr, Zifencei, Zba/Zbb/Zbc/Zbs, V,
+                      Zicond, Zicbom/Zicbop/Zicboz, Zihintpause,
+                      Zvkned/Zvknhb/Zvkb/Zvkt)
   - Instruction dataclass and line parser (parse_line)
   - Dual-arith eligibility helpers
 
@@ -76,6 +78,10 @@ _I = {
     "ori":   ("rd", ("rs1",)),      "andi":  ("rd", ("rs1",)),
     "slli":  ("rd", ("rs1",)),      "srli":  ("rd", ("rs1",)),
     "srai":  ("rd", ("rs1",)),
+    "sllw":  ("rd", ("rs1","rs2")), "srlw":  ("rd", ("rs1","rs2")),
+    "sraw":  ("rd", ("rs1","rs2")),
+    "slliw": ("rd", ("rs1",)),      "srliw": ("rd", ("rs1",)),
+    "sraiw": ("rd", ("rs1",)),
     "lui":   ("rd", ()),            "auipc": ("rd", ()),
     "jal":   ("rd", ()),            "jalr":  ("rd", ("mem_base",)),
     "beq":   (None, ("rs1","rs2")), "bne":   (None, ("rs1","rs2")),
@@ -143,6 +149,9 @@ _M = {
     "mulhsu": ("rd", ("rs1","rs2")), "mulhu":  ("rd", ("rs1","rs2")),
     "div":    ("rd", ("rs1","rs2")), "divu":   ("rd", ("rs1","rs2")),
     "rem":    ("rd", ("rs1","rs2")), "remu":   ("rd", ("rs1","rs2")),
+    "mulw":   ("rd", ("rs1","rs2")),
+    "divw":   ("rd", ("rs1","rs2")), "divuw":  ("rd", ("rs1","rs2")),
+    "remw":   ("rd", ("rs1","rs2")), "remuw":  ("rd", ("rs1","rs2")),
 }
 
 _A = {
@@ -153,6 +162,13 @@ _A = {
     "amoxor.w":  ("rd", ("rs1","rs2")), "amomax.w":  ("rd", ("rs1","rs2")),
     "amomin.w":  ("rd", ("rs1","rs2")), "amomaxu.w": ("rd", ("rs1","rs2")),
     "amominu.w": ("rd", ("rs1","rs2")),
+    "lr.d":      ("rd", ("rs1",)),
+    "sc.d":      ("rd", ("rs1","rs2")),
+    "amoswap.d": ("rd", ("rs1","rs2")), "amoadd.d":  ("rd", ("rs1","rs2")),
+    "amoand.d":  ("rd", ("rs1","rs2")), "amoor.d":   ("rd", ("rs1","rs2")),
+    "amoxor.d":  ("rd", ("rs1","rs2")), "amomax.d":  ("rd", ("rs1","rs2")),
+    "amomin.d":  ("rd", ("rs1","rs2")), "amomaxu.d": ("rd", ("rs1","rs2")),
+    "amominu.d": ("rd", ("rs1","rs2")),
 }
 
 _F = {
@@ -168,7 +184,9 @@ _F = {
     "fsgnj.s":  ("fd",  ("fs1","fs2")), "fsgnjn.s": ("fd",  ("fs1","fs2")),
     "fsgnjx.s": ("fd",  ("fs1","fs2")),
     "fcvt.w.s":  ("rd", ("fs1",)),      "fcvt.wu.s": ("rd", ("fs1",)),
+    "fcvt.l.s":  ("rd", ("fs1",)),      "fcvt.lu.s": ("rd", ("fs1",)),
     "fcvt.s.w":  ("fd", ("rs1",)),      "fcvt.s.wu": ("fd", ("rs1",)),
+    "fcvt.s.l":  ("fd", ("rs1",)),      "fcvt.s.lu": ("fd", ("rs1",)),
     "fmv.x.w":  ("rd",  ("fs1",)),      "fmv.w.x":  ("fd",  ("rs1",)),
     "feq.s":    ("rd",  ("fs1","fs2")), "flt.s":    ("rd",  ("fs1","fs2")),
     "fle.s":    ("rd",  ("fs1","fs2")), "fclass.s": ("rd",  ("fs1",)),
@@ -188,7 +206,9 @@ _D = {
     "fsgnjx.d":  ("fd",  ("fs1","fs2")),
     "fcvt.s.d":  ("fd",  ("fs1",)),      "fcvt.d.s":  ("fd",  ("fs1",)),
     "fcvt.w.d":  ("rd",  ("fs1",)),      "fcvt.wu.d": ("rd",  ("fs1",)),
+    "fcvt.l.d":  ("rd",  ("fs1",)),      "fcvt.lu.d": ("rd",  ("fs1",)),
     "fcvt.d.w":  ("fd",  ("rs1",)),      "fcvt.d.wu": ("fd",  ("rs1",)),
+    "fcvt.d.l":  ("fd",  ("rs1",)),      "fcvt.d.lu": ("fd",  ("rs1",)),
     "fmv.x.d":   ("rd",  ("fs1",)),      "fmv.d.x":   ("fd",  ("rs1",)),
     "feq.d":     ("rd",  ("fs1","fs2")), "flt.d":     ("rd",  ("fs1","fs2")),
     "fle.d":     ("rd",  ("fs1","fs2")), "fclass.d":  ("rd",  ("fs1",)),
@@ -227,16 +247,21 @@ _B = {
     "sh3add":    ("rd", ("rs1","rs2")),
     "sh1add.uw": ("rd", ("rs1","rs2")), "sh2add.uw": ("rd", ("rs1","rs2")),
     "sh3add.uw": ("rd", ("rs1","rs2")),
+    "add.uw":    ("rd", ("rs1","rs2")), "slli.uw":   ("rd", ("rs1",)),
     "andn":   ("rd", ("rs1","rs2")), "orn":    ("rd", ("rs1","rs2")),
     "xnor":   ("rd", ("rs1","rs2")),
     "clz":    ("rd", ("rs1",)),      "ctz":    ("rd", ("rs1",)),
     "cpop":   ("rd", ("rs1",)),
+    "clzw":   ("rd", ("rs1",)),      "ctzw":   ("rd", ("rs1",)),
+    "cpopw":  ("rd", ("rs1",)),
     "max":    ("rd", ("rs1","rs2")), "maxu":   ("rd", ("rs1","rs2")),
     "min":    ("rd", ("rs1","rs2")), "minu":   ("rd", ("rs1","rs2")),
     "sext.b": ("rd", ("rs1",)),      "sext.h": ("rd", ("rs1",)),
     "zext.h": ("rd", ("rs1",)),
     "rol":    ("rd", ("rs1","rs2")), "ror":    ("rd", ("rs1","rs2")),
     "rori":   ("rd", ("rs1",)),
+    "rolw":   ("rd", ("rs1","rs2")), "rorw":   ("rd", ("rs1","rs2")),
+    "roriw":  ("rd", ("rs1",)),
     "orc.b":  ("rd", ("rs1",)),      "rev8":   ("rd", ("rs1",)),
     "clmul":  ("rd", ("rs1","rs2")), "clmulh": ("rd", ("rs1","rs2")),
     "clmulr": ("rd", ("rs1","rs2")),
@@ -245,6 +270,29 @@ _B = {
     "binv":   ("rd", ("rs1","rs2")), "binvi":  ("rd", ("rs1",)),
     "bset":   ("rd", ("rs1","rs2")), "bseti":  ("rd", ("rs1",)),
     "bic":    ("rd", ("rs1","rs2")),
+}
+
+_ZICOND = {
+    "czero.eqz": ("rd", ("rs1","rs2")),
+    "czero.nez": ("rd", ("rs1","rs2")),
+}
+
+# Zicbom cache-block operations (cbo.clean/flush/inval are full barriers;
+# cbo.zero is a store-like zeroing operation).
+# prefetch.i/r/w are hints: only rs1 RAW dep tracked, no mem-chain effect.
+_CMO = {
+    "cbo.clean":  (None, ("mem_base",)),
+    "cbo.flush":  (None, ("mem_base",)),
+    "cbo.inval":  (None, ("mem_base",)),
+    "cbo.zero":   (None, ("mem_base",)),
+    "prefetch.i": (None, ("mem_base",)),
+    "prefetch.r": (None, ("mem_base",)),
+    "prefetch.w": (None, ("mem_base",)),
+}
+
+# Zihintpause: pause hint (treated as a full barrier to serialise spin loops).
+_ZIHINTPAUSE = {
+    "pause": (None, ()),
 }
 
 _V = {
@@ -308,13 +356,42 @@ _V = {
     "vmsgtu.vx":("vd",("vs1","rs1")), "vmsgt.vx":("vd",("vs1","rs1")),
     "vfcvt.xu.f.v":("vd",("vs1",)),  "vfcvt.x.f.v":("vd",("vs1",)),
     "vfcvt.f.xu.v":("vd",("vs1",)),  "vfcvt.f.x.v":("vd",("vs1",)),
+    # ── Zvkned (AES vector crypto) ───────────────────────────────────────
+    # vd is implicitly both source and destination for the round-update forms.
+    # The pattern below tracks vs2 (via vs1 slot) → vd dep; the vd-as-source
+    # dep is accepted as a mild underapproximation.
+    "vaesdf.vv":  ("vd",("vs1",)),   "vaesdf.vs":  ("vd",("vs1",)),
+    "vaesdm.vv":  ("vd",("vs1",)),   "vaesdm.vs":  ("vd",("vs1",)),
+    "vaesef.vv":  ("vd",("vs1",)),   "vaesef.vs":  ("vd",("vs1",)),
+    "vaesem.vv":  ("vd",("vs1",)),   "vaesem.vs":  ("vd",("vs1",)),
+    "vaeskf1.vi": ("vd",("vs1",)),
+    "vaeskf2.vi": ("vd",("vs1",)),
+    "vaesz.vs":   ("vd",("vs1",)),
+    # ── Zvknhb (SHA-2 vector crypto) ─────────────────────────────────────
+    "vsha2ch.vv": ("vd",("vs1","vs2")),
+    "vsha2cl.vv": ("vd",("vs1","vs2")),
+    "vsha2ms.vv": ("vd",("vs1","vs2")),
+    # ── Zvkb (bit-manipulation for crypto) ───────────────────────────────
+    "vbrev8.v":   ("vd",("vs1",)),
+    "vrev8.v":    ("vd",("vs1",)),
+    "vandn.vv":   ("vd",("vs1","vs2")), "vandn.vx": ("vd",("vs1","rs1")),
+    # ── Zvkt (carryless multiply) ─────────────────────────────────────────
+    "vclmul.vv":  ("vd",("vs1","vs2")), "vclmul.vx":  ("vd",("vs1","rs1")),
+    "vclmulh.vv": ("vd",("vs1","vs2")), "vclmulh.vx": ("vd",("vs1","rs1")),
 }
 
-ALL_TABLES: dict = {**_I, **_M, **_A, **_F, **_D, **_Q, **_ZICSR, **_B, **_V}
+ALL_TABLES: dict = {
+    **_I, **_M, **_A, **_F, **_D, **_Q, **_ZICSR, **_B, **_V,
+    **_ZICOND, **_CMO, **_ZIHINTPAUSE,
+}
 
 BARRIERS = frozenset({
     "fence", "fence.i", "ecall", "ebreak",
     "vsetvli", "vsetivli", "vsetvl",
+    # Zicbom: cache-block management ops are full ordering fences.
+    "cbo.clean", "cbo.flush", "cbo.inval",
+    # Zihintpause: pause serialises spin loops.
+    "pause",
 })
 _BRANCH_MNEMONICS = frozenset({
     "beq", "bne", "blt", "bge", "bltu", "bgeu",
@@ -325,7 +402,8 @@ _AMO_PREFIXES = ("lr.", "sc.", "amo")
 _LOADS  = frozenset({"lb","lh","lw","lbu","lhu","lwu","ld","flw","fld","flq"} |
                     {k for k in _V if k.startswith("vle")})
 _STORES = frozenset({"sb","sh","sw","sd","fsw","fsd","fsq"} |
-                    {k for k in _V if k.startswith("vse")})
+                    {k for k in _V if k.startswith("vse")} |
+                    {"cbo.zero"})
 _AMO_SUFFIX_RE = re.compile(r"\.(aq|rl|aqrl)$")
 
 # Regex for a plain integer immediate: optional minus, then decimal or 0x hex.

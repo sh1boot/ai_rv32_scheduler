@@ -250,12 +250,17 @@ _TALLY_ARITH_MN: frozenset = frozenset({
     # Zb* bit-manipulation
     "bic",  "andn", "xnor",
     "sh1add","sh2add","sh3add",
+    "add.uw", "slli.uw",
     "min",  "minu", "max",  "maxu",
     "clz",  "ctz",  "cpop", "rev8",
+    "clzw", "ctzw", "cpopw",
     "sext.b","sext.h","zext.h",
     "bset", "bclr", "binv", "bext",
     "bseti","bclri","binvi","bexti",
     "ror",  "rol",  "rori", "orc.b",
+    "rorw", "rolw", "roriw",
+    # Zicond
+    "czero.eqz", "czero.nez",
 })
 
 # Control flow: conditional branches, jumps, calls, returns, traps.

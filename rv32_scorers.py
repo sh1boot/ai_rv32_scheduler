@@ -285,6 +285,7 @@ _ADDR_UPDATE_MN = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"}
 _ADDR_COMPUTE_MN = frozenset({
     "add",  "addi",  "addw",  "addiw",
     "sub",  "subw",
+    "add.uw", "slli.uw",
     "sh1add", "sh1add.uw",
     "sh2add", "sh2add.uw",
     "sh3add", "sh3add.uw",
