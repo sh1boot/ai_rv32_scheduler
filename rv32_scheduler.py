@@ -250,12 +250,17 @@ _TALLY_ARITH_MN: frozenset = frozenset({
     # Zb* bit-manipulation
     "bic",  "andn", "xnor",
     "sh1add","sh2add","sh3add",
+    "add.uw", "slli.uw",
     "min",  "minu", "max",  "maxu",
     "clz",  "ctz",  "cpop", "rev8",
+    "clzw", "ctzw", "cpopw",
     "sext.b","sext.h","zext.h",
     "bset", "bclr", "binv", "bext",
     "bseti","bclri","binvi","bexti",
     "ror",  "rol",  "rori", "orc.b",
+    "rorw", "rolw", "roriw",
+    # Zicond
+    "czero.eqz", "czero.nez",
 })
 
 # Control flow: conditional branches, jumps, calls, returns, traps.
@@ -854,8 +859,10 @@ class AssemblyScheduler:
         # A block boundary is any barrier label (branch target or globally
         # visible symbol).  Non-barrier labels are folded in as pass-through
         # text with no sentinel, so they never split a block.
-        all_stats: list = []
-        instr_index    = 0
+        all_stats:    list = []
+        func_stats:   list = []   # stats for the current function's blocks only
+        current_func: str  = ""   # name of the function being accumulated
+        instr_index        = 0
         pass_lines:     list = []   # inter-block pass-through (flushed before label)
         trailing_pass:  list = []   # post-instruction pass-through (carried to next block)
         instructions:   list = []   # Instruction objects for the current block
@@ -873,6 +880,19 @@ class AssemblyScheduler:
         # Forwarded to _process_block so the renamer knows which registers
         # survive a call at the preceding block boundary.
         current_block_live_in:  frozenset = frozenset()
+
+        def _emit_func_summary() -> None:
+            """Emit a one-line per-function stats comment, then reset func_stats."""
+            if func_stats and any(s.total_instrs for s in func_stats):
+                fs     = PairStats.merge(func_stats)
+                total  = fs.total_instrs
+                rvc    = fs.rvc_eligible
+                paired = fs.paired_instrs
+                ratio  = paired / rvc if rvc else 0.0
+                name   = current_func or "<top>"
+                print(f"# {name}: {total} total, {rvc} rvc, {paired} paired,"
+                      f" {ratio:.2f}x", file=out)
+            func_stats.clear()
 
         def _flush_block():
             """Process and emit the accumulated block, then reset state."""
@@ -894,6 +914,7 @@ class AssemblyScheduler:
                 chain_reorder          = chain_reorder,
             )
             all_stats.append(st)
+            func_stats.append(st)
             pass_lines.clear()
             trailing_pass.clear()
             instructions.clear()
@@ -937,7 +958,7 @@ class AssemblyScheduler:
             derive the ABI live-in set for the incoming block (e.g. after a
             ``call`` the return-site block inherits callee-saved + a0/a1).
             """
-            nonlocal instr_index, last_sentinel_idx
+            nonlocal instr_index, last_sentinel_idx, current_func
             nonlocal current_block_is_entry, current_block_live_in, current_block_label
             is_entry = label_name in globally_visible
 
@@ -962,6 +983,7 @@ class AssemblyScheduler:
                 chain_reorder          = chain_reorder,
             )
             all_stats.append(st)
+            func_stats.append(st)
             instructions.clear()
             sentinel_texts.clear()
             last_sentinel_idx = None
@@ -969,9 +991,11 @@ class AssemblyScheduler:
             pass_lines.extend(trailing_pass)
             trailing_pass.clear()
 
-            # Flush the output stream after completing a whole function so that
-            # each function's assembly is written to disk before we move on.
+            # Emit per-function summary just before the new global symbol, then
+            # start accumulating stats for the new function.
             if is_entry:
+                _emit_func_summary()
+                current_func = label_name
                 out.flush()
 
             # The new block that starts here is a function entry if its opening
@@ -1069,6 +1093,7 @@ class AssemblyScheduler:
         _flush_pending_prefixes_as_passthrough()
         # Flush the final block.
         _flush_block()
+        _emit_func_summary()   # trailing function (or only function in file)
 
         # Aggregate stats across all blocks.
         merged = PairStats.merge(all_stats)
