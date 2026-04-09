@@ -1,6 +1,6 @@
 SOURCES=rv32_scheduler.py rv32_core.py rv32_scorers.py
 ESSENTIALS=testcase0.out.s testcase0-noalias.out.s
-TESTS=$(ESSENTIALS) core_matrix.out.s core_matrix_O2.out.s
+TESTS=$(ESSENTIALS) godot.out.s core_matrix.out.s core_matrix_O2.out.s
 
 essentials: $(ESSENTIALS)
 
