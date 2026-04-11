@@ -959,12 +959,13 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
     # Move/li pairs: each instruction is an independent one-input→one-output
     # data path; no shared-source requirement.  Only same-kind pairs allowed:
     # mv+mv (each routes a different register) or li+li (each loads a constant).
-    # mv+li is intentionally excluded — the scheduler can reveal whether the
-    # pressure to separate these forms produces better overall schedules.
-    # Checked before the table so c.mv (add rd, rs — one use) is handled here
-    # rather than falling into the add/sub same-input path.
-    if _is_mv(a) or _is_li(a):
-        return (_is_mv(a) and _is_mv(b)) or (_is_li(a) and _is_li(b))
+    # li+mv is intentionally excluded to concede the case where a source
+    # register is copied and then replaced with a constant, and
+    # reordering can achieve any complementary case of li+mv.
+    if _is_mv(a):
+        return _is_mv(b) or _is_li(b)
+    if _is_li(a):
+        return _is_li(b)
     # Table-driven same-input pairs.
     partners = _OP_PAIR_TABLE.get(a.mnemonic)
     if partners is None or b.mnemonic not in partners:
