@@ -257,7 +257,7 @@ _B = {
     "max":    ("rd", ("rs1","rs2")), "maxu":   ("rd", ("rs1","rs2")),
     "min":    ("rd", ("rs1","rs2")), "minu":   ("rd", ("rs1","rs2")),
     "sext.b": ("rd", ("rs1",)),      "sext.h": ("rd", ("rs1",)),
-    "zext.h": ("rd", ("rs1",)),
+    "zext.h": ("rd", ("rs1",)),      "zext.w": ("rd", ("rs1",)),
     "rol":    ("rd", ("rs1","rs2")), "ror":    ("rd", ("rs1","rs2")),
     "rori":   ("rd", ("rs1",)),
     "rolw":   ("rd", ("rs1","rs2")), "rorw":   ("rd", ("rs1","rs2")),
