@@ -1,4 +1,4 @@
-SOURCES=rv32_scheduler.py rv32_core.py rv32_scorers.py
+SOURCES=rv32_*.py
 ESSENTIALS=testcase0.out.s testcase0-noalias.out.s
 TESTS=$(ESSENTIALS) godot.out.s core_matrix.out.s core_matrix_O2.out.s
 
@@ -11,6 +11,9 @@ clean:
 
 %.out.s: %.s $(SOURCES)
 	python ./rv32_scheduler.py --wide-dual-arith --same-base-reorder $< > $@
+
+%.tally: %.out.s $(SOURCES)
+	python ./rv32_tally.py $< | tee $@
 
 %.unpaired.s: %.out.s
 	sed "s/^.*# PAIR.*$$/----/" < $< | uniq > $@
