@@ -6,9 +6,11 @@ RV32 instruction scheduler: reads assembly source,
 reorders instructions within basic blocks to maximise pairing opportunities,
 and emits the reordered assembly with PAIR+ annotations.
 
-Unpaired instructions are annotated with TALLY:/CLASS: tags indicating which
-secondary pairing rules (see TALLY_RULES in rv32_scorers.py) they are
-eligible for on each side.  Use rv32_tally.py to analyse these annotations.
+Unpaired instructions are annotated with TALLY-A:, TALLY-B:, and CLASS:
+tags (all comma-separated lists) indicating which secondary pairing rules
+(see TALLY_RULES in rv32_scorers.py) they are eligible for on each side,
+and which instruction classes they belong to (arith/mem/control/big/rvc).
+Use rv32_tally.py to analyse these annotations.
 
 Usage
 -----
@@ -136,7 +138,7 @@ class PairStats:
 
         Rule rows follow at one level of indentation, then the size estimate.
         Opcode tally tables have moved to the rv32_tally.py tool, which reads
-        TALLY:/CLASS: annotations from the scheduler output.
+        TALLY-A:/TALLY-B:/CLASS: annotations from the scheduler output.
         """
         # ── Header rows: pairs achieved vs rvc ceiling ───────────────────
         lbl_pairs = "pairs:"
@@ -667,25 +669,32 @@ def _process_block(
 
     # ── Annotate each unpaired instruction with TALLY and CLASS tags ──────
     # For each instruction that was not claimed by a primary rule, compute:
-    #   TALLY:<rule>:A  — eligible as first instruction (A-side) of that rule
-    #   TALLY:<rule>:B  — eligible as second instruction (B-side) of that rule
-    #   CLASS:<cls>     — instruction class membership (arith/mem/control/big)
-    # Multiple tags may appear.  These annotations are written into the output
-    # as assembly comments and parsed by the rv32_tally.py analysis tool.
+    #   TALLY-A:<rule1>,<rule2>,…   — tally rules this instruction can play A in
+    #   TALLY-B:<rule1>,<rule2>,…   — tally rules this instruction can play B in
+    #   CLASS:<cls1>,<cls2>,…       — instruction class membership
+    #                                 (arith/mem/control/big/rvc)
+    # All three tags use the same comma-separated list format.  They are
+    # written into the output as assembly comments and parsed by the
+    # rv32_tally.py analysis tool.
     tally_annots: dict = {}   # {instruction.index: "TAG1 TAG2 …"}
     for i, instr in enumerate(real_scheduled):
         if i in pair_start_set or i in pair_end_set:
             continue
         tags: list = []
-        for name, _pair_fn, a_fn, b_fn in TALLY_RULES:
-            if a_fn(instr):
-                tags.append(f"TALLY:{name}:A")
-            if b_fn(instr):
-                tags.append(f"TALLY:{name}:B")
+        a_rules = [name for name, _pair_fn, a_fn, _b_fn in TALLY_RULES
+                   if a_fn(instr)]
+        b_rules = [name for name, _pair_fn, _a_fn, b_fn in TALLY_RULES
+                   if b_fn(instr)]
+        if a_rules:
+            tags.append("TALLY-A:" + ",".join(a_rules))
+        if b_rules:
+            tags.append("TALLY-B:" + ",".join(b_rules))
         classes = [cls for cls, mn_set in _TALLY_GROUP.items()
                    if instr.mnemonic in mn_set]
         if _imm_is_big(instr):
             classes.append("big")
+        if can_compress(instr):
+            classes.append("rvc")
         if classes:
             tags.append("CLASS:" + ",".join(sorted(classes)))
         if tags:
@@ -820,9 +829,11 @@ class AssemblyScheduler:
         is processed and written to *out* before the next block is read.
         Peak memory is O(block_size), not O(file_size).
 
-        Unpaired instructions are annotated with TALLY:/CLASS: tags (see
-        rv32_tally.py) indicating which secondary pairing rules they are
-        eligible for on each side.  Use rv32_tally.py to analyse the output.
+        Unpaired instructions are annotated with TALLY-A:, TALLY-B:, and
+        CLASS: tags (comma-separated rule / class lists — see rv32_tally.py)
+        indicating which secondary pairing rules they are eligible for on
+        each side, and which classes they belong to.  Use rv32_tally.py to
+        analyse the output.
 
         Parameters
         ----------
@@ -1169,7 +1180,7 @@ def main():
             doc = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:26s}  {doc}")
         print()
-        print("tally rules (annotated on unpaired instructions as TALLY:name:A/B):")
+        print("tally rules (annotated on unpaired instructions as TALLY-A:name,… / TALLY-B:name,…):")
         for name, fn, a_fn, b_fn in TALLY_RULES:
             doc  = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:26s}  {doc}")
