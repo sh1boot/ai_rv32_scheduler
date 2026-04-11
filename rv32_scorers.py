@@ -51,13 +51,23 @@ PairScoreFn = Callable[["Instruction", "Instruction"], float]
 _CL_INT_REGS = frozenset(f"x{n}" for n in range(8, 16))
 _CL_FP_REGS  = frozenset(f"f{n}" for n in range(8, 16))
 
+# Target profile: RV64GC + Zcb (RVA23 baseline).  In RV64 the c.jal, c.flw,
+# c.fsw, c.flwsp, c.fswsp slots are repurposed for c.addiw/c.ld/c.sd/
+# c.ldsp/c.sdsp respectively, and shifts use a 6-bit shamt.
 _CAN_COMPRESS_MNEMONICS: frozenset = frozenset({
+    # Base RVC (RV32/RV64 shared)
     "jalr", "add",
-    "addi", "lui", "slli", "lw", "flw", "fld",
-    "sw", "fsw", "fsd",
+    "addi", "lui", "slli", "lw", "fld",
+    "sw", "fsd",
     "beq", "bne", "beqz", "bnez", "jal",
     "sub", "xor", "or", "and", "srai", "srli", "andi",
-    "nop",
+    "nop", "ebreak",
+    # RV64C extras
+    "ld", "sd", "addiw", "addw", "subw",
+    # Zcb (compressed code-size extension)
+    "lbu", "lhu", "lh", "sb", "sh",
+    "sext.b", "sext.h", "sext.w", "zext.h", "zext.w",
+    "mul", "xori",
 })
 
 
@@ -65,9 +75,10 @@ def can_compress(instr: "Instruction") -> bool:
     """
     Return True if *instr* is a candidate for a 16-bit RVC encoding.
 
-    Checks mnemonic, register constraints, and immediate ranges against the
-    actual RVC encoding rules.  Branch/jump offset ranges are not checked
-    (the offset is a label whose value is unknown at this stage).
+    Target profile is RV64GC + Zcb.  Checks mnemonic, register constraints,
+    and immediate ranges against the actual RVC encoding rules.  Branch/jump
+    offset ranges are not checked (the offset is a label whose value is
+    unknown at this stage).
     """
     mn   = instr.mnemonic
     if mn not in _CAN_COMPRESS_MNEMONICS:
@@ -75,12 +86,37 @@ def can_compress(instr: "Instruction") -> bool:
     defs = instr.defs
     uses = instr.uses
 
+    # c.nop / c.ebreak: zero-operand encodings, always compressible.
+    if mn in ("nop", "ebreak"):
+        return True
+
     if mn in ("sub", "xor", "or", "and"):
         # c.sub/c.xor/c.or/c.and: RSD form (rd==rs1), rd and rs2 both in CL.
         rd  = defs[0] if defs else None
         rs1 = uses[0] if uses else None
         rs2 = uses[1] if len(uses) > 1 else None
         return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS and rd == rs1
+
+    if mn in ("addw", "subw"):
+        # c.addw/c.subw (RV64C): RSD form, rd and rs2 both in CL.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        rs2 = uses[1] if len(uses) > 1 else None
+        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS and rd == rs1
+
+    if mn == "mul":
+        # c.mul (Zcb): RSD form, rd and rs2 both in CL.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        rs2 = uses[1] if len(uses) > 1 else None
+        return rd in _CL_INT_REGS and rs2 in _CL_INT_REGS and rd == rs1
+
+    if mn in ("sext.b", "sext.h", "sext.w", "zext.h", "zext.w"):
+        # c.sext.b/c.sext.h/c.zext.h/c.zext.w/c.sext.w (Zcb, c.sext.w is RV64).
+        # Single-operand form: rd in CL, rd == rs1.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        return rd in _CL_INT_REGS and rd == rs1
 
     if mn in ("srai", "srli", "andi"):
         # c.srai/c.srli/c.andi: RSD form (rd==rs1), rd in CL.
@@ -90,9 +126,21 @@ def can_compress(instr: "Instruction") -> bool:
             return False
         imm = instr.imm
         if mn == "andi":
-            return imm is not None and -32 <= imm <= 31
-        # srai/srli: shamt must be non-zero and fit in 5 bits
-        return imm is not None and 1 <= imm <= 31
+            # c.andi: imm in -32..31, OR c.zext.b (Zcb) which is
+            # andi rd, rd, 0xff.  The parser canonicalises `zext.b` to
+            # `andi rd, rs, 0xff`, so detect that alias here.
+            if imm is None:
+                return False
+            return (-32 <= imm <= 31) or imm == 0xff
+        # srai/srli: shamt must be non-zero, RV64 uses 6-bit shamt (1..63).
+        return imm is not None and 1 <= imm <= 63
+
+    if mn == "xori":
+        # c.not (Zcb): xori rd, rd, -1 with rd in CL.  The parser canonicalises
+        # the `not` pseudo to this form.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        return rd in _CL_INT_REGS and rd == rs1 and instr.imm == -1
 
     if mn in ("beqz", "bnez"):
         # c.beqz/c.bnez: rs1 in CL.  Offset range not checked.
@@ -105,52 +153,79 @@ def can_compress(instr: "Instruction") -> bool:
         rs2 = uses[1] if len(uses) > 1 else None
         return rs1 in _CL_INT_REGS and rs2 == "x0"
 
-    if mn in ("lw", "flw", "fld"):
-        # c.lw/c.flw/c.fld: base in CL, rd in CL, offset in 0..124 (mult 4).
-        # c.lwsp/c.flwsp/c.fldsp: base == sp, offset in 0..252/504 (mult 4/8).
-        # Memory operands are decoded into instr.mem = (offset, base_reg).
+    if mn in ("lw", "ld", "fld"):
+        # c.lw/c.ld/c.fld: base in CL, rd in CL, offset aligned.
+        # c.lwsp/c.ldsp/c.fldsp: base == sp, offset non-negative and aligned.
+        # c.ldsp/c.lwsp also require rd != x0.
         mem  = instr.mem
         rd   = defs[0] if defs else None
         off, base = mem if mem else (None, None)
+        align = 8 if mn in ("ld", "fld") else 4
         if base == "x2":
-            # lwsp/flwsp/fldsp: offset must be non-negative and aligned.
-            if off is None or off < 0:
+            if off is None or off < 0 or rd in (None, "x0"):
                 return False
-            align = 8 if mn == "fld" else 4
-            limit = 504 if mn == "fld" else 252
+            # c.lwsp: 0..252, c.ldsp/c.fldsp: 0..504.
+            limit = 252 if mn == "lw" else 504
             return off % align == 0 and off <= limit
-        cl_regs = _CL_FP_REGS if mn in ("flw", "fld") else _CL_INT_REGS
+        cl_regs = _CL_FP_REGS if mn == "fld" else _CL_INT_REGS
         if base not in _CL_INT_REGS or rd not in cl_regs:
             return False
-        # Offset: 0..124 (mult 4) for lw/flw, 0..248 (mult 8) for fld.
         if off is None or off < 0:
             return False
-        align = 8 if mn == "fld" else 4
-        limit = 248 if mn == "fld" else 124
+        # c.lw: 0..124, c.ld/c.fld: 0..248.
+        limit = 124 if mn == "lw" else 248
         return off % align == 0 and off <= limit
 
-    if mn in ("sw", "fsw", "fsd"):
-        # c.sw/c.fsw/c.fsd: base in CL, rs2 in CL, offset in 0..124 (mult 4).
-        # c.swsp/c.fswsp/c.fsdsp: base == sp, offset in 0..252/504 (mult 4/8).
+    if mn in ("sw", "sd", "fsd"):
+        # c.sw/c.sd/c.fsd: base in CL, rs2 in CL, offset aligned.
+        # c.swsp/c.sdsp/c.fsdsp: base == sp, offset non-negative and aligned.
+        # Note: c.sdsp/c.swsp accept any rs2 including x0.
         mem  = instr.mem
         off, base = mem if mem else (None, None)
         # x0 is filtered from uses; if all remaining uses equal the base,
         # the stored value was x0.
         rs2 = next((r for r in uses if r != base), "x0")
+        align = 8 if mn in ("sd", "fsd") else 4
         if base == "x2":
             if off is None or off < 0:
                 return False
-            align = 8 if mn == "fsd" else 4
-            limit = 504 if mn == "fsd" else 252
+            limit = 252 if mn == "sw" else 504
             return off % align == 0 and off <= limit
-        cl_regs = _CL_FP_REGS if mn in ("fsw", "fsd") else _CL_INT_REGS
+        cl_regs = _CL_FP_REGS if mn == "fsd" else _CL_INT_REGS
         if base not in _CL_INT_REGS or rs2 not in cl_regs:
             return False
         if off is None or off < 0:
             return False
-        align = 8 if mn == "fsd" else 4
-        limit = 248 if mn == "fsd" else 124
+        limit = 124 if mn == "sw" else 248
         return off % align == 0 and off <= limit
+
+    if mn in ("lbu", "lhu", "lh"):
+        # c.lbu (Zcb): rd in CL, base in CL, offset 0..3.
+        # c.lhu/c.lh (Zcb): rd in CL, base in CL, offset in {0, 2}.
+        mem  = instr.mem
+        rd   = defs[0] if defs else None
+        off, base = mem if mem else (None, None)
+        if base not in _CL_INT_REGS or rd not in _CL_INT_REGS:
+            return False
+        if off is None or off < 0:
+            return False
+        if mn == "lbu":
+            return off <= 3
+        return off in (0, 2)
+
+    if mn in ("sb", "sh"):
+        # c.sb (Zcb): rs2 in CL, base in CL, offset 0..3.
+        # c.sh (Zcb): rs2 in CL, base in CL, offset in {0, 2}.
+        mem  = instr.mem
+        off, base = mem if mem else (None, None)
+        rs2 = next((r for r in uses if r != base), None)
+        if base not in _CL_INT_REGS or rs2 not in _CL_INT_REGS:
+            return False
+        if off is None or off < 0:
+            return False
+        if mn == "sb":
+            return off <= 3
+        return off in (0, 2)
 
     if mn == "jalr":
         # c.jalr rs1: rd=x1, rs1 != x0, offset=0.
@@ -209,13 +284,23 @@ def can_compress(instr: "Instruction") -> bool:
             return imm is not None and imm != 0 and -32 <= imm <= 31
         return False
 
+    if mn == "addiw":
+        # c.addiw (RV64C): RSD form, rd != x0, imm in -32..31.  Unlike c.addi,
+        # imm=0 is a valid (albeit redundant sign-extend) encoding.
+        rd  = defs[0] if defs else None
+        rs1 = uses[0] if uses else None
+        imm = instr.imm
+        if rd is None or rd == "x0" or rd != rs1:
+            return False
+        return imm is not None and -32 <= imm <= 31
+
     if mn == "slli":
-        # c.slli rd, shamt: RSD form (rd==rs1), rd != x0, shamt in 1..31.
+        # c.slli rd, shamt: RSD form (rd==rs1), rd != x0, shamt in 1..63 (RV64).
         rd  = defs[0] if defs else None
         rs1 = uses[0] if uses else None
         imm = instr.imm
         return (rd is not None and rd != "x0" and rd == rs1
-                and imm is not None and 1 <= imm <= 31)
+                and imm is not None and 1 <= imm <= 63)
 
     if mn == "lui":
         # c.lui rd, imm: rd != x0/x2, imm != 0, imm in -32..31 (upper 20 bits).
@@ -225,9 +310,10 @@ def can_compress(instr: "Instruction") -> bool:
                 and imm is not None and imm != 0 and -32 <= imm <= 31)
 
     if mn == "jal":
-        # c.jal (RV32C, rd=x1) / c.j (rd=x0): offset range not checked.
+        # RV64C: c.j (rd=x0); the c.jal (rd=x1) slot is taken by c.addiw.
+        # Offset range not checked.
         rd = defs[0] if defs else None
-        return rd in (None, "x0", "x1")
+        return rd in (None, "x0")
 
     return False
 

@@ -4,17 +4,20 @@ rv32_tally.py
 Post-processing analysis tool for rv32_scheduler.py output.
 
 Reads annotated assembly from one or more files (or stdin), parses the
-PAIR+, PAIR=, TALLY:, and CLASS: annotations written by rv32_scheduler.py,
-and produces cross-tab tables and counts.
+PAIR+, PAIR=, TALLY-A:, TALLY-B:, and CLASS: annotations written by
+rv32_scheduler.py, and produces cross-tab tables and counts.
 
 Annotation format (written by rv32_scheduler.py)
 -------------------------------------------------
     instr  # PAIR+ [rule_name]   — primary pair, A-side (first instruction)
     instr  # PAIR=               — primary pair, B-side (second instruction)
-    instr  # TALLY:rule:A TALLY:rule:B CLASS:cls1,cls2
-        TALLY:rule:A  — instruction is eligible as A-side of that tally rule
-        TALLY:rule:B  — instruction is eligible as B-side of that tally rule
-        CLASS:cls     — instruction's class (arith, mem, control); comma-separated
+    instr  # TALLY-A:r1,r2 TALLY-B:r3 CLASS:cls1,cls2
+        TALLY-A:rules  — comma-separated list of tally rules this instruction
+                         is eligible for as A-side (first of pair)
+        TALLY-B:rules  — comma-separated list of tally rules this instruction
+                         is eligible for as B-side (second of pair)
+        CLASS:classes  — comma-separated list of instruction classes
+                         (arith, mem, control, big, rvc)
 
 Usage
 -----
@@ -35,11 +38,12 @@ from collections import Counter
 # Grabs the mnemonic (first token of the instruction field, before registers).
 # Assembly lines are expected in the form:
 #   <optional_whitespace><mnemonic><rest>  # <annotations>
-_INSTR_RE   = re.compile(r'^\s+(\S+)')
-_PAIR_A_RE  = re.compile(r'#\s*PAIR\+\s*(?:\[([^\]]*)\])?')
-_PAIR_B_RE  = re.compile(r'#\s*PAIR=')
-_TALLY_RE   = re.compile(r'TALLY:(\w+):(A|B)')
-_CLASS_RE   = re.compile(r'CLASS:([\w,]+)')
+_INSTR_RE    = re.compile(r'^\s+(\S+)')
+_PAIR_A_RE   = re.compile(r'#\s*PAIR\+\s*(?:\[([^\]]*)\])?')
+_PAIR_B_RE   = re.compile(r'#\s*PAIR=')
+_TALLY_A_RE  = re.compile(r'TALLY-A:([\w,]+)')
+_TALLY_B_RE  = re.compile(r'TALLY-B:([\w,]+)')
+_CLASS_RE    = re.compile(r'CLASS:([\w,]+)')
 
 
 class AnnotatedInstr:
@@ -92,13 +96,13 @@ def parse_annotated_stream(lines):
         if _PAIR_B_RE.search(comment):
             ai.is_pair_b = True
 
-        # TALLY annotations
-        for m_t in _TALLY_RE.finditer(comment):
-            rule, side = m_t.group(1), m_t.group(2)
-            if side == "A":
-                ai.tally_a.add(rule)
-            else:
-                ai.tally_b.add(rule)
+        # TALLY-A / TALLY-B annotations (comma-separated rule lists)
+        m_ta = _TALLY_A_RE.search(comment)
+        if m_ta:
+            ai.tally_a = set(m_ta.group(1).split(","))
+        m_tb = _TALLY_B_RE.search(comment)
+        if m_tb:
+            ai.tally_b = set(m_tb.group(1).split(","))
 
         # CLASS annotation
         m_cls = _CLASS_RE.search(comment)
@@ -164,11 +168,16 @@ _TALLY_MEM_MN: frozenset = frozenset({
 # identified by their CLASS annotation rather than by mnemonic alone.
 _TALLY_BIG_MN: frozenset = frozenset({"lui", "auipc"})
 
+# "rvc" has no mnemonic-only membership: an instruction is RVC-compressible
+# only when register and immediate constraints line up.  The scheduler emits
+# CLASS:rvc per-instance; filters on "rvc" rely on that annotation via the
+# classes-set intersection in _instr_excluded / _matches_filter.
 _TALLY_GROUP: dict = {
     "arith":   _TALLY_ARITH_MN,
     "mem":     _TALLY_MEM_MN,
     "control": _TALLY_CONTROL_MN,
     "big":     _TALLY_BIG_MN,
+    "rvc":     frozenset(),
 }
 
 
