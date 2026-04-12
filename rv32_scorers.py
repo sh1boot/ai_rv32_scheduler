@@ -869,6 +869,30 @@ def _rule_load_jalr_chain(a: "Instruction", b: "Instruction",
     return rd_a in liveness.get(b.index, frozenset())
 
 
+_LOAD_BRANCH_MN = frozenset({"beqz", "bnez"})
+
+
+def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
+                            liveness: dict) -> bool:
+    """
+    Load followed by a conditional branch on the loaded value.
+
+    A slot: lw or ld
+    B slot: beqz or bnez whose tested register equals A's destination.
+
+    A's destination must be dead after B.  Matches null-check / flag-load
+    idioms (load a value, branch if zero/non-zero).
+    """
+    if not _is_load_producer(a):
+        return False
+    rd_a = a.defs[0]
+    if b.mnemonic not in _LOAD_BRANCH_MN:
+        return False
+    if not b.uses or b.uses[0] != rd_a:
+        return False
+    return rd_a in liveness.get(b.index, frozenset())
+
+
 def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
                            liveness: dict) -> bool:
     """
@@ -1220,6 +1244,7 @@ COMPACT32_RULES: list = [
     ("post_increment",      _rule_post_increment),
     ("load_mem_chain",      _rule_load_mem_chain),
     ("load_jalr_chain",     _rule_load_jalr_chain),
+    ("load_branch_chain",   _rule_load_branch_chain),
     ("load_arith_chain",    _rule_load_arith_chain),
     ("op_pair",             _rule_op_pair),
     ("op_pair_chain",       _rule_op_pair_chain),
@@ -1492,6 +1517,7 @@ def make_compact32_scorer(liveness: dict,
         if a.mnemonic in _LOAD_PRODUCER_MN:
             eligible.add("load_mem_chain")
             eligible.add("load_jalr_chain")
+            eligible.add("load_branch_chain")
             eligible.add("load_arith_chain")
         if a.mnemonic in _OP_PAIR_TABLE or _is_mv(a) or _is_li(a):
             eligible.add("op_pair")
