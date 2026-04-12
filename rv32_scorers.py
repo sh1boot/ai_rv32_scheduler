@@ -1278,6 +1278,33 @@ def _rule_op_pair_chain(a: "Instruction", b: "Instruction",
     return rd_a in liveness.get(b.index, frozenset())
 
 
+def _rule_li_branch_chain(a: "Instruction", b: "Instruction",
+                          liveness: dict) -> bool:
+    """
+    Load-immediate followed by a conditional branch using the loaded value,
+    effectively synthesising ``bXX rs1, imm, label``.
+
+    A slot: ``li rd, imm`` with imm in −512..511 (10-bit signed)
+    B slot: any conditional branch (beq/bne/blt/bge/bltu/bgeu/beqz/bnez)
+            that uses rd as one of its operands.
+
+    rd must be dead after B — it carries only the comparison constant.
+    The immediate range is wider than the compact-encoding ``_is_li``
+    (−16..15) because the fused branch-with-immediate encoding has room
+    for a 10-bit signed operand.
+    """
+    if a.mnemonic != "addi" or a.uses or not a.defs:
+        return False
+    imm = a.imm
+    if imm is None or imm < -512 or imm > 511:
+        return False
+    rd = a.defs[0]
+    if b.mnemonic not in _BRANCH_CMP:
+        return False
+    if rd not in b.uses:
+        return False
+    return rd in liveness.get(b.index, frozenset())
+
 
 # the first match wins.
 COMPACT32_RULES: list = [
@@ -1302,6 +1329,7 @@ COMPACT32_RULES: list = [
     ("mv_load_jump",        _rule_mv_load_jump),
     ("arith_branch",        _rule_arith_branch),
     ("addi_branch",         _rule_addi_branch),
+    ("li_branch_chain",     _rule_li_branch_chain),
 ]
 
 def _is_return_instr(instr: "Instruction") -> bool:
@@ -1544,6 +1572,9 @@ def make_compact32_scorer(liveness: dict,
                 eligible.add("cmp_branch_chain")
         if a.defs and _is_li(a):
             eligible.add("cmp_branch_chain")
+        if (a.mnemonic == "addi" and not a.uses and a.defs
+                and a.imm is not None and -512 <= a.imm <= 511):
+            eligible.add("li_branch_chain")
         if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
             rd = a.defs[0]
             if a.uses and a.uses[0] == rd:
