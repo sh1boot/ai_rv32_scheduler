@@ -21,8 +21,9 @@ Usage
     python rv32_scheduler.py -          # read from stdin
 
 """
-import re, io, sys, copy, argparse
+import re, io, sys, copy, argparse, os
 from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable
 
@@ -750,6 +751,95 @@ def _process_block(
     )
 
 # ---------------------------------------------------------------------------
+# Parallel processing helpers
+# ---------------------------------------------------------------------------
+
+def _split_into_functions(source: str) -> "list[str]":
+    """Split assembly source into chunks at globally-visible label boundaries.
+
+    Returns a list of source-text chunks.  The first chunk is the preamble
+    (everything before the first globally-visible label, possibly empty).
+    Each subsequent chunk starts just before the inter-function gap
+    (blank lines, ``.globl`` directives, comments) that precedes its entry
+    label, so all associated directives travel with the function they declare.
+    """
+    _, globally_visible = _classify_labels(source)
+    lines = source.splitlines(keepends=True)
+
+    # First pass: find the line index of each globally-visible label definition.
+    func_label_lines: list = []
+    for i, line in enumerate(lines):
+        m = _LABEL_DEF.match(line.strip())
+        if m and m.group(1) in globally_visible:
+            func_label_lines.append(i)
+
+    if not func_label_lines:
+        return [source]
+
+    # For each function-entry label, walk backwards to capture the preamble:
+    # blank lines, comments, .globl/.weak directives, .type, .p2align, etc.
+    # that conventionally sit between functions.
+    split_points: list = []
+    for label_line in func_label_lines:
+        start = label_line
+        while start > 0:
+            prev = lines[start - 1].strip()
+            if (not prev
+                    or prev.startswith("#") or prev.startswith("//")
+                    or prev.startswith(";")
+                    or prev.startswith(".")):
+                start -= 1
+            else:
+                break
+        split_points.append(start)
+
+    # De-duplicate and sort (the first function's preamble walk might reach 0).
+    split_points = sorted(set(split_points))
+    # Don't split at 0 — that would create an empty first chunk.
+    if split_points and split_points[0] == 0:
+        split_points = split_points[1:]
+
+    chunks: list = []
+    prev = 0
+    for sp in split_points:
+        chunks.append("".join(lines[prev:sp]))
+        prev = sp
+    chunks.append("".join(lines[prev:]))
+    return chunks
+
+
+def _process_function_chunk(
+    chunk: str,
+    rename: bool,
+    wide_dual_arith: bool,
+    verbose: bool,
+    same_base_reorder: bool,
+    chain_reorder: bool,
+    label_sets: tuple = None,
+) -> "tuple[str, PairStats]":
+    """Process a single function chunk and return (output_text, stats).
+
+    Top-level function (not a method or closure) so it is picklable by
+    ``ProcessPoolExecutor``.  Each call constructs its own scorer with
+    independent mutable state.
+    """
+    pair_score = make_compact32_scorer({}, wide_dual_arith=wide_dual_arith)
+    sched = AssemblyScheduler(chunk)
+    buf = io.StringIO()
+    stats = sched.process(
+        pair_score             = pair_score,
+        rename                 = rename,
+        out                    = buf,
+        verbose                = verbose,
+        same_base_reorder      = same_base_reorder,
+        chain_reorder          = chain_reorder,
+        _label_sets            = label_sets,
+        _suppress_file_summary = True,
+    )
+    return buf.getvalue(), stats
+
+
+# ---------------------------------------------------------------------------
 # High-level API
 # ---------------------------------------------------------------------------
 
@@ -821,6 +911,8 @@ class AssemblyScheduler:
         verbose:            bool = False,
         same_base_reorder:      bool = False,
         chain_reorder:          bool = False,
+        _label_sets:        tuple = None,
+        _suppress_file_summary: bool = False,
     ) -> "PairStats":
         """
         Parse, schedule, and emit the source in a single streaming pass.
@@ -856,7 +948,10 @@ class AssemblyScheduler:
             out = sys.stdout
 
         # Classify labels for barrier/non-barrier scheduling decisions.
-        branch_targets, globally_visible = _classify_labels(self.source)
+        if _label_sets is not None:
+            branch_targets, globally_visible = _label_sets
+        else:
+            branch_targets, globally_visible = _classify_labels(self.source)
 
         # Whole-function CFG liveness pre-pass.  Computes live_out for every
         # basic block in a single O(N) parse + a few dataflow iterations, so
@@ -1109,9 +1204,11 @@ class AssemblyScheduler:
         # Aggregate stats across all blocks.
         merged = PairStats.merge(all_stats)
 
-        # Append the file-wide summary as assembly comments.
-        for summary_line in merged.summary_lines():
-            print(summary_line, file=out)
+        # Append the file-wide summary as assembly comments (suppressed when
+        # running as a parallel worker — the caller merges stats separately).
+        if not _suppress_file_summary:
+            for summary_line in merged.summary_lines():
+                print(summary_line, file=out)
 
         self.last_stats = merged
         return merged
@@ -1167,6 +1264,11 @@ def main():
                          "other when they share the same base register, the base "
                          "is not modified between them, and their address ranges "
                          "do not overlap.")
+    ap.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                    help="Number of parallel worker processes.  Each function "
+                         "in the input is scheduled independently; -j N spreads "
+                         "them across N processes.  0 = number of CPUs.  "
+                         "Default: 1 (sequential).")
     args = ap.parse_args()
 
     if args.list_rules:
@@ -1195,30 +1297,71 @@ def main():
     else:
         source = open(args.input).read()
 
-    sched = AssemblyScheduler(source)
+    n_jobs = args.jobs
+    if n_jobs == 0:
+        n_jobs = os.cpu_count() or 1
 
-    factory, _ = SCORERS[args.scorer]
-    if args.scorer == "compact32":
-        pair_score = make_compact32_scorer(
-            {}, wide_dual_arith=args.wide_dual_arith)
+    if n_jobs > 1 and args.scorer == "compact32":
+        # Parallel path: split into per-function chunks and process in
+        # parallel.  Each worker gets its own scorer with independent
+        # mutable state.  Label classification runs once on the whole file
+        # and is shared with every worker so block boundaries are identical
+        # to the sequential path.
+        label_sets = _classify_labels(source)
+        chunks = _split_into_functions(source)
+        all_stats: list = []
+        results: "list[tuple[str, PairStats]]" = [None] * len(chunks)
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            future_to_idx = {}
+            for idx, chunk in enumerate(chunks):
+                fut = pool.submit(
+                    _process_function_chunk,
+                    chunk,
+                    rename            = args.rename,
+                    wide_dual_arith   = args.wide_dual_arith,
+                    verbose           = args.verbose,
+                    same_base_reorder = args.same_base_reorder,
+                    chain_reorder     = args.chain_reorder,
+                    label_sets        = label_sets,
+                )
+                future_to_idx[fut] = idx
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                results[idx] = fut.result()
+
+        for text, stats in results:
+            sys.stdout.write(text)
+            all_stats.append(stats)
+
+        merged = PairStats.merge(all_stats)
+        # Emit the file-wide summary that the workers suppressed.
+        for summary_line in merged.summary_lines():
+            print(summary_line)
     else:
-        pair_score = factory()
+        # Sequential path: single scorer, stream directly to stdout.
+        factory, _ = SCORERS[args.scorer]
+        if args.scorer == "compact32":
+            pair_score = make_compact32_scorer(
+                {}, wide_dual_arith=args.wide_dual_arith)
+        else:
+            pair_score = factory()
 
-    # Stream output directly to stdout; summary printed at end of process().
-    sched.process(
-        pair_score        = pair_score,
-        rename            = args.rename,
-        out               = sys.stdout,
-        verbose           = args.verbose,
-        same_base_reorder = args.same_base_reorder,
-        chain_reorder     = args.chain_reorder,
-    )
+        sched = AssemblyScheduler(source)
+        sched.process(
+            pair_score        = pair_score,
+            rename            = args.rename,
+            out               = sys.stdout,
+            verbose           = args.verbose,
+            same_base_reorder = args.same_base_reorder,
+            chain_reorder     = args.chain_reorder,
+        )
+        merged = sched.last_stats
 
-    if sched.last_stats is not None:
-        st = sched.last_stats
+    if merged is not None:
         src_label = args.input if args.input != "-" else "<stdin>"
         print(f"\n# --- report: {args.scorer}  {src_label} ---", file=sys.stderr)
-        for line in st.summary_lines():
+        for line in merged.summary_lines():
             print(line, file=sys.stderr)
 
 if __name__ == "__main__":
