@@ -94,12 +94,27 @@ def _bnb_schedule_window(
         # every candidate in the ready set.  pair_score may be expensive
         # (e.g. compact32 with regex parsing); caching it here avoids
         # calling it twice per candidate (once for sorting, once in the loop).
+        #
+        # Also try the reverse direction: if (prev, cand) doesn't pair but
+        # (cand, prev) does and they are independent, we can swap them so
+        # that cand occupies the A slot and prev the B slot.
         if prev_free and scheduled:
             prev = scheduled[-1]
-            scores = {c: pair_score(prev, idx_map[c]) for c in ready}
-            candidates = sorted(ready, key=lambda c: (-scores[c], c))
+            fwd = {c: pair_score(prev, idx_map[c]) for c in ready}
+            prev_succs = graph.successors[prev.index]
+            rev = {}
+            for c in ready:
+                if fwd[c] == 0 and c not in prev_succs:
+                    s = pair_score(idx_map[c], prev)
+                    if s > 0:
+                        rev[c] = s
+            candidates = sorted(ready,
+                                key=lambda c: (0 if fwd[c] > 0
+                                               else 1 if c in rev
+                                               else 2, c))
         else:
-            scores = {}
+            fwd = {}
+            rev = {}
             candidates = sorted(ready)
 
         for cand in candidates:
@@ -114,14 +129,24 @@ def _bnb_schedule_window(
 
             instr = idx_map[cand]
 
-            if prev_free and scheduled and scores.get(cand, 0) > 0:
+            if prev_free and scheduled and fwd.get(cand, 0) > 0:
                 score_delta = 1
                 new_prev_free = False
+                do_swap = False
+            elif prev_free and scheduled and cand in rev:
+                score_delta = 1
+                new_prev_free = False
+                do_swap = True
             else:
                 score_delta = 0
                 new_prev_free = True
+                do_swap = False
 
-            scheduled.append(instr)
+            if do_swap:
+                scheduled[-1] = instr   # cand becomes A
+                scheduled.append(prev)  # prev becomes B
+            else:
+                scheduled.append(instr)
             ready.remove(cand)
             # Decrement in-degree for all local successors and track which
             # ones crossed zero (became ready).  The undo must restore ALL
@@ -138,7 +163,11 @@ def _bnb_schedule_window(
             search(scheduled, ready, indeg,
                    current_score + score_delta, new_prev_free)
 
-            scheduled.pop()
+            if do_swap:
+                scheduled.pop()         # remove prev (B slot)
+                scheduled[-1] = prev    # restore prev as the free instruction
+            else:
+                scheduled.pop()
             ready.add(cand)
             for succ in decremented:
                 if indeg[succ] == 0:
@@ -157,10 +186,34 @@ def _bnb_schedule_window(
         ready = set(initial_ready)
         while ready:
             # Greedy: prefer candidates that pair with the last instruction.
+            # Also consider swapping if (cand, prev) pairs but (prev, cand)
+            # does not and there is no dependency edge prev -> cand.
             if result:
                 prev = result[-1]
-                chosen = max(ready,
-                             key=lambda c: (pair_score(prev, idx_map[c]), -c))
+                prev_succs = graph.successors[prev.index]
+
+                def _greedy_key(c):
+                    fwd = pair_score(prev, idx_map[c])
+                    if fwd > 0:
+                        return (2, -c)
+                    if c not in prev_succs and pair_score(idx_map[c], prev) > 0:
+                        return (1, -c)
+                    return (0, -c)
+
+                chosen = max(ready, key=_greedy_key)
+                fwd_score = pair_score(prev, idx_map[chosen])
+                if fwd_score == 0 and chosen not in prev_succs \
+                        and pair_score(idx_map[chosen], prev) > 0:
+                    # Swap: cand becomes A, prev becomes B.
+                    result[-1] = idx_map[chosen]
+                    result.append(prev)
+                    ready.remove(chosen)
+                    for succ in graph.successors[chosen]:
+                        if succ in local_indices:
+                            remaining_indeg[succ] -= 1
+                            if remaining_indeg[succ] == 0:
+                                ready.add(succ)
+                    continue
             else:
                 chosen = min(ready)
             result.append(idx_map[chosen])
