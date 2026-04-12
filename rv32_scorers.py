@@ -1105,7 +1105,7 @@ def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
     A slot: ``mv rd, rs`` or load with offset in 0..3×width
     B slot: j / jr / jalr 0(rs) / ret  (shared with arith_jump)
     """
-    if _is_mv(a):
+    if _is_mv(a) or _is_li(a):
         return _is_small_jump(b)
     if _is_load(a) and a.mem is not None:
         off, _base = a.mem
