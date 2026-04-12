@@ -34,7 +34,7 @@ from typing import Callable
 
 from rv32_core import (
     Instruction,
-    _DUAL_ARITH_MN, _REG4, _IMM_FORMS,
+    _DUAL_ARITH_MN, _REG4, _IMM_FORMS, _COMMUTATIVE_BINOP,
     _dual_arith_ok, _dual_arith_ok_wide,
 )
 
@@ -356,6 +356,28 @@ _CMP_MNEMONICS = frozenset({
 })
 _BRANCH_ZERO = frozenset({"beqz", "bnez", "beq", "bne"})
 _BRANCH_CMP  = frozenset({"beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez"})
+
+# beq and bne are symmetric: ``beq rs1, rs2, lbl`` == ``beq rs2, rs1, lbl``.
+_COMMUTATIVE_BRANCH = frozenset({"beq", "bne"})
+
+
+def _is_chained(rd: str, b: "Instruction", liveness: dict) -> bool:
+    """True if *b* consumes *rd* and *rd* is dead after *b*.
+
+    Handles commutative instructions: for R-type ops in ``_COMMUTATIVE_BINOP``
+    and for ``beq``/``bne``, *rd* may appear as either operand.  For all
+    other instructions *rd* must be ``b.uses[0]`` (rs1).
+    """
+    if not b.uses:
+        return False
+    if b.uses[0] == rd:
+        pass  # matched as rs1
+    elif (b.mnemonic in _COMMUTATIVE_BINOP or b.mnemonic in _COMMUTATIVE_BRANCH):
+        if rd not in b.uses:
+            return False
+    else:
+        return False
+    return rd in liveness.get(b.index, frozenset())
 
 # Module-level constants shared by multiple rules and by make_compact32_scorer.
 #
@@ -896,14 +918,15 @@ def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
 def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
                            liveness: dict) -> bool:
     """
-    Load followed by arithmetic that reads the loaded value as rs1, with the
+    Load followed by arithmetic that uses the loaded value, with the
     same encoding constraints as dual_arith_chain's B slot.
 
     A slot: lw or ld; A's destination must lie in x0..x15 so the chain
             intermediate fits the compact register field.
-    B slot: dual-arith op with rs1 == rd_a, rd_b in x0..x15, rs2 (if any)
-            in x0..x15, and the same immediate range as dual_arith_chain
-            (−16..15 for addi/andi/etc., 1..31 for slli/srli).
+    B slot: dual-arith op using rd_a (as either operand for commutative
+            ops), rd_b in x0..x15, all register uses in x0..x15, and
+            immediate in range (−16..15 for addi/andi/etc., 1..31 for
+            slli/srli).
 
     A's destination must be dead after B — it carries only the chained value.
     """
@@ -914,12 +937,12 @@ def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
         return False
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
-    if not b.uses or b.uses[0] != rd_a:
+    if not _is_chained(rd_a, b, liveness):
         return False
     rd_b = b.defs[0] if b.defs else None
     if rd_b is None or rd_b not in _REG4:
         return False
-    if len(b.uses) >= 2 and b.uses[1] not in _REG4:
+    if any(u not in _REG4 for u in b.uses):
         return False
     if b.mnemonic in _IMM_FORMS:
         imm = b.imm
@@ -930,7 +953,7 @@ def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
                 return False
         elif imm < -16 or imm > 15:
             return False
-    return rd_a in liveness.get(b.index, frozenset())
+    return True
 
 
 def _rule_dual_arith(a: "Instruction", b: "Instruction",
@@ -1019,26 +1042,25 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
 
     Matches:
         <dual-arith op>  rd_a, rd_a, rs2_a   (A in RSD form; rd_a in x0..x15)
-        <dual-arith op>  rd_b, rd_a, rs2_b   (B reads A's result as rs1)
+        <dual-arith op>  rd_b, rd_a, rs2_b   (B uses A's result; rd_a dead after B)
 
     rd_a must be dead after B — it is the intermediate, used only to pass
     A's result to B.  rd_b must be in x0..x15.
 
-    Note: B reads A's result as rs1 (``uses[0]``).  For commutative ops
-    (``add``, ``and``, ``or``, …) the renamer normalises operand order so
-    the chain intermediate is rs1 when possible.
+    For commutative B ops (add, and, or, xor) rd_a may appear as either
+    rs1 or rs2.
     """
     if not a.dual_arith_ok:
         return False
     rd_a = a.defs[0]
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
-    if not b.uses or b.uses[0] != rd_a:
+    if not _is_chained(rd_a, b, liveness):
         return False
     rd_b = b.defs[0] if b.defs else None
     if rd_b is None or rd_b not in _REG4:
         return False
-    if len(b.uses) >= 2 and b.uses[1] not in _REG4:
+    if any(u not in _REG4 for u in b.uses):
         return False
     if b.mnemonic in _IMM_FORMS:
         imm = b.imm
@@ -1049,9 +1071,6 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
                 return False
         elif imm < -16 or imm > 15:
             return False
-    # A's result is consumed by B and not needed afterwards.
-    if rd_a not in liveness.get(b.index, frozenset()):
-        return False
     return True
 
 
@@ -1519,7 +1538,7 @@ def make_compact32_scorer(liveness: dict,
             rd_a = a.defs[0]
             if b.mnemonic not in _DUAL_ARITH_MN:
                 return False
-            if not b.uses or b.uses[0] != rd_a:
+            if not _is_chained(rd_a, b, liveness):
                 return False
             rd_b = b.defs[0] if b.defs else None
             if rd_b is None:
@@ -1528,8 +1547,6 @@ def make_compact32_scorer(liveness: dict,
                 imm = b.imm
                 if imm is None or imm < -16 or imm > 15:
                     return False
-            if rd_a not in liveness.get(b.index, frozenset()):
-                return False
             return True
 
         def _rule_arith_jump_w(a, b, liveness):
