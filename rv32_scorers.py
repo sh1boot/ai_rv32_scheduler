@@ -1055,17 +1055,54 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     return True
 
 
+def _is_jump_no_call(b: "Instruction") -> bool:
+    """True if *b* is an unconditional jump but NOT a function call.
+
+    Accepts:
+      - ``j label`` (canonicalised to ``jal`` with no defs — x0 link reg)
+      - ``jr rs`` / ``ret`` (canonicalised to ``jalr`` with zero offset)
+
+    Rejects:
+      - ``jal func`` (writes ra / x1 — link register ⇒ call)
+      - ``jalr offset(rs)`` with non-zero offset (indirect call through vtable)
+    """
+    if b.mnemonic == "jal":
+        return not b.defs  # j → defs=[], jal func → defs=[x1]
+    if b.mnemonic == "jalr":
+        return b.imm is None or b.imm == 0
+    return False
+
+
 def _rule_arith_jump(a: "Instruction", b: "Instruction",
                      liveness: dict) -> bool:
     """
     Arithmetic operation (dual-arith subset) followed by an unconditional
-    call or jump.
+    jump (not a call).
 
     Matches:
         <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
-        jal / jalr       ...
+        j / jr / ret     ...
     """
-    return a.dual_arith_ok and b.mnemonic in ("jal", "jalr")
+    return a.dual_arith_ok and _is_jump_no_call(b)
+
+
+def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
+                       liveness: dict) -> bool:
+    """
+    Move or small-offset load followed by an unconditional jump (not a call).
+
+    A slot: ``mv rd, rs`` or ``ld``/``lw`` with offset in 0..3×width
+    B slot: j / jr / ret  (same constraint as arith_jump)
+    """
+    if _is_mv(a):
+        return _is_jump_no_call(b)
+    if _is_load(a) and a.mem is not None:
+        off, _base = a.mem
+        if off is not None and off >= 0:
+            width = _MEM_WIDTH.get(a.mnemonic, 0)
+            if width != 0 and off % width == 0 and off <= 3 * width:
+                return _is_jump_no_call(b)
+    return False
 
 
 def _rule_arith_branch(a: "Instruction", b: "Instruction",
@@ -1251,6 +1288,7 @@ COMPACT32_RULES: list = [
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
     ("arith_jump",          _rule_arith_jump),
+    ("mv_load_jump",        _rule_mv_load_jump),
     ("arith_branch",        _rule_arith_branch),
     ("addi_branch",         _rule_addi_branch),
 ]
@@ -1456,7 +1494,7 @@ def make_compact32_scorer(liveness: dict,
             return True
 
         def _rule_arith_jump_w(a, b, liveness):
-            return _da_ok(a) and b.mnemonic in ("jal", "jalr")
+            return _da_ok(a) and _is_jump_no_call(b)
 
         def _rule_arith_branch_w(a, b, liveness):
             if not _da_ok(a):
@@ -1523,6 +1561,8 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
             eligible.add("op_pair_chain")
+        if _is_mv(a) or (_is_load(a) and _mem_small_offset_ok(a)):
+            eligible.add("mv_load_jump")
         if _da_ok(a):
             eligible.add("dual_arith")
             eligible.add("dual_arith_chain")
