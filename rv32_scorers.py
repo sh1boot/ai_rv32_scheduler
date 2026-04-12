@@ -775,7 +775,7 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
                           liveness: dict) -> bool:
     """
     Memory op followed by an address update on the same base
-    (post-increment / access-then-stride).
+    (access-then-stride).
 
     A slot: _is_mem_op        (any load or store)
     B slot: _is_addr_update   (add/addi/sub/sh[1-3]add — scalar only)
@@ -794,6 +794,119 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
         if load_rd is not None and load_rd == arith_rd:
             return False
     return _addr_stride_ok(b, a)
+
+
+# ---------------------------------------------------------------------------
+# Load-producer chain rules
+# ---------------------------------------------------------------------------
+# Three rules that share an A slot: a word or doubleword load whose result
+# is consumed by B and then dead.  They differ in what B may be:
+#
+#   load_mem_chain    B is a load/store indexed by the loaded pointer, with a
+#                     small scaled offset (0..3 × access width).
+#   load_jalr_chain   B is an indirect jump/call through the loaded pointer.
+#   load_arith_chain  B is an arithmetic op reading the loaded value as rs1,
+#                     with the same encoding constraints as dual_arith_chain.
+#
+# Shared A predicate: _is_load_producer.
+_LOAD_PRODUCER_MN = frozenset({"lw", "ld"})
+
+
+def _is_load_producer(instr: "Instruction") -> bool:
+    """True if *instr* is a word/doubleword load that can seed a chain."""
+    return instr.mnemonic in _LOAD_PRODUCER_MN and bool(instr.defs)
+
+
+def _rule_load_mem_chain(a: "Instruction", b: "Instruction",
+                         liveness: dict) -> bool:
+    """
+    Load of a value followed by an indexed load/store that uses the loaded
+    value as its base, with a small scaled offset.
+
+    A slot: lw or ld
+    B slot: any load/store whose base register equals A's destination and
+            whose offset is a non-negative multiple of its access width with
+            the scaled index in {0, 1, 2, 3}.
+
+    A's destination must be dead after B — it carries only the chained
+    pointer.  Matches the pointer-deref idiom (load pointer, deref field).
+    """
+    if not _is_load_producer(a):
+        return False
+    rd_a = a.defs[0]
+    if not _is_mem_op(b) or b.mem is None:
+        return False
+    off_b, base_b = b.mem
+    if base_b != rd_a:
+        return False
+    width_b = _MEM_WIDTH.get(b.mnemonic, 0)
+    if width_b == 0 or off_b is None:
+        return False
+    if off_b < 0 or off_b % width_b != 0 or off_b // width_b > 3:
+        return False
+    return rd_a in liveness.get(b.index, frozenset())
+
+
+def _rule_load_jalr_chain(a: "Instruction", b: "Instruction",
+                          liveness: dict) -> bool:
+    """
+    Load of a function pointer followed by an indirect jump/call through it.
+
+    A slot: lw or ld
+    B slot: jalr (the parser canonicalises ``jr`` to ``jalr``) whose base
+            register equals A's destination.
+
+    A's destination must be dead after B.  Matches vtable / function-pointer
+    call idioms.
+    """
+    if not _is_load_producer(a):
+        return False
+    rd_a = a.defs[0]
+    if b.mnemonic != "jalr":
+        return False
+    if not b.uses or b.uses[0] != rd_a:
+        return False
+    return rd_a in liveness.get(b.index, frozenset())
+
+
+def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
+                           liveness: dict) -> bool:
+    """
+    Load followed by arithmetic that reads the loaded value as rs1, with the
+    same encoding constraints as dual_arith_chain's B slot.
+
+    A slot: lw or ld; A's destination must lie in x0..x15 so the chain
+            intermediate fits the compact register field.
+    B slot: dual-arith op with rs1 == rd_a, rd_b in x0..x15, rs2 (if any)
+            in x0..x15, and the same immediate range as dual_arith_chain
+            (−16..15 for addi/andi/etc., 1..31 for slli/srli).
+
+    A's destination must be dead after B — it carries only the chained value.
+    """
+    if not _is_load_producer(a):
+        return False
+    rd_a = a.defs[0]
+    if rd_a not in _REG4:
+        return False
+    if b.mnemonic not in _DUAL_ARITH_MN:
+        return False
+    if not b.uses or b.uses[0] != rd_a:
+        return False
+    rd_b = b.defs[0] if b.defs else None
+    if rd_b is None or rd_b not in _REG4:
+        return False
+    if len(b.uses) >= 2 and b.uses[1] not in _REG4:
+        return False
+    if b.mnemonic in _IMM_FORMS:
+        imm = b.imm
+        if imm is None:
+            return False
+        if b.mnemonic in ("slli", "srli"):
+            if imm < 1 or imm > 31:
+                return False
+        elif imm < -16 or imm > 15:
+            return False
+    return rd_a in liveness.get(b.index, frozenset())
 
 
 def _rule_dual_arith(a: "Instruction", b: "Instruction",
@@ -1104,6 +1217,9 @@ COMPACT32_RULES: list = [
     ("addr_chain",          _rule_addr_chain),
     ("pre_increment",       _rule_pre_increment),
     ("post_increment",      _rule_post_increment),
+    ("load_mem_chain",      _rule_load_mem_chain),
+    ("load_jalr_chain",     _rule_load_jalr_chain),
+    ("load_arith_chain",    _rule_load_arith_chain),
     ("op_pair",             _rule_op_pair),
     ("op_pair_chain",       _rule_op_pair_chain),
     ("dual_arith",          _rule_dual_arith),
@@ -1372,6 +1488,10 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("pre_increment")
         if _is_mem_op(a):
             eligible.add("post_increment")
+        if a.mnemonic in _LOAD_PRODUCER_MN:
+            eligible.add("load_mem_chain")
+            eligible.add("load_jalr_chain")
+            eligible.add("load_arith_chain")
         if a.mnemonic in _OP_PAIR_TABLE or _is_mv(a) or _is_li(a):
             eligible.add("op_pair")
         if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
