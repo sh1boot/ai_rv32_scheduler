@@ -267,19 +267,55 @@ def _opcode_tally_lines(
     if not row_ops and not col_ops:
         return []
 
+    # -- Per-row "top next": most frequent B-side opcode for each row ------
+    # Considers ALL B-side opcodes (not just displayed columns).
+    row_top_next: dict = {}   # mn_a -> (mn_b, count)
+    for mn_a in row_ops:
+        best_mn, best_cnt = "", 0
+        for (a, b), cnt in tbl.items():
+            if a == mn_a and b and cnt > best_cnt:
+                best_mn, best_cnt = b, cnt
+        if best_cnt:
+            row_top_next[mn_a] = (best_mn, best_cnt)
+
+    # -- Per-column "top prev": most frequent A-side opcode for each col ---
+    # Considers ALL A-side opcodes (not just displayed rows).
+    col_top_prev: dict = {}   # mn_b -> (mn_a, count)
+    for mn_b in col_ops:
+        best_mn, best_cnt = "", 0
+        for (a, b), cnt in tbl.items():
+            if b == mn_b and a and cnt > best_cnt:
+                best_mn, best_cnt = a, cnt
+        if best_cnt:
+            col_top_prev[mn_b] = (best_mn, best_cnt)
+
     col_w   = max((len(mn) for mn in col_ops), default=4)
     row_w   = max((len(mn) for mn in row_ops), default=4)
     total_w = max(5, max((len(str(opcode_tally.get(mn, 0))) for mn in row_ops), default=1))
     total_w = max(total_w, len(str(actual_total)))
+
+    # Width for the two "top next" suffix columns.
+    top_mn_w = max((len(mn) for mn, _ in row_top_next.values()), default=4)
+    top_mn_w = max(top_mn_w, len("next"))
+    top_ct_w = max((len(str(ct)) for _, ct in row_top_next.values()), default=1)
+    top_ct_w = max(top_ct_w, 1)
+
+    def _suffix(mn_a: str) -> str:
+        if mn_a in row_top_next:
+            tmn, tct = row_top_next[mn_a]
+            return f"  {tmn:>{top_mn_w}} {tct:>{top_ct_w}d}"
+        return ""
 
     lines = [f"# {header}"]
     if hidden:
         lines.append(f"#   ({hidden} of {actual_total} hidden)")
     if col_include:
         lines.append(f"#   (columns restricted to: {', '.join(sorted(col_include))})")
-    lines.append(f"# {'':>{row_w}}  {'total':>{total_w}}"
-                 + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
-                    if col_ops else ""))
+    hdr_line = (f"# {'':>{row_w}}  {'total':>{total_w}}"
+                + ("  " + "  ".join(f"{mn:>{col_w}}" for mn in col_ops)
+                   if col_ops else "")
+                + f"  {'next':>{top_mn_w}}")
+    lines.append(hdr_line)
 
     tot_row = f"# {'':>{row_w}}  {actual_total:>{total_w}d}"
     if col_ops:
@@ -300,7 +336,23 @@ def _opcode_tally_lines(
                      if tbl.get((mn_a, b), 0) else " " * col_w
                      for b in col_ops]
             row += "  " + "  ".join(cells)
+        row += _suffix(mn_a)
         lines.append(row)
+
+    # -- Bottom summary rows: top prev opcode and count per column ---------
+    if col_ops:
+        prev_mn_row = f"# {'prev':<{row_w}}  {'':>{total_w}}"
+        prev_ct_row = f"# {'':>{row_w}}  {'':>{total_w}}"
+        prev_mn_row += "  " + "  ".join(
+            f"{col_top_prev[b][0]:>{col_w}}" if b in col_top_prev
+            else " " * col_w
+            for b in col_ops)
+        prev_ct_row += "  " + "  ".join(
+            f"{col_top_prev[b][1]:>{col_w}d}" if b in col_top_prev
+            else " " * col_w
+            for b in col_ops)
+        lines.append(prev_mn_row)
+        lines.append(prev_ct_row)
 
     return lines
 
