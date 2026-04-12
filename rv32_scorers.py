@@ -1055,16 +1055,27 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     return True
 
 
-def _is_jump_no_call(b: "Instruction") -> bool:
-    """True if *b* is an unconditional jump but NOT a function call.
+def _is_small_jump(b: "Instruction") -> bool:
+    """True if *b* is an unconditional branch with a small or zero immediate.
+
+    ``j`` targets a local label whose offset fits in the instruction word;
+    ``jalr``/``jr`` with zero offset is a pure register-indirect transfer.
+    Both are safe to pair because the immediate is small and not subject to
+    linker relocation.
+
+    ``jal`` (call) carries a potentially large, linker-modifiable function
+    address.  ``jalr`` with a non-zero offset typically holds a relocation
+    addend from ``auipc``; both are rejected.
 
     Accepts:
-      - ``j label`` (canonicalised to ``jal`` with no defs — x0 link reg)
-      - ``jr rs`` / ``ret`` (canonicalised to ``jalr`` with zero offset)
+      - ``j label``   (canonicalised to ``jal`` with defs=[] — x0 link reg)
+      - ``jr rs``     (canonicalised to ``jalr`` with zero/absent offset)
+      - ``jalr rd, 0(rs)``  (zero offset — indirect call/jump)
+      - ``ret``       (canonicalised to ``jalr`` with zero offset)
 
     Rejects:
-      - ``jal func`` (writes ra / x1 — link register ⇒ call)
-      - ``jalr offset(rs)`` with non-zero offset (indirect call through vtable)
+      - ``jal func``  (defs=[x1] — large/relocatable immediate)
+      - ``jalr rd, off(rs)``  with off ≠ 0 (relocatable addend)
     """
     if b.mnemonic == "jal":
         return not b.defs  # j → defs=[], jal func → defs=[x1]
@@ -1076,32 +1087,32 @@ def _is_jump_no_call(b: "Instruction") -> bool:
 def _rule_arith_jump(a: "Instruction", b: "Instruction",
                      liveness: dict) -> bool:
     """
-    Arithmetic operation (dual-arith subset) followed by an unconditional
-    jump (not a call).
+    Arithmetic operation (dual-arith subset) followed by a small
+    unconditional branch (j, jr, jalr with zero offset, ret).
 
     Matches:
         <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
-        j / jr / ret     ...
+        j / jr / jalr 0(rs) / ret
     """
-    return a.dual_arith_ok and _is_jump_no_call(b)
+    return a.dual_arith_ok and _is_small_jump(b)
 
 
 def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
                        liveness: dict) -> bool:
     """
-    Move or small-offset load followed by an unconditional jump (not a call).
+    Move or small-offset load followed by a small unconditional branch.
 
-    A slot: ``mv rd, rs`` or ``ld``/``lw`` with offset in 0..3×width
-    B slot: j / jr / ret  (same constraint as arith_jump)
+    A slot: ``mv rd, rs`` or load with offset in 0..3×width
+    B slot: j / jr / jalr 0(rs) / ret  (shared with arith_jump)
     """
     if _is_mv(a):
-        return _is_jump_no_call(b)
+        return _is_small_jump(b)
     if _is_load(a) and a.mem is not None:
         off, _base = a.mem
         if off is not None and off >= 0:
             width = _MEM_WIDTH.get(a.mnemonic, 0)
             if width != 0 and off % width == 0 and off <= 3 * width:
-                return _is_jump_no_call(b)
+                return _is_small_jump(b)
     return False
 
 
@@ -1494,7 +1505,7 @@ def make_compact32_scorer(liveness: dict,
             return True
 
         def _rule_arith_jump_w(a, b, liveness):
-            return _da_ok(a) and _is_jump_no_call(b)
+            return _da_ok(a) and _is_small_jump(b)
 
         def _rule_arith_branch_w(a, b, liveness):
             if not _da_ok(a):
