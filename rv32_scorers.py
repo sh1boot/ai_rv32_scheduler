@@ -891,7 +891,7 @@ def _rule_load_jalr_chain(a: "Instruction", b: "Instruction",
     return rd_a in liveness.get(b.index, frozenset())
 
 
-_LOAD_BRANCH_MN = frozenset({"beqz", "bnez"})
+_LOAD_BRANCH_MN = frozenset({"beqz", "bnez", "beq", "bne"})
 
 
 def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
@@ -910,9 +910,7 @@ def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
     rd_a = a.defs[0]
     if b.mnemonic not in _LOAD_BRANCH_MN:
         return False
-    if not b.uses or b.uses[0] != rd_a:
-        return False
-    return rd_a in liveness.get(b.index, frozenset())
+    return _is_chained(rd_a, b, liveness)
 
 
 def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
