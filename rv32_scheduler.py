@@ -1312,12 +1312,17 @@ def main():
         all_stats: list = []
         results: "list[tuple[str, PairStats]]" = [None] * len(chunks)
 
+        # Submit largest chunks first so the pool starts on the most
+        # expensive functions immediately, reducing tail latency.
+        submit_order = sorted(range(len(chunks)),
+                              key=lambda i: len(chunks[i]), reverse=True)
+
         with ProcessPoolExecutor(max_workers=n_jobs) as pool:
             future_to_idx = {}
-            for idx, chunk in enumerate(chunks):
+            for idx in submit_order:
                 fut = pool.submit(
                     _process_function_chunk,
-                    chunk,
+                    chunks[idx],
                     rename            = args.rename,
                     wide_dual_arith   = args.wide_dual_arith,
                     verbose           = args.verbose,
