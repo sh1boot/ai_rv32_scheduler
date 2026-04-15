@@ -31,6 +31,8 @@ Usage
 import re, sys, argparse, shutil
 from collections import Counter
 
+from rv32_core import parse_line
+
 # ---------------------------------------------------------------------------
 # Annotation parsing
 # ---------------------------------------------------------------------------
@@ -49,7 +51,7 @@ _CLASS_RE    = re.compile(r'CLASS:([\w,]+)')
 class AnnotatedInstr:
     """Parsed record for one instruction line."""
     __slots__ = ("mnemonic", "is_pair_a", "pair_rule", "is_pair_b",
-                 "tally_a", "tally_b", "classes")
+                 "tally_a", "tally_b", "classes", "parsed")
 
     def __init__(self):
         self.mnemonic: str       = ""
@@ -59,6 +61,10 @@ class AnnotatedInstr:
         self.tally_a:  set       = set()   # rule names where eligible as A-side
         self.tally_b:  set       = set()   # rule names where eligible as B-side
         self.classes:  frozenset = frozenset()
+        # Full Instruction record (defs/uses/is_load/etc.) for dependency
+        # analysis when reordering around skipped neighbours.  None if
+        # parse_line could not decode the instruction.
+        self.parsed:   object    = None
 
 
 def parse_annotated_stream(lines):
@@ -80,6 +86,13 @@ def parse_annotated_stream(lines):
 
         ai = AnnotatedInstr()
         ai.mnemonic = mnemonic
+        # parse_line strips comments itself and returns None for non-instruction
+        # lines.  We feed the original line so it sees the same operand text
+        # that the scheduler did.
+        try:
+            ai.parsed = parse_line(0, line)
+        except Exception:
+            ai.parsed = None
 
         # Extract comment portion (everything after the first '#' not inside
         # the instruction operands).
@@ -195,6 +208,44 @@ def _matches_filter(mn: str, filter_toks: "frozenset[str]") -> bool:
     return any(_mn_in_group(mn, tok) for tok in filter_toks)
 
 
+def _can_commute(x, y) -> bool:
+    """True if instructions *x* and *y* can be swapped without changing
+    program semantics — i.e. there is no register, memory, CSR, or barrier
+    dependency between them.
+
+    Conservative: if either instruction is missing parsed metadata (e.g.
+    parse_line returned None for an unknown mnemonic) the answer is False.
+    Memory ops are conservative too — any pairing that involves a store on
+    either side is treated as conflicting, since the tally tool has no
+    alias analysis.
+    """
+    if x is None or y is None:
+        return False
+    if getattr(x, "is_barrier", False) or getattr(y, "is_barrier", False):
+        return False
+    x_load  = getattr(x, "is_load",  False)
+    x_store = getattr(x, "is_store", False)
+    y_load  = getattr(y, "is_load",  False)
+    y_store = getattr(y, "is_store", False)
+    x_mem   = x_load or x_store
+    y_mem   = y_load or y_store
+    if (x_store and y_mem) or (y_store and x_mem):
+        return False
+    x_cdef = set(getattr(x, "csr_defs", []) or ())
+    y_cdef = set(getattr(y, "csr_defs", []) or ())
+    x_cuse = set(getattr(x, "csr_uses", []) or ())
+    y_cuse = set(getattr(y, "csr_uses", []) or ())
+    if (x_cdef & y_cuse) or (y_cdef & x_cuse) or (x_cdef & y_cdef):
+        return False
+    x_def = set(getattr(x, "defs", []) or ())
+    y_def = set(getattr(y, "defs", []) or ())
+    x_use = set(getattr(x, "uses", []) or ())
+    y_use = set(getattr(y, "uses", []) or ())
+    if (x_def & y_use) or (y_def & x_use) or (x_def & y_def):
+        return False
+    return True
+
+
 def _instr_excluded(ai: "AnnotatedInstr", exclude: "frozenset[str]") -> bool:
     """True if *ai* should be excluded based on *exclude* tokens.
 
@@ -222,6 +273,7 @@ def _opcode_tally_lines(
     grid_cols: int = 20,
     exclude: "frozenset[str]" = frozenset({"lui", "auipc"}),
     col_include: "frozenset[str]" = frozenset(),
+    sort_col_by: str = "",
 ) -> list:
     """Format a cross-tab grid and return it as a list of comment strings.
 
@@ -229,6 +281,8 @@ def _opcode_tally_lines(
     opcode_tally    : {mn_a: count}          (row totals)
     exclude         : class/mnemonic tokens to hide from rows AND columns
     col_include     : if non-empty, restrict columns to these class/mnemonic tokens
+    sort_col_by     : if non-empty, rank columns by their count in this row's
+                      mnemonic instead of by overall column total
     """
     def _excluded(mn: str) -> bool:
         return any(_mn_in_group(mn, tok) for tok in exclude)
@@ -258,8 +312,14 @@ def _opcode_tally_lines(
                       if b and not _excluded(b) and _include_col(b)}
     col_totals_all = {b: sum(tbl.get((a, b), 0) for a in visible_mn)
                       for b in all_col_mn}
+    if sort_col_by:
+        # Rank columns by how often the chosen A-row pairs with each B,
+        # falling back to overall column total to break ties / handle zeros.
+        col_sort_key = lambda kv: (-tbl.get((sort_col_by, kv[0]), 0), -kv[1])
+    else:
+        col_sort_key = lambda kv: -kv[1]
     col_ops    = [mn for mn, _ in
-                  sorted(col_totals_all.items(), key=lambda kv: -kv[1])[:grid_cols]]
+                  sorted(col_totals_all.items(), key=col_sort_key)[:grid_cols]]
     col_totals = {b: col_totals_all[b] for b in col_ops}
     grand_total = sum(opcode_tally.get(mn, 0) for mn in visible_mn)
     hidden      = actual_total - grand_total
@@ -367,7 +427,8 @@ def analyse(instrs: "list[AnnotatedInstr]",
             exclude: "frozenset[str]" = frozenset({"big"}),
             pairs_mode: bool = False,
             grid_rows: int = 20,
-            grid_cols: int = 20) -> list:
+            grid_cols: int = 20,
+            sort_col_by: str = "") -> list:
     """
     Produce tally output lines for *instrs*.
 
@@ -395,49 +456,41 @@ def analyse(instrs: "list[AnnotatedInstr]",
     singleton_tally: Counter = Counter()
     opcode_tally:    Counter = Counter()
 
-    # Walk the instruction list, collecting adjacent unpaired pairs.
-    prev: "AnnotatedInstr | None" = None
+    # Walk the instruction list.  Excluded and already-paired instructions
+    # do not break the (prev → cand) chain on their own — the scheduler is
+    # free to reorder around them provided no register/memory/CSR/barrier
+    # dependency forbids the move.  We accumulate them in *skipped* and
+    # only count (prev, cand) when every skipped neighbour can commute
+    # with cand (so cand can be lifted up to prev).
+    prev:    "AnnotatedInstr | None" = None
+    skipped: list                     = []
+
     for ai in instrs:
-        if ai.is_pair_a or ai.is_pair_b:
-            prev = None
+        if ai.is_pair_a or ai.is_pair_b or _instr_excluded(ai, exclude):
+            if prev is not None:
+                skipped.append(ai)
             continue
-        if _instr_excluded(ai, exclude):
-            prev = None
-            continue
-        # Determine if this instruction is "interesting" for the requested rule.
+
         a_ok = (not rule) or (rule in ai.tally_a)
         b_ok = (not rule) or (rule in ai.tally_b)
+
+        if prev is not None:
+            prev_a_ok = (not rule) or (rule in prev.tally_a)
+            cur_b_ok  = b_ok
+            # In pairs mode B must be rule-eligible; in default mode B is
+            # any non-excluded/non-paired instruction.
+            count_pair = prev_a_ok and (cur_b_ok if pairs_mode else True)
+            if count_pair and all(_can_commute(s.parsed, ai.parsed)
+                                  for s in skipped):
+                singleton_tally[(prev.mnemonic, ai.mnemonic)] += 1
+                if pairs_mode:
+                    opcode_tally[prev.mnemonic] += 1
 
         if a_ok and not pairs_mode:
             opcode_tally[ai.mnemonic] += 1
 
-        if pairs_mode:
-            if prev is not None:
-                prev_a_ok = (not rule) or (rule in prev.tally_a)
-                cur_b_ok  = (not rule) or (rule in ai.tally_b)
-                if prev_a_ok and cur_b_ok:
-                    singleton_tally[(prev.mnemonic, ai.mnemonic)] += 1
-                    opcode_tally[prev.mnemonic] += 1
-            prev = ai
-        else:
-            prev = ai
-
-    if not pairs_mode:
-        # Build singleton_tally from adjacent (A-eligible, any) pairs.
-        prev2: "AnnotatedInstr | None" = None
-        for ai in instrs:
-            if ai.is_pair_a or ai.is_pair_b:
-                prev2 = None
-                continue
-            if _instr_excluded(ai, exclude):
-                prev2 = None
-                continue
-            a_ok = (not rule) or (rule in ai.tally_a)
-            if prev2 is not None:
-                prev2_a_ok = (not rule) or (rule in prev2.tally_a)
-                if prev2_a_ok:
-                    singleton_tally[(prev2.mnemonic, ai.mnemonic)] += 1
-            prev2 = ai
+        prev = ai
+        skipped = []
 
     if not opcode_tally and not singleton_tally:
         mode_desc = "pairs" if pairs_mode else "A-side"
@@ -454,6 +507,7 @@ def analyse(instrs: "list[AnnotatedInstr]",
         header=hdr,
         grid_rows=grid_rows, grid_cols=grid_cols,
         exclude=exclude, col_include=cols,
+        sort_col_by=sort_col_by,
     ))
     return lines
 
@@ -480,6 +534,10 @@ def main():
                          "Same tokens as --cols.  'big' excludes lui, auipc, and "
                          "any instruction annotated CLASS:big (large immediate).  "
                          "Default: 'big'.")
+    ap.add_argument("--sort-by", default="", metavar="MNEMONIC",
+                    help="Sort columns by their count in row MNEMONIC instead "
+                         "of by overall column total.  Empty (default) = sort "
+                         "by total.")
     ap.add_argument("--pairs", action="store_true",
                     help="Count adjacent (A-eligible, B-eligible) pairs rather "
                          "than individual A-side instructions.")
@@ -508,12 +566,13 @@ def main():
 
     output = analyse(
         instrs,
-        rule      = args.rule,
-        cols      = col_include,
-        exclude   = exclude,
-        pairs_mode= args.pairs,
-        grid_rows = args.grid_rows,
-        grid_cols = args.grid_cols,
+        rule        = args.rule,
+        cols        = col_include,
+        exclude     = exclude,
+        pairs_mode  = args.pairs,
+        grid_rows   = args.grid_rows,
+        grid_cols   = args.grid_cols,
+        sort_col_by = args.sort_by,
     )
     for line in output:
         print(line)
