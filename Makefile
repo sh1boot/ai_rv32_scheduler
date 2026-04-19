@@ -10,7 +10,7 @@ clean:
 	rm -f *.out.s
 
 %.out.s: %.s $(SOURCES)
-	python ./rv32_scheduler.py --wide-dual-arith --same-base-reorder $< > $@
+	python ./rv32_scheduler.py -j0 --wide-dual-arith --same-base-reorder $< > $@
 
 %.tally: %.out.s $(SOURCES)
 	python ./rv32_tally.py $< | tee $@
