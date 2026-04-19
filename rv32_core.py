@@ -488,6 +488,11 @@ class Instruction:
     def __repr__(self):
         return f"I{self.index}:{self.mnemonic}"
 
+    def __str__(self):
+        if self.operands:
+            return f"{self.mnemonic} {', '.join(self.operands)}"
+        return self.mnemonic
+
 # ---------------------------------------------------------------------------
 # Operand decoder
 # ---------------------------------------------------------------------------
