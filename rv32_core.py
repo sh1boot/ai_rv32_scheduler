@@ -478,7 +478,6 @@ class Instruction:
     imm:        object = None  # int immediate if present, else None
     mem:        object = None  # (offset:int, base:str) for load/store, else None
     dual_arith_ok:       bool = False
-    dual_arith_ok_wide:  bool = False
     # Source lines (label definitions) that must be emitted immediately before
     # this instruction wherever it is scheduled.  Used for non-barrier labels
     # such as .Lpcrel_hi* that must stay anchored to the instruction they
@@ -492,6 +491,16 @@ class Instruction:
         if self.operands:
             return f"{self.mnemonic} {', '.join(self.operands)}"
         return self.mnemonic
+
+# ---------------------------------------------------------------------------
+# Enable wide dual arithmetic
+# ---------------------------------------------------------------------------
+def enable_wide_dual_arith():
+    global _DUAL_ARITH_REG
+    _DUAL_ARITH_REG = frozenset(f"x{n}" for n in range(32))
+    _ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
+    _ADDI_LOW = -(_ADDI_RANGE // 2)
+    _ADDI_HIGH = (_ADDI_RANGE // 2)
 
 # ---------------------------------------------------------------------------
 # Operand decoder
@@ -799,7 +808,6 @@ def parse_line(index: int, line: str):
 
     # Pre-compute dual-arith eligibility flags.
     instr.dual_arith_ok      = _dual_arith_ok(instr)
-    instr.dual_arith_ok_wide = _dual_arith_ok_wide(instr)
     return instr
 
 # ---------------------------------------------------------------------------
@@ -812,8 +820,9 @@ _DUAL_ARITH_MN = frozenset({
     "sub",  "subw",
     "and",  "bic",  "andn",
     "or",   "xor",
-    "slli", "srli",              # shift-immediate (moved from dual_arith2)
+    # "slli", "srli",
 })
+
 # R-type instructions whose rs1/rs2 can be swapped without changing the result.
 _COMMUTATIVE_BINOP = frozenset({
     "add",  "addw",
@@ -822,67 +831,62 @@ _COMMUTATIVE_BINOP = frozenset({
     "min",  "minu", "max",  "maxu",
     "xnor",
 })
-_REG4      = frozenset(f"x{n}" for n in range(16))
+_DUAL_ARITH_REG = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
 _IMM_FORMS = frozenset({"addi", "addiw", "andi", "slli", "srli"})
 
-def _dual_arith_ok(instr: "Instruction") -> bool:
+_ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
+_ADDI_LOW = -(_ADDI_RANGE // 2)
+_ADDI_HIGH = (_ADDI_RANGE // 2)
+
+def _is_rsd_compatible(instr: "Instruction") -> bool:
+    if not instr.uses or not instr.defs:
+        # Zero-input and zero-output instructions aren't _in_compatible.
+        # Assume they're filtered elsewhere.
+        return True
+    if instr.mnemonic in _COMMUTATIVE_BINOP:
+        return instr.defs[0] in instr.uses
+    return instr.defs[0] == instr.uses[0]
+
+
+def _dual_arith_immediate_ok(instr: "Instruction") -> bool:
+    mn  = instr.mnemonic
+    if mn not in _IMM_FORMS:
+        # No immediate, no problem
+        return True
+    imm = instr.imm
+    if mn == "addi":
+        if instr.uses and instr.uses[0] == "x2":
+            return imm in range(_ADDI_LOW * 4, _ADDI_HIGH * 4, 4)
+        return imm in range(_ADDI_LOW, _ADDI_HIGH)
+    if mn in ("slli", "srli", "srai"):
+        return imm in range(1, 33)
+    return imm in range(-16,15)
+
+
+def _dual_arith_impl(instr: "Instruction", chain_in: bool = False, chain_out: bool = False) -> bool:
     mn  = instr.mnemonic
     if mn not in _DUAL_ARITH_MN:
         return False
-    rd  = instr.defs[0] if instr.defs else None
-    rs1 = instr.uses[0] if instr.uses else None
-    if rd is None or rs1 is None:
+    if not (chain_in | chain_out) and not _is_rsd_compatible(instr):
         return False
-    if mn == "addi" and rs1 == "x2" and rd != "x2":
-        if rd not in _REG4:
-            return False
-        imm = instr.imm
-        if imm is None or imm <= 0 or imm % 4 != 0 or imm > 124:
-            return False
-        return True
-    if rd != rs1 or rd not in _REG4:
+    if not chain_out and not all(rd in _DUAL_ARITH_REG for rd in instr.defs):
         return False
-    if len(instr.uses) >= 2 and instr.uses[1] not in _REG4:
+    # TODO: It's more complicated than this, because only one input can
+    # be forwarded from rd and given a free pass, and the specific input
+    # depends on the commutativity of the operation.
+    if not chain_in and not all(rs in _DUAL_ARITH_REG for rs in instr.uses):
         return False
+    # TODO: see if `imm is not None` works better here
     if mn in _IMM_FORMS:
-        imm = instr.imm
-        if imm is None:
-            return False
-        if mn in ("slli", "srli"):
-            if imm < 1 or imm > 31:
-                return False
-        else:
-            limit = 31 if mn in ("addi", "addiw") else 15
-            if imm < -(limit + 1) or imm > limit:
-                return False
+        return _dual_arith_immediate_ok(instr)
     return True
 
+def _dual_arith_ok(instr: "Instruction") -> bool:
+    return _dual_arith_impl(instr, chain_in=False, chain_out=False)
 
-def _dual_arith_ok_wide(instr: "Instruction") -> bool:
-    """Like _dual_arith_ok but accepts any of x0..x31 (no _REG4 constraint)."""
-    mn = instr.mnemonic
-    if mn not in _DUAL_ARITH_MN:
-        return False
-    rd  = instr.defs[0] if instr.defs else None
-    rs1 = instr.uses[0] if instr.uses else None
-    if rd is None or rs1 is None:
-        return False
-    if mn == "addi" and rs1 == "x2" and rd != "x2":
-        imm = instr.imm
-        return imm is not None and imm > 0 and imm % 4 == 0 and imm <= 124
-    if rd != rs1:
-        return False
-    if mn in _IMM_FORMS:
-        imm = instr.imm
-        if imm is None:
-            return False
-        if mn in ("slli", "srli"):
-            if imm < 1 or imm > 31:
-                return False
-        else:
-            limit = 31 if mn in ("addi", "addiw") else 15
-            if imm < -(limit + 1) or imm > limit:
-                return False
-    return True
+def _chain_arith_a(instr: "Instruction") -> bool:
+    return _dual_arith_impl(instr, chain_in=False, chain_out=True)
 
+def _chain_arith_b(instr: "Instruction") -> bool:
+    return _dual_arith_impl(instr, chain_in=True, chain_out=False)

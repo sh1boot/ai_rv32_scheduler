@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from rv32_core import (
-    Instruction, parse_line,
+    Instruction, enable_wide_dual_arith, parse_line,
     _INT_ABI, _FP_ABI, _SENTINEL_MN,
 )
 from rv32_analysis import (
@@ -811,7 +811,6 @@ def _split_into_functions(source: str) -> "list[str]":
 def _process_function_chunk(
     chunk: str,
     rename: bool,
-    wide_dual_arith: bool,
     verbose: bool,
     same_base_reorder: bool,
     chain_reorder: bool,
@@ -823,7 +822,7 @@ def _process_function_chunk(
     ``ProcessPoolExecutor``.  Each call constructs its own scorer with
     independent mutable state.
     """
-    pair_score = make_compact32_scorer({}, wide_dual_arith=wide_dual_arith)
+    pair_score = make_compact32_scorer({})
     sched = AssemblyScheduler(chunk)
     buf = io.StringIO()
     stats = sched.process(
@@ -1271,6 +1270,9 @@ def main():
                          "Default: 1 (sequential).")
     args = ap.parse_args()
 
+    if args.wide_dual_arith:
+        enable_wide_dual_arith()
+
     if args.list_rules:
         print("Scorers (--scorer NAME):")
         for name, (_, desc) in SCORERS.items():
@@ -1324,7 +1326,6 @@ def main():
                     _process_function_chunk,
                     chunks[idx],
                     rename            = args.rename,
-                    wide_dual_arith   = args.wide_dual_arith,
                     verbose           = args.verbose,
                     same_base_reorder = args.same_base_reorder,
                     chain_reorder     = args.chain_reorder,
@@ -1346,11 +1347,7 @@ def main():
     else:
         # Sequential path: single scorer, stream directly to stdout.
         factory, _ = SCORERS[args.scorer]
-        if args.scorer == "compact32":
-            pair_score = make_compact32_scorer(
-                {}, wide_dual_arith=args.wide_dual_arith)
-        else:
-            pair_score = factory()
+        pair_score = factory()
 
         sched = AssemblyScheduler(source)
         sched.process(

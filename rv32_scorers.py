@@ -30,12 +30,13 @@ The scorer, ``--list-rules`` output, PAIR+ annotations, and stats all pick
 it up automatically.
 """
 
+import sys
 from typing import Callable
 
 from rv32_core import (
     Instruction,
-    _DUAL_ARITH_MN, _REG4, _IMM_FORMS, _COMMUTATIVE_BINOP,
-    _dual_arith_ok, _dual_arith_ok_wide,
+    _DUAL_ARITH_MN, _DUAL_ARITH_REG, _IMM_FORMS, _COMMUTATIVE_BINOP,
+    _dual_arith_immediate_ok, _dual_arith_ok, _chain_arith_a, _chain_arith_b,
 )
 
 # ---------------------------------------------------------------------------
@@ -525,7 +526,7 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
         return rd in liveness.get(b.index, frozenset())
 
     # Path 2: _is_li + any comparison branch (rd used as comparison operand)
-    if _is_li(a):
+    if _is_li(a):  # TODO: look at available range here
         if b.mnemonic not in _BRANCH_CMP:
             return False
         if rd not in b.uses:
@@ -580,8 +581,6 @@ def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
     if rd not in liveness.get(b.index, frozenset()):
         return False
     return True
-
-
 
 
 # Map each load/store mnemonic to the number of bytes it accesses.
@@ -685,7 +684,7 @@ def _is_mv(instr: "Instruction") -> bool:
     return False
 
 
-def _is_li(instr: "Instruction") -> bool:
+def _is_li(instr: "Instruction", values = range(-16, 16)) -> bool:
     """True if *instr* is a load-immediate within the compact encoding range.
 
     The GAS pseudo ``li rd, imm`` canonicalises to ``addi rd, x0, imm`` with
@@ -693,7 +692,7 @@ def _is_li(instr: "Instruction") -> bool:
     Immediate is restricted to −16..+15 to fit the compact encoding field.
     """
     return (instr.mnemonic == "addi" and not instr.uses
-            and instr.imm is not None and -16 <= instr.imm <= 15)
+            and instr.imm is not None and instr.imm in values)
 
 
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
@@ -931,26 +930,19 @@ def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
     if not _is_load_producer(a):
         return False
     rd_a = a.defs[0]
-    if rd_a not in _REG4:
+    if rd_a not in _DUAL_ARITH_REG:
         return False
     if b.mnemonic not in _DUAL_ARITH_MN:
         return False
     if not _is_chained(rd_a, b, liveness):
         return False
     rd_b = b.defs[0] if b.defs else None
-    if rd_b is None or rd_b not in _REG4:
+    if rd_b is None or rd_b not in _DUAL_ARITH_REG:
         return False
-    if any(u not in _REG4 for u in b.uses):
+    if any(u not in _DUAL_ARITH_REG for u in b.uses):
         return False
-    if b.mnemonic in _IMM_FORMS:
-        imm = b.imm
-        if imm is None:
-            return False
-        if b.mnemonic in ("slli", "srli"):
-            if imm < 1 or imm > 31:
-                return False
-        elif imm < -16 or imm > 15:
-            return False
+    if not _dual_arith_immediate_ok(b):
+        return False
     return True
 
 
@@ -981,7 +973,7 @@ def _is_arith_mem_a(instr: "Instruction") -> bool:
     if mn not in _ARITH_MEM_MN:
         return False
     rd = instr.defs[0] if instr.defs else None
-    if rd is None or rd not in _REG4:
+    if rd is None or rd not in _DUAL_ARITH_REG:
         return False
     if not instr.uses or instr.uses[0] != rd:   # rsd constraint
         return False
@@ -991,7 +983,7 @@ def _is_arith_mem_a(instr: "Instruction") -> bool:
     else:
         # add, sub, and, or: rs2 must also be in x0..x15
         rs2 = instr.uses[1] if len(instr.uses) > 1 else None
-        return rs2 is not None and rs2 in _REG4
+        return rs2 is not None and rs2 in _DUAL_ARITH_REG
 
 
 def _mem_small_offset_ok(instr: "Instruction") -> bool:
@@ -1039,37 +1031,17 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     source, then discarded (dead after B).
 
     Matches:
-        <dual-arith op>  rd_a, rd_a, rs2_a   (A in RSD form; rd_a in x0..x15)
+        <dual-arith op>  rd_a, rs1_a, rs2_a
         <dual-arith op>  rd_b, rd_a, rs2_b   (B uses A's result; rd_a dead after B)
 
     rd_a must be dead after B — it is the intermediate, used only to pass
-    A's result to B.  rd_b must be in x0..x15.
+    A's result to B.
 
     For commutative B ops (add, and, or, xor) rd_a may appear as either
     rs1 or rs2.
     """
-    if not a.dual_arith_ok:
-        return False
-    rd_a = a.defs[0]
-    if b.mnemonic not in _DUAL_ARITH_MN:
-        return False
-    if not _is_chained(rd_a, b, liveness):
-        return False
-    rd_b = b.defs[0] if b.defs else None
-    if rd_b is None or rd_b not in _REG4:
-        return False
-    if any(u not in _REG4 for u in b.uses):
-        return False
-    if b.mnemonic in _IMM_FORMS:
-        imm = b.imm
-        if imm is None:
-            return False
-        if b.mnemonic in ("slli", "srli"):
-            if imm < 1 or imm > 31:
-                return False
-        elif imm < -16 or imm > 15:
-            return False
-    return True
+    rd_a = a.defs[0] if a.defs else None
+    return _chain_arith_a(a) and _chain_arith_b(b) and _is_chained(rd_a, b, liveness)
 
 
 def _is_small_jump(b: "Instruction") -> bool:
@@ -1137,7 +1109,8 @@ def _rule_arith_branch(a: "Instruction", b: "Instruction",
                        liveness: dict) -> bool:
     """
     Arithmetic operation (dual-arith subset) followed by a conditional
-    branch on whether the result is zero.
+    branch on whether the result is zero.  In this instance rsd is
+    re-used, but not discarded after the branch.
 
     Matches:
         <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
@@ -1180,7 +1153,7 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
     """
     if not a.dual_arith_ok or a.mnemonic != "addi":
         return False
-    rsd = a.defs[0]
+    rsd = a.defs[0] if a.defs else None
     if b.mnemonic not in ("beq", "bne"):
         return False
     # rsd must appear as either operand of the branch (commutativity).
@@ -1240,6 +1213,7 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
         minu / maxu     — minimum and maximum (unsigned)
         and / andn      — AND and AND-NOT of the same operands
         mv / mv         — two independent register copies (any sources)
+        mv / li         - one register copy, one constant load
         li / li         — two independent small constant loads
     """
     if not a.defs or not b.defs or a.defs[0] == b.defs[0]:
@@ -1495,8 +1469,7 @@ TALLY_RULES: list = [
 # ---------------------------------------------------------------------------
 
 def make_compact32_scorer(liveness: dict,
-                          tally_rules: "list[str]" = [],
-                          wide_dual_arith: bool = False) -> "PairScoreFn":
+                          tally_rules: "list[str]" = []) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
@@ -1507,10 +1480,6 @@ def make_compact32_scorer(liveness: dict,
         Ordered list of tally rule names to activate (see TALLY_RULES).
         Each name corresponds to a rule that is tried only after all primary
         rules have failed.  Order matches --tally= list order.
-
-    wide_dual_arith
-        When True, relax the register constraint for the dual-arith rule family
-        from x0..x15 to all 32 integer registers.  Enabled by --wide-dual-arith.
     """
     cell: list = [liveness]
 
@@ -1521,61 +1490,7 @@ def make_compact32_scorer(liveness: dict,
         if name in _tally_by_name
     ]
 
-    # Select the dual-arith eligibility check according to the register-range flag.
-    _da_ok = _dual_arith_ok_wide if wide_dual_arith else _dual_arith_ok
-
-    # When wide_dual_arith is set, build local rule functions that use the
-    # widened eligibility check and drop the _REG4 register constraints.
-    if wide_dual_arith:
-        def _rule_dual_arith_w(a, b, liveness):
-            return _da_ok(a) and _da_ok(b)
-
-        def _rule_dual_arith_chain_w(a, b, liveness):
-            if not _da_ok(a):
-                return False
-            rd_a = a.defs[0]
-            if b.mnemonic not in _DUAL_ARITH_MN:
-                return False
-            if not _is_chained(rd_a, b, liveness):
-                return False
-            rd_b = b.defs[0] if b.defs else None
-            if rd_b is None:
-                return False
-            if b.mnemonic in _IMM_FORMS:
-                imm = b.imm
-                if imm is None or imm < -16 or imm > 15:
-                    return False
-            return True
-
-        def _rule_arith_jump_w(a, b, liveness):
-            return _da_ok(a) and _is_small_jump(b)
-
-        def _rule_arith_branch_w(a, b, liveness):
-            if not _da_ok(a):
-                return False
-            rd = a.defs[0] if a.defs else None
-            if rd is None or b.mnemonic not in ("beqz", "bnez"):
-                return False
-            return (b.uses[0] if b.uses else None) == rd
-
-        def _rule_addi_branch_w(a, b, liveness):
-            if not _da_ok(a) or a.mnemonic != "addi":
-                return False
-            rsd = a.defs[0]
-            if b.mnemonic not in ("beq", "bne"):
-                return False
-            return rsd in b.uses
-
-        _wide_overrides = {
-            "dual_arith":       _rule_dual_arith_w,
-            "dual_arith_chain": _rule_dual_arith_chain_w,
-            "arith_jump":       _rule_arith_jump_w,
-            "arith_branch":     _rule_arith_branch_w,
-            "addi_branch":      _rule_addi_branch_w,
-        }
-        rules = [(name, _wide_overrides.get(name, fn)) for name, fn in COMPACT32_RULES]
-    else:
-        rules = list(COMPACT32_RULES)
+    rules = list(COMPACT32_RULES)
 
     def _a_eligible(a: "Instruction") -> "frozenset[str]":
         eligible = set()
@@ -1620,9 +1535,10 @@ def make_compact32_scorer(liveness: dict,
             eligible.add("op_pair_chain")
         if _is_mv(a) or (_is_load(a) and _mem_small_offset_ok(a)):
             eligible.add("mv_load_jump")
-        if _da_ok(a):
-            eligible.add("dual_arith")
+        if _chain_arith_a(a):
             eligible.add("dual_arith_chain")
+        if _dual_arith_ok(a):
+            eligible.add("dual_arith")
             eligible.add("arith_jump")
             eligible.add("arith_branch")
             if a.mnemonic == "addi":
