@@ -497,6 +497,81 @@ class Instruction:
         """Source registers that carry data — uses excluding x0."""
         return [r for r in self.uses if r != "x0"]
 
+    @property
+    def is_sized_load(self):
+        return self.mnemonic in _LOAD_MN
+
+    @property
+    def is_sized_store(self):
+        return self.mnemonic in _STORE_MN
+
+    @property
+    def is_mem_op(self):
+        return self.mnemonic in _MEM_OPS
+
+    @property
+    def is_addr_update(self):
+        return self.mnemonic in _ADDR_UPDATE_MN
+
+    @property
+    def is_addr_compute(self):
+        return self.mnemonic in _ADDR_COMPUTE_MN
+
+    @property
+    def is_cmp(self):
+        return self.mnemonic in _CMP_MNEMONICS
+
+    @property
+    def is_mv(self):
+        if self.mnemonic == "addi" and len(self.real_uses) == 1 and self.imm == 0:
+            return True
+        if self.mnemonic == "add" and len(self.real_uses) == 1:
+            return True
+        return False
+
+    def is_li(self, values=range(-16, 16)):
+        return (self.mnemonic == "addi" and not self.real_uses
+                and self.imm is not None and self.imm in values)
+
+    @property
+    def is_load_producer(self):
+        return self.mnemonic in _LOAD_PRODUCER_MN and bool(self.defs)
+
+    @property
+    def is_arith_mem_a(self):
+        mn = self.mnemonic
+        if mn not in _ARITH_MEM_MN:
+            return False
+        rd = self.defs[0] if self.defs else None
+        if rd is None or rd not in _DUAL_ARITH_REG:
+            return False
+        if not self.uses or self.uses[0] != rd:
+            return False
+        if mn == "addi":
+            imm = self.imm
+            return imm is not None and -64 <= imm <= 63
+        rs2 = self.uses[1] if len(self.uses) > 1 else None
+        return rs2 is not None and rs2 in _DUAL_ARITH_REG
+
+    @property
+    def is_small_jump(self):
+        if self.mnemonic == "jal":
+            return not self.defs
+        if self.mnemonic == "jalr":
+            return self.imm is None or self.imm == 0
+        return False
+
+    @property
+    def is_return(self):
+        if self.mnemonic == "ret":
+            return True
+        if self.mnemonic == "jalr":
+            if self.mem is not None and self.mem[1] == "x1":
+                return True
+            if "x1" in self.uses and (not self.defs or self.defs[0] == "x0"):
+                return True
+        return False
+
 # ---------------------------------------------------------------------------
 # Enable wide dual arithmetic
 # ---------------------------------------------------------------------------
@@ -876,6 +951,40 @@ _COMMUTATIVE_BINOP = frozenset({
 _DUAL_ARITH_REG = frozenset(f"x{n}" for n in range(16))
 _CHAIN_REG = "x31"
 _IMM_FORMS = frozenset({"addi", "addiw", "andi", "slli", "srli"})
+
+# ---------------------------------------------------------------------------
+# Mnemonic sets used by Instruction predicate methods
+# ---------------------------------------------------------------------------
+
+_MEM_WIDTH: dict = {
+    "lb":  1, "lbu": 1, "sb":  1,
+    "lh":  2, "lhu": 2, "sh":  2,
+    "lw":  4, "lwu": 4, "sw":  4,
+    "ld":  8,            "sd":  8,
+    "flw": 4, "fsw": 4,
+    "fld": 8, "fsd": 8,
+}
+_LOAD_MN  = frozenset(mn for mn in _MEM_WIDTH
+                       if mn.startswith(("l", "f")) and not mn.startswith("fs"))
+_STORE_MN = frozenset(mn for mn in _MEM_WIDTH
+                       if mn.startswith(("s", "fs")))
+_MEM_OPS  = frozenset(_MEM_WIDTH)
+
+_CMP_MNEMONICS = frozenset({
+    "slti", "sltiu", "slt", "sltu",
+    "seqz", "snez", "sltz", "sgtz",
+})
+_ADDR_UPDATE_MN = frozenset({"add", "addi", "sub", "sh1add", "sh2add", "sh3add"})
+_ADDR_COMPUTE_MN = frozenset({
+    "add",  "addi",  "addw",  "addiw",
+    "sub",  "subw",
+    "add.uw", "slli.uw",
+    "sh1add", "sh1add.uw",
+    "sh2add", "sh2add.uw",
+    "sh3add", "sh3add.uw",
+})
+_LOAD_PRODUCER_MN = frozenset({"lw", "ld"})
+_ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
 
 _ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
 _ADDI_LOW = -(_ADDI_RANGE // 2)

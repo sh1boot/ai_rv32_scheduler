@@ -136,7 +136,7 @@ def _mem_independent(a: "Instruction", b: "Instruction",
 
     If any condition cannot be verified the function returns False (conservative).
     """
-    from rv32_scorers import _MEM_WIDTH  # local import to avoid circular dep
+    from rv32_core import _MEM_WIDTH
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem

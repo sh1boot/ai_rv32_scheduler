@@ -30,6 +30,7 @@ from typing import Callable
 from rv32_core import (
     Instruction, enable_wide_dual_arith, parse_line,
     _INT_ABI, _FP_ABI, _SENTINEL_MN,
+    _MEM_WIDTH, _MEM_OPS,
 )
 from rv32_analysis import (
     DepGraph, build_dep_graph, compute_liveness,
@@ -38,7 +39,7 @@ from rv32_analysis import (
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score,
     COMPACT32_RULES, TALLY_RULES, SCORERS,
-    make_compact32_scorer, _MEM_WIDTH, _MEM_OPS,
+    make_compact32_scorer,
 )
 from rv32_rename import (
     _ALL_INT_REGS, _ALL_FP_REGS, _TEMPORARIES, _RESERVED,
