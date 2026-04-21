@@ -510,6 +510,11 @@ class Instruction:
         return self.mnemonic in _MEM_OPS
 
     @property
+    def mem_width(self):
+        """Byte width of the memory access, or 0 for non-memory instructions."""
+        return _MEM_WIDTH.get(self.mnemonic, 0)
+
+    @property
     def is_addr_update(self):
         return self.mnemonic in _ADDR_UPDATE_MN
 

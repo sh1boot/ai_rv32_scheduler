@@ -30,7 +30,7 @@ from typing import Callable
 from rv32_core import (
     Instruction, enable_wide_dual_arith, parse_line,
     _INT_ABI, _FP_ABI, _SENTINEL_MN,
-    _MEM_WIDTH, _MEM_OPS,
+    _MEM_OPS,
 )
 from rv32_analysis import (
     DepGraph, build_dep_graph, compute_liveness,
@@ -279,7 +279,7 @@ _TALLY_CONTROL_MN: frozenset = frozenset({
     "c.beqz","c.bnez","c.j","c.jal","c.jalr","c.jr",
 })
 
-# Memory: loads and stores (derived from the scorer's _MEM_OPS set).
+# Memory: loads and stores — same set as Instruction.is_mem_op.
 _TALLY_MEM_MN: frozenset = _MEM_OPS
 
 # Upper-immediate instructions are always "big" (20-bit immediate).
@@ -310,7 +310,7 @@ def _imm_is_big(instr: "Instruction") -> bool:
         off = instr.mem[0]
         if off is None:
             return False
-        scale = _MEM_WIDTH.get(mn, 1)
+        scale = instr.mem_width or 1
         return not (off % scale == 0 and -16 * scale <= off <= 15 * scale)
     imm = instr.imm
     if imm is None:

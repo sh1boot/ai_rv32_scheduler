@@ -34,7 +34,7 @@ import sys
 from typing import Callable
 
 from rv32_core import (
-    Instruction, _MEM_WIDTH,
+    Instruction,
     _DUAL_ARITH_MN, _DUAL_ARITH_REG, _IMM_FORMS, _COMMUTATIVE_BINOP,
     _dual_arith_immediate_ok, _dual_arith_ok, _chain_arith_a, _chain_arith_b,
 )
@@ -567,7 +567,7 @@ def _addr_stride_ok(arith: "Instruction", mem: "Instruction") -> bool:
     """
     if arith.mnemonic not in _IMM_ARITH:
         return True
-    width = _MEM_WIDTH.get(mem.mnemonic, 0)
+    width = mem.mem_width
     imm = arith.imm
     return width != 0 and imm is not None and abs(imm) % width == 0
 
@@ -584,7 +584,7 @@ def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
     """
     if not a.is_sized_load or a.mnemonic != b.mnemonic:
         return False
-    width = _MEM_WIDTH.get(a.mnemonic)
+    width = a.mem_width
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
@@ -608,7 +608,7 @@ def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
     """
     if not a.is_sized_store or a.mnemonic != b.mnemonic:
         return False
-    width = _MEM_WIDTH.get(a.mnemonic)
+    width = a.mem_width
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
@@ -727,7 +727,7 @@ def _rule_load_mem_chain(a: "Instruction", b: "Instruction",
     off_b, base_b = b.mem
     if base_b != rd_a:
         return False
-    width_b = _MEM_WIDTH.get(b.mnemonic, 0)
+    width_b = b.mem_width
     if width_b == 0 or off_b is None:
         return False
     if off_b < 0 or off_b % width_b != 0 or off_b // width_b > 3:
@@ -835,7 +835,7 @@ def _mem_small_offset_ok(instr: "Instruction") -> bool:
     off, _base = mem
     if off is None or off < 0:
         return False
-    width = _MEM_WIDTH.get(instr.mnemonic, 0)
+    width = instr.mem_width
     return width != 0 and off % width == 0 and off <= 3 * width
 
 
@@ -906,7 +906,7 @@ def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
     if a.is_sized_load and a.mem is not None:
         off, _base = a.mem
         if off is not None and off >= 0:
-            width = _MEM_WIDTH.get(a.mnemonic, 0)
+            width = a.mem_width
             if width != 0 and off % width == 0 and off <= 3 * width:
                 return b.is_small_jump
     return False

@@ -136,7 +136,6 @@ def _mem_independent(a: "Instruction", b: "Instruction",
 
     If any condition cannot be verified the function returns False (conservative).
     """
-    from rv32_core import _MEM_WIDTH
     if a.mem is None or b.mem is None:
         return False
     off_a, base_a = a.mem
@@ -148,8 +147,8 @@ def _mem_independent(a: "Instruction", b: "Instruction",
     if writer_idx > a.index:   # written after a, before (or at) b
         return False
     # Both access widths must be known.
-    w_a = _MEM_WIDTH.get(a.mnemonic)
-    w_b = _MEM_WIDTH.get(b.mnemonic)
+    w_a = a.mem_width or None
+    w_b = b.mem_width or None
     if w_a is None or w_b is None:
         return False
     # Non-overlap: [off_a, off_a+w_a) and [off_b, off_b+w_b) must not intersect.
