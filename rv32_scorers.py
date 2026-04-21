@@ -183,8 +183,6 @@ def can_compress(instr: "Instruction") -> bool:
         # Note: c.sdsp/c.swsp accept any rs2 including x0.
         mem  = instr.mem
         off, base = mem if mem else (None, None)
-        # x0 is filtered from uses; if all remaining uses equal the base,
-        # the stored value was x0.
         rs2 = next((r for r in uses if r != base), "x0")
         align = 8 if mn in ("sd", "fsd") else 4
         if base == "x2":
@@ -247,14 +245,13 @@ def can_compress(instr: "Instruction") -> bool:
 
     if mn == "add":
         # c.add rd, rs2: RSD form (rd == rs1), rd != x0.
-        # c.mv  rd, rs:  rs1 == x0 (filtered to single use), rd != x0.
+        # c.mv  rd, rs:  rs1 == x0, rd != x0.
         rd  = defs[0] if defs else None
         if rd is None or rd == "x0":
             return False
         rs1 = uses[0] if len(uses) > 0 else None
         rs2 = uses[1] if len(uses) > 1 else None
-        if rs2 is None:
-            # x0 was filtered — this is the c.mv form.
+        if rs1 == "x0":
             return True
         # c.add: RSD form only.
         return rd == rs1
@@ -265,16 +262,16 @@ def can_compress(instr: "Instruction") -> bool:
         imm = instr.imm
         if rd is None:
             return False
-        # c.li: addi rd, x0, imm (x0 filtered → no uses).
-        if not uses:
+        # c.li: addi rd, x0, imm.
+        if rs1 == "x0":
             return rd != "x0" and imm is not None and -32 <= imm <= 31
         # c.addi16sp: addi x2, x2, imm (RSD on sp).
         if rd == "x2" and rs1 == "x2":
             return (imm is not None and imm != 0
                     and imm % 16 == 0 and -512 <= imm <= 496)
-        # c.mv: addi rd, rs, 0 (GAS mv pseudo; x0 already filtered so rs != x0).
+        # c.mv: addi rd, rs, 0 (GAS mv pseudo).
         # Assembler emits c.mv rd, rs for this form.  No register-range limit.
-        if imm == 0 and rd != "x0":
+        if imm == 0 and rd != "x0" and rs1 != "x0":
             return True
         # c.addi4spn rd', x2, imm: sp-relative, rd in CL, imm positive mult of 4.
         if rs1 == "x2" and rd in _CL_INT_REGS:
