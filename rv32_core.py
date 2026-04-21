@@ -498,6 +498,15 @@ class Instruction:
         return [r for r in self.uses if r != "x0"]
 
     @property
+    def is_rsd(self):
+        if not self.uses or not self.defs:
+            # Not for consideration
+            return False
+        if self.mnemonic in _COMMUTATIVE_BINOP:
+            return self.defs[0] in self.uses
+        return self.defs[0] == self.uses[0]
+
+    @property
     def is_sized_load(self):
         return self.mnemonic in _LOAD_MN
 
@@ -543,22 +552,6 @@ class Instruction:
         return self.mnemonic in _LOAD_PRODUCER_MN and bool(self.defs)
 
     @property
-    def is_arith_mem_a(self):
-        mn = self.mnemonic
-        if mn not in _ARITH_MEM_MN:
-            return False
-        rd = self.defs[0] if self.defs else None
-        if rd is None or rd not in _DUAL_ARITH_REG:
-            return False
-        if not self.uses or self.uses[0] != rd:
-            return False
-        if mn == "addi":
-            imm = self.imm
-            return imm is not None and -64 <= imm <= 63
-        rs2 = self.uses[1] if len(self.uses) > 1 else None
-        return rs2 is not None and rs2 in _DUAL_ARITH_REG
-
-    @property
     def is_small_jump(self):
         if self.mnemonic == "jal":
             return not self.defs
@@ -583,9 +576,9 @@ class Instruction:
 def enable_wide_dual_arith():
     global _DUAL_ARITH_REG
     _DUAL_ARITH_REG = frozenset(f"x{n}" for n in range(32))
-    _ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
-    _ADDI_LOW = -(_ADDI_RANGE // 2)
-    _ADDI_HIGH = (_ADDI_RANGE // 2)
+    _DUAL_ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
+    _DUAL_ADDI_LOW = -(_DUAL_ADDI_RANGE // 2)
+    _DUAL_ADDI_HIGH = (_DUAL_ADDI_RANGE // 2)
 
 # ---------------------------------------------------------------------------
 # Operand decoder
@@ -989,42 +982,40 @@ _ADDR_COMPUTE_MN = frozenset({
     "sh3add", "sh3add.uw",
 })
 _LOAD_PRODUCER_MN = frozenset({"lw", "ld"})
-_ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
 
-_ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
-_ADDI_LOW = -(_ADDI_RANGE // 2)
-_ADDI_HIGH = (_ADDI_RANGE // 2)
+# _DUAL_ARITH_MN isn't fully populated, and the intent there is that the
+# unused codes are duplicates of `addi` and `li` with extra range on the
+# immediates.  This effective range is calculated here (and in
+# enable_wide_dual_arith), so that adding and removing opcodes will
+# reflect the impact on the immediate to show whether it's worth it (for
+# example, it's been worth giving up the shift operations, which mostly
+# fit in op_pair rules).
 
-def _is_rsd_compatible(instr: "Instruction") -> bool:
-    if not instr.uses or not instr.defs:
-        # Zero-input and zero-output instructions aren't _in_compatible.
-        # Assume they're filtered elsewhere.
-        return True
-    if instr.mnemonic in _COMMUTATIVE_BINOP:
-        return instr.defs[0] in instr.uses
-    return instr.defs[0] == instr.uses[0]
-
+_DUAL_ADDI_RANGE = (((1 << len(_DUAL_ARITH_MN).bit_length()) - (len(_DUAL_ARITH_MN) - 1)) << len(_DUAL_ARITH_REG).bit_length()) // 2
+_DUAL_ADDI_LOW = -(_DUAL_ADDI_RANGE // 2)
+_DUAL_ADDI_HIGH = (_DUAL_ADDI_RANGE // 2)
 
 def _dual_arith_immediate_ok(instr: "Instruction") -> bool:
+    imm = instr.imm
     mn  = instr.mnemonic
-    if mn not in _IMM_FORMS:
+    if imm is None:
         # No immediate, no problem
         return True
-    imm = instr.imm
     if mn == "addi":
         if instr.uses and instr.uses[0] == "x2":
-            return imm in range(_ADDI_LOW * 4, _ADDI_HIGH * 4, 4)
-        return imm in range(_ADDI_LOW, _ADDI_HIGH)
+            return imm in range(_DUAL_ADDI_LOW * 4, _DUAL_ADDI_HIGH * 4, 4)
+        return imm in range(_DUAL_ADDI_LOW, _DUAL_ADDI_HIGH)
+    # TODO: oops, hard-coded 5-bit forms, it'll do for now.
     if mn in ("slli", "srli", "srai"):
         return imm in range(1, 33)
-    return imm in range(-16,15)
+    return imm in range(-16, 16)
 
 
 def _dual_arith_impl(instr: "Instruction", chain_in: bool = False, chain_out: bool = False) -> bool:
     mn  = instr.mnemonic
     if mn not in _DUAL_ARITH_MN:
         return False
-    if not (chain_in | chain_out) and not _is_rsd_compatible(instr):
+    if not ((chain_in | chain_out) or instr.is_rsd) and not instr.is_li(range(-65536, 65536)):
         return False
     if not chain_out and not all(rd in _DUAL_ARITH_REG for rd in instr.defs):
         return False
@@ -1034,10 +1025,7 @@ def _dual_arith_impl(instr: "Instruction", chain_in: bool = False, chain_out: bo
     if not chain_in and not all(rs == "x0" or rs in _DUAL_ARITH_REG
                                 for rs in instr.uses):
         return False
-    # TODO: see if `imm is not None` works better here
-    if mn in _IMM_FORMS:
-        return _dual_arith_immediate_ok(instr)
-    return True
+    return _dual_arith_immediate_ok(instr)
 
 def _dual_arith_ok(instr: "Instruction") -> bool:
     return _dual_arith_impl(instr, chain_in=False, chain_out=False)

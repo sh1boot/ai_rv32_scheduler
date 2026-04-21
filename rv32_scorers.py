@@ -353,6 +353,7 @@ _BRANCH_CMP  = frozenset({"beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "b
 # beq and bne are symmetric: ``beq rs1, rs2, lbl`` == ``beq rs2, rs1, lbl``.
 _COMMUTATIVE_BRANCH = frozenset({"beq", "bne"})
 
+_ARITH_MEM_MN = frozenset({"add", "sub", "and", "or", "addi"})
 
 def _is_chained(rd: str, b: "Instruction", liveness: dict) -> bool:
     """True if *b* consumes *rd* and *rd* is dead after *b*.
@@ -371,6 +372,21 @@ def _is_chained(rd: str, b: "Instruction", liveness: dict) -> bool:
     else:
         return False
     return rd in liveness.get(b.index, frozenset())
+
+def _is_arith_mem_a(instr: "Instruction") -> bool:
+    mn = instr.mnemonic
+    if mn not in _ARITH_MEM_MN:
+        return False
+    rd = instr.defs[0] if instr.defs else None
+    if rd is None or rd not in _DUAL_ARITH_REG:
+        return False
+    if not instr.uses or instr.uses[0] != rd:
+        return False
+    if mn == "addi":
+        imm = instr.imm
+        return imm is not None and -64 <= imm <= 63
+    rs2 = instr.uses[1] if len(instr.uses) > 1 else None
+    return rs2 is not None and rs2 in _DUAL_ARITH_REG
 
 _IMM_ARITH  = frozenset({"addi", "addiw"})
 _COMPACT32_BRANCH_MN = frozenset({
@@ -857,7 +873,7 @@ def _rule_arith_mem(a: "Instruction", b: "Instruction",
     The dep graph still prevents scheduling A before B when a true dependency
     exists.
     """
-    return a.is_arith_mem_a and _mem_small_offset_ok(b)
+    return _is_arith_mem_a(a) and _mem_small_offset_ok(b)
 
 
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
@@ -1252,7 +1268,7 @@ def _arith_return_a_eligible(instr: "Instruction") -> bool:
 #   a_eligible_fn  : per-instruction A-side structural check (instr) -> bool
 #   b_eligible_fn  : per-instruction B-side structural check (instr) -> bool
 TALLY_RULES: list = [
-    ("arith_mem",    _rule_arith_mem,    lambda i: i.is_arith_mem_a, _mem_small_offset_ok),
+    ("arith_mem",    _rule_arith_mem,    _is_arith_mem_a,           _mem_small_offset_ok),
     ("chain",        _rule_chain,        _chain_a_eligible,         _chain_b_eligible),
     ("rsd_live",     _rule_rsd_live,     _rsd_live_a_eligible,      _rsd_live_b_eligible),
     ("arith_return", _rule_arith_return, _arith_return_a_eligible,  lambda i: i.is_return),
