@@ -492,6 +492,11 @@ class Instruction:
             return f"{self.mnemonic} {', '.join(self.operands)}"
         return self.mnemonic
 
+    @property
+    def real_uses(self):
+        """Source registers that carry data — uses excluding x0."""
+        return [r for r in self.uses if r != "x0"]
+
 # ---------------------------------------------------------------------------
 # Enable wide dual arithmetic
 # ---------------------------------------------------------------------------
@@ -552,7 +557,6 @@ def _decode_operands(mnemonic, pat_def, pat_uses, ops):
 
     if mask_reg:
         uses.append(mask_reg)
-    uses = [r for r in uses if r != "x0"]
     return defs, uses, csr_defs, csr_uses
 
 # ---------------------------------------------------------------------------
@@ -643,6 +647,19 @@ def parse_line(index: int, line: str):
         instr.is_load   = mnemonic in _LOADS
         instr.is_store  = mnemonic in _STORES
         instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+    # c.mv rd, rs = add rd, x0, rs  — x0 is the implicit rs1.
+    # c.li rd, imm = addi rd, x0, imm  — ditto.
+    # c.nop = addi x0, x0, 0  — ditto.
+    # Their ALL_TABLES entries only declare one use slot (the visible operand),
+    # so x0 is not in uses yet.  Splice it in so the positional mapping matches
+    # the canonical base-ISA form.
+    if raw_mn in ("c.mv", "c.li", "c.nop"):
+        instr.uses = ["x0"] + instr.uses
+    # c.jal target  = jal x1, target    — x1 implicitly defined (link register).
+    # c.jalr rs     = jalr x1, 0(rs)    — ditto.
+    # Their ALL_TABLES entries have pat_def=None so x1 is not in defs yet.
+    if raw_mn in ("c.jal", "c.jalr"):
+        instr.defs = ["x1"]
 
     # Step 2 — GAS pseudo-instructions that are strict aliases for a base-ISA
     # instruction.  Operands were decoded correctly from the pseudo's ALL_TABLES
@@ -678,9 +695,13 @@ def parse_line(index: int, line: str):
         instr.mnemonic = mnemonic
         instr.is_branch = mnemonic in _BRANCH_MNEMONICS
     # For ``neg``/``negw``: splice in the implicit zero (rs1=x0) so that
-    # operands match the canonical 3-operand sub/subw form.
+    # operands and uses match the canonical 3-operand sub/subw form.
     if raw_mn in ("neg", "negw") and len(instr.operands) == 2:
         instr.operands = [instr.operands[0], "zero", instr.operands[1]]
+        instr.uses = ["x0"] + instr.uses
+    # For ``li``: the implicit rs1=x0 is not in the table (no textual token).
+    if raw_mn == "li":
+        instr.uses = ["x0"] + instr.uses
     # For ``not``: fix up imm=-1 so _dual_arith_ok and imm-range checks see it.
     if mnemonic == "xori" and instr.imm is None and raw_mn == "not":
         instr.imm = -1
@@ -727,8 +748,7 @@ def parse_line(index: int, line: str):
         ("bge",  0): "blez",   # bge zero, rs → blez rs  (rs ≤ 0)
     }
     if mnemonic in ("bne", "beq", "blt", "bge") and len(instr.uses) >= 1:
-        # uses has already had x0 filtered out by _decode_operands, so we need
-        # to inspect the raw ops to determine which position was zero.
+        # Inspect raw ops (not uses) to determine which position was zero.
         # ops[0] and ops[1] are the two source registers; ops[2] is the label.
         if len(ops) >= 3:
             r0 = _normalise_reg(ops[0])
@@ -747,13 +767,16 @@ def parse_line(index: int, line: str):
                     instr.uses      = [r1 if zero_pos == 0 else r0]
                     instr.is_branch = True   # already True, but be explicit
 
-    # Step 5 — ``seqz rd, rs`` / ``snez rd, rs`` pseudo forms.
+    # Step 5 — comparison-with-zero pseudo forms.
     #
     # No-alias disassemblers emit the real encodings:
     #   seqz rd, rs  ==  sltiu rd, rs, 1
     #   snez rd, rs  ==  sltu  rd, x0, rs
-    # Canonicalise both directions so the mnemonic is always seqz/snez,
+    #   sgtz rd, rs  ==  slt   rd, x0, rs
+    #   sltz rd, rs  ==  slt   rd, rs, x0
+    # Canonicalise so the mnemonic (and uses) always match the pseudo form,
     # ensuring they are recognised by _CMP_MNEMONICS rules.
+
     # sltiu rd, rs, 1  →  seqz rd, rs
     # instr.imm is not yet populated at this point (imm scan runs below), so
     # read the immediate directly from the raw ops list.
@@ -761,11 +784,26 @@ def parse_line(index: int, line: str):
         instr.mnemonic = "seqz"
         mnemonic       = "seqz"
 
-    # sltu rd, zero, rs  →  snez rd, rs  (3-operand form with explicit x0/zero)
-    if (mnemonic == "sltu" and instr.defs
-            and len(ops) >= 3 and _normalise_reg(ops[1]) == "x0"):
-        instr.mnemonic = "snez"
-        mnemonic       = "snez"
+    # slt/sltu rd, {zero, rs} or {rs, zero}  →  snez/sgtz/sltz
+    _ZERO_CMP: dict = {
+        ("sltu", 0): "snez",   # sltu rd, zero, rs → snez rd, rs
+        ("slt",  0): "sgtz",   # slt  rd, zero, rs → sgtz rd, rs
+        ("slt",  1): "sltz",   # slt  rd, rs, zero → sltz rd, rs
+    }
+    if mnemonic in ("slt", "sltu") and instr.defs and len(ops) >= 3:
+        rs1 = _normalise_reg(ops[1])
+        rs2 = _normalise_reg(ops[2])
+        zero_pos = None
+        if rs1 == "x0":
+            zero_pos = 0
+        elif rs2 == "x0":
+            zero_pos = 1
+        if zero_pos is not None:
+            key = (mnemonic, zero_pos)
+            if key in _ZERO_CMP:
+                mnemonic        = _ZERO_CMP[key]
+                instr.mnemonic  = mnemonic
+                instr.uses      = [rs2 if zero_pos == 0 else rs1]
 
     # Step 6 — ``zext.b rd, rs  ==  andi rd, rs, 0xff``
     #
@@ -879,7 +917,8 @@ def _dual_arith_impl(instr: "Instruction", chain_in: bool = False, chain_out: bo
     # TODO: It's more complicated than this, because only one input can
     # be forwarded from rd and given a free pass, and the specific input
     # depends on the commutativity of the operation.
-    if not chain_in and not all(rs in _DUAL_ARITH_REG for rs in instr.uses):
+    if not chain_in and not all(rs == "x0" or rs in _DUAL_ARITH_REG
+                                for rs in instr.uses):
         return False
     # TODO: see if `imm is not None` works better here
     if mn in _IMM_FORMS:
