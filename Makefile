@@ -5,6 +5,8 @@ TESTS=$(ESSENTIALS) godot.out.s core_matrix.out.s core_matrix_O2.out.s
 essentials: $(ESSENTIALS)
 
 all: $(TESTS)
+	bash ./record.sh $(TESTS)
+
 
 clean:
 	rm -f *.out.s
