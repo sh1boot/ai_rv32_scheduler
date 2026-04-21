@@ -674,12 +674,12 @@ def _is_mv(instr: "Instruction") -> bool:
 
     Covers two canonical forms:
     * ``addi rd, rs, 0`` — GAS pseudo ``mv rd, rs`` (I-type)
-    * ``add  rd, x0, rs`` — C-extension ``c.mv rd, rs`` (R-type; x0 filtered
-      away leaves exactly one use)
+    * ``add  rd, x0, rs`` — C-extension ``c.mv rd, rs`` (R-type; one real
+      source register, x0 is the other)
     """
-    if instr.mnemonic == "addi" and len(instr.uses) == 1 and instr.imm == 0:
+    if instr.mnemonic == "addi" and len(instr.real_uses) == 1 and instr.imm == 0:
         return True
-    if instr.mnemonic == "add" and len(instr.uses) == 1:
+    if instr.mnemonic == "add" and len(instr.real_uses) == 1:
         return True
     return False
 
@@ -687,11 +687,11 @@ def _is_mv(instr: "Instruction") -> bool:
 def _is_li(instr: "Instruction", values = range(-16, 16)) -> bool:
     """True if *instr* is a load-immediate within the compact encoding range.
 
-    The GAS pseudo ``li rd, imm`` canonicalises to ``addi rd, x0, imm`` with
-    x0 filtered from uses[], so this form has mnemonic="addi" and uses=[].
+    The GAS pseudo ``li rd, imm`` canonicalises to ``addi rd, x0, imm``;
+    x0 is kept in uses[] as a positional marker but real_uses is empty.
     Immediate is restricted to −16..+15 to fit the compact encoding field.
     """
-    return (instr.mnemonic == "addi" and not instr.uses
+    return (instr.mnemonic == "addi" and not instr.real_uses
             and instr.imm is not None and instr.imm in values)
 
 
@@ -939,7 +939,7 @@ def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
     rd_b = b.defs[0] if b.defs else None
     if rd_b is None or rd_b not in _DUAL_ARITH_REG:
         return False
-    if any(u not in _DUAL_ARITH_REG for u in b.uses):
+    if any(u != "x0" and u not in _DUAL_ARITH_REG for u in b.uses):
         return False
     if not _dual_arith_immediate_ok(b):
         return False
@@ -1232,7 +1232,7 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
     partners = _OP_PAIR_TABLE.get(a.mnemonic)
     if partners is None or b.mnemonic not in partners:
         return False
-    return bool(a.uses) and a.uses == b.uses
+    return bool(a.real_uses) and a.uses == b.uses
 
 
 # Chain form: A's result is consumed by B, then dead.
@@ -1284,7 +1284,7 @@ def _rule_li_branch_chain(a: "Instruction", b: "Instruction",
     (−16..15) because the fused branch-with-immediate encoding has room
     for a 10-bit signed operand.
     """
-    if a.mnemonic != "addi" or a.uses or not a.defs:
+    if a.mnemonic != "addi" or a.real_uses or not a.defs:
         return False
     imm = a.imm
     if imm is None or imm < -512 or imm > 511:
@@ -1414,8 +1414,8 @@ def _chain_a_eligible(instr: "Instruction") -> bool:
 
 
 def _chain_b_eligible(instr: "Instruction") -> bool:
-    """B-eligible for 'chain': has at least one use (potential consumer)."""
-    return bool(instr.uses)
+    """B-eligible for 'chain': has at least one real use (potential consumer)."""
+    return bool(instr.real_uses)
 
 
 def _rsd_live_a_eligible(instr: "Instruction") -> bool:
@@ -1427,8 +1427,8 @@ def _rsd_live_a_eligible(instr: "Instruction") -> bool:
 
 
 def _rsd_live_b_eligible(instr: "Instruction") -> bool:
-    """B-eligible for 'rsd_live': has at least one use (potential consumer)."""
-    return bool(instr.uses)
+    """B-eligible for 'rsd_live': has at least one real use (potential consumer)."""
+    return bool(instr.real_uses)
 
 
 def _arith_return_a_eligible(instr: "Instruction") -> bool:
@@ -1502,7 +1502,7 @@ def make_compact32_scorer(liveness: dict,
                 eligible.add("cmp_branch_chain")
         if a.defs and _is_li(a):
             eligible.add("cmp_branch_chain")
-        if (a.mnemonic == "addi" and not a.uses and a.defs
+        if (a.mnemonic == "addi" and not a.real_uses and a.defs
                 and a.imm is not None and -512 <= a.imm <= 511):
             eligible.add("li_branch_chain")
         if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):

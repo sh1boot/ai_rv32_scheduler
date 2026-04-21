@@ -168,7 +168,8 @@ def _apply_rename(scheduled: list, start: int, end: int,
         # Commutative operand normalisation: for instructions where rs1/rs2 are
         # interchangeable, ensure the "key" register is always rs1 (uses[0]).
         # Preference order: chain reg (x31) > RSD form (rd == rs1) > leave alone.
-        if instr.mnemonic in _COMMUTATIVE_BINOP and len(instr.uses) == 2:
+        if (instr.mnemonic in _COMMUTATIVE_BINOP and len(instr.uses) == 2
+                and "x0" not in instr.uses):
             rs1, rs2 = instr.uses[0], instr.uses[1]
             rd = instr.defs[0] if instr.defs else None
             if rs2 == _CHAIN_REG and rs1 != _CHAIN_REG:
