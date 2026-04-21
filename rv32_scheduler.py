@@ -466,9 +466,9 @@ def _abi_liveness_for_terminal(real_scheduled: list) -> tuple:
 
     Terminal classification
     -----------------------
-    ``ret``
-        live_out  = {x10, x11}  (return values a0/a1 must not be renamed away)
-        next_live_in = {}        (no successor in this translation unit)
+    ``ret`` / ``jr ra``  (jalr x0, 0(ra) — detected structurally)
+        live_out  = {x10, x11} ∪ callee-saved
+        next_live_in = {}
 
     ``tail``
         live_out  = {x10–x17}   (all argument regs forwarded to tail callee)
@@ -488,8 +488,13 @@ def _abi_liveness_for_terminal(real_scheduled: list) -> tuple:
     last = real_scheduled[-1]
     mn   = last.mnemonic
 
-    if mn == "ret":
-        return _ABI_RETURN_REGS, frozenset()
+    # ret / jr ra: function return — jalr with no link register (rd=x0),
+    # base register = ra (x1).  Canonicalised from "ret" to "jalr" by
+    # parse_line, so we detect it by structure rather than mnemonic.
+    # Callee-saved registers (including sp) are live-out because the caller
+    # expects them preserved across the call.
+    if mn == "jalr" and not last.defs and "x1" in last.uses:
+        return _ABI_RETURN_REGS | _ABI_CALLEE_SAVED, frozenset()
 
     if mn == "tail":
         return _ABI_ARG_REGS, frozenset()
