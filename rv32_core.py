@@ -672,11 +672,15 @@ def parse_line(index: int, line: str):
     # disassembler printing ``mv a0, a1`` and a no-alias disassembler printing
     # ``addi a0, a1, 0`` both produce the same mnemonic, uses, and imm.
     _PSEUDO_CANON = {"mv": "addi", "li": "addi", "j": "jal", "jr": "jalr",
-                     "neg": "sub", "not": "xori"}
+                     "neg": "sub", "negw": "subw", "not": "xori"}
     if mnemonic in _PSEUDO_CANON:
         mnemonic       = _PSEUDO_CANON[mnemonic]
         instr.mnemonic = mnemonic
         instr.is_branch = mnemonic in _BRANCH_MNEMONICS
+    # For ``neg``/``negw``: splice in the implicit zero (rs1=x0) so that
+    # operands match the canonical 3-operand sub/subw form.
+    if raw_mn in ("neg", "negw") and len(instr.operands) == 2:
+        instr.operands = [instr.operands[0], "zero", instr.operands[1]]
     # For ``not``: fix up imm=-1 so _dual_arith_ok and imm-range checks see it.
     if mnemonic == "xori" and instr.imm is None and raw_mn == "not":
         instr.imm = -1

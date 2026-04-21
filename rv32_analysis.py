@@ -400,7 +400,9 @@ def build_cfg_liveness(
         mn = term.mnemonic
 
         # Function exits: no successors within this translation unit.
-        if mn in ("ret", "tail"):
+        # "ret" is canonicalised to "jalr" by parse_line; handled below
+        # by the jalr-no-defs branch.
+        if mn == "tail":
             return []
 
         # Calls: return site is the fall-through block.
@@ -453,8 +455,12 @@ def build_cfg_liveness(
         if term is None:
             return frozenset()
         mn = term.mnemonic
-        if mn == "ret":
-            return _ret_regs
+        # ret / jr ra: jalr with no link (rd=x0), base = ra (x1).
+        # Canonicalised from "ret" to "jalr" by parse_line.
+        # Callee-saved regs (incl. sp) are live because the caller
+        # expects them preserved.
+        if mn == "jalr" and not term.defs and "x1" in term.uses:
+            return _ret_regs | _callee_saved
         if mn == "tail":
             return _arg_regs
         if mn in ("call",) or (mn in ("jal", "jalr") and "x1" in term.defs):
