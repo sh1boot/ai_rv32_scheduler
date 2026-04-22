@@ -16,16 +16,30 @@ make_compact32_scorer(liveness) -> PairScoreFn
 
 COMPACT32_RULES
     Ordered list of (name, rule_fn) pairs used by the compact32 scorer.
+    Each rule_fn has signature ``(a, b, liveness) -> str | None``:
+        None  - pair matches the rule (success)
+        str   - short reason token describing why the pair is rejected
     Extend this list to add new pairing rules (see "Adding a new rule" below).
+
+RULE_CATEGORIES
+    Ordered list of ``(category, a_member_fn, b_member_fn, [rule_names])``
+    tuples.  Categories group rules that share a common structural pattern
+    (chain / rsd / lspair / addrmem / dual / jumpret) so the scheduler can
+    report category-level near-miss reasons for unpaired instructions.
 
 SCORERS
     Registry dict mapping CLI name -> (factory_fn, description_str).
 
 Adding a new compact32 rule
 ---------------------------
-1. Write ``def _rule_foo(a, b, liveness) -> bool: ...``
-2. Append ``("foo", _rule_foo)`` to COMPACT32_RULES.
-3. Add the A-side gate to ``_a_eligible()`` inside ``make_compact32_scorer``.
+1. Write ``def _rule_foo(a, b, liveness) -> str | None: ...``
+   Return None when the pair matches; return a short reason token when it
+   does not.  Reason tokens are free-form but should reuse the existing
+   vocabulary (noopcode, notrsd, notchain, nodep, live, bigimm, wrongreg,
+   basediff, stride, samedest, partner, etc.) where possible.
+2. Append ``("foo", _rule_foo)`` to COMPACT32_RULES and add an entry to
+   ``_RULE_CATEGORY`` mapping the rule name to an existing category (or add
+   a new category to RULE_CATEGORIES).
 The scorer, ``--list-rules`` output, PAIR+ annotations, and stats all pick
 it up automatically.
 """
@@ -408,7 +422,7 @@ def _is_pow2_imm(imm) -> bool:
 
 
 def _rule_bit_branch_rsd(a: "Instruction", b: "Instruction",
-                         liveness: dict) -> bool:
+                         liveness: dict) -> "str | None":
     """
     Single-bit mask in RSD form + conditional branch.
 
@@ -418,22 +432,26 @@ def _rule_bit_branch_rsd(a: "Instruction", b: "Instruction",
 
     rd is overwritten with the isolated bit and then consumed by the branch.
     """
-    if not a.defs or a.mnemonic != "andi":
-        return False
+    if not a.defs:
+        return "nodef"
+    if a.mnemonic != "andi":
+        return "noopcode"
     rd = a.defs[0]
     if not _is_pow2_imm(a.imm):
-        return False
-    if not a.uses or a.uses[0] != rd:   # must be RSD form
-        return False
+        return "notmask"
+    if not a.uses or a.uses[0] != rd:
+        return "notrsd"
     if b.mnemonic not in ("beqz", "bnez"):
-        return False
+        return "notbranch"
     if rd not in b.uses:
-        return False
-    return rd in liveness.get(b.index, frozenset())
+        return "nodep"
+    if rd not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_bit_branch_chain(a: "Instruction", b: "Instruction",
-                           liveness: dict) -> bool:
+                           liveness: dict) -> "str | None":
     """
     Single-bit test into a fresh register + conditional branch (chain form).
 
@@ -449,24 +467,26 @@ def _rule_bit_branch_chain(a: "Instruction", b: "Instruction",
     the branch and is then discarded.  The source register rs is preserved.
     """
     if not a.defs:
-        return False
+        return "nodef"
     rd = a.defs[0]
-    if a.uses and a.uses[0] == rd:      # RSD form → not chain
-        return False
     if a.mnemonic == "andi":
         if not _is_pow2_imm(a.imm):
-            return False
+            return "notmask"
     elif a.mnemonic not in ("slli", "srli", "srai"):
-        return False
+        return "noopcode"
+    if a.uses and a.uses[0] == rd:
+        return "notchain"
     if b.mnemonic not in ("beqz", "bnez"):
-        return False
+        return "notbranch"
     if rd not in b.uses:
-        return False
-    return rd in liveness.get(b.index, frozenset())
+        return "nodep"
+    if rd not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
-                           liveness: dict) -> bool:
+                           liveness: dict) -> "str | None":
     """
     Compare + conditional branch where the compare result register is dead
     after the branch (chain form).
@@ -498,34 +518,36 @@ def _rule_cmp_branch_chain(a: "Instruction", b: "Instruction",
         bltu   a3, a5, .L    # a5 dead after branch
     """
     if not a.defs:
-        return False
+        return "nodef"
     rd = a.defs[0]
 
-    # Path 1: _is_cmp + beqz/bnez/beq/bne (chain form: rd != rs1)
+    # Path 1: _is_cmp + beqz/bnez (chain form: rd != rs1)
     if a.is_cmp:
-        # Chain form: rd must differ from rs1 so the source is preserved.
-        # If rd == rs1 this is cmp_branch_rsd territory instead.
         if a.uses and a.uses[0] == rd:
-            return False
+            return "notchain"
         if b.mnemonic not in _BRANCH_ZERO:
-            return False
+            return "notbranch"
         if rd not in b.uses:
-            return False
-        return rd in liveness.get(b.index, frozenset())
+            return "nodep"
+        if rd not in liveness.get(b.index, frozenset()):
+            return "live"
+        return None
 
     # Path 2: _is_li + any comparison branch (rd used as comparison operand)
-    if a.is_li():  # TODO: look at available range here
+    if a.is_li():
         if b.mnemonic not in _BRANCH_CMP:
-            return False
+            return "notbranch"
         if rd not in b.uses:
-            return False
-        return rd in liveness.get(b.index, frozenset())
+            return "nodep"
+        if rd not in liveness.get(b.index, frozenset()):
+            return "live"
+        return None
 
-    return False
+    return "noopcode"
 
 
 def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
-                         liveness: dict) -> bool:
+                         liveness: dict) -> "str | None":
     """
     Compare in RSD form (result overwrites source) + conditional branch.
 
@@ -552,23 +574,23 @@ def _rule_cmp_branch_rsd(a: "Instruction", b: "Instruction",
         beqz   t1, .loop
     """
     if not a.defs:
-        return False
+        return "nodef"
     rd = a.defs[0]
     if not a.is_cmp:
-        return False
+        return "noopcode"
     # RSD constraint: rd must equal rs1 so the compact encoding can omit
     # one register field.  No pseudo-instruction exemptions — even seqz/snez
     # expand to distinct-register forms (sltiu rd, rs, 1) where rd != rs is
     # valid assembly, so the caller must actually write seqz rd, rd to qualify.
     if not a.uses or a.uses[0] != rd:
-        return False
+        return "notrsd"
     if b.mnemonic not in _BRANCH_ZERO:
-        return False
+        return "notbranch"
     if rd not in b.uses:
-        return False
+        return "nodep"
     if rd not in liveness.get(b.index, frozenset()):
-        return False
-    return True
+        return "live"
+    return None
 
 
 def _addr_stride_ok(arith: "Instruction", mem: "Instruction") -> bool:
@@ -589,7 +611,7 @@ def _addr_stride_ok(arith: "Instruction", mem: "Instruction") -> bool:
 
 
 def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
-                              liveness: dict) -> bool:
+                              liveness: dict) -> "str | None":
     """
     Pair of same-width loads from adjacent memory locations with the same base.
     Address difference must equal the access width.  Both destinations distinct.
@@ -598,22 +620,30 @@ def _rule_adjacent_load_pair(a: "Instruction", b: "Instruction",
         <load>  rd1, N(base)
         <load>  rd2, N±<width>(base)   rd1 != rd2, same mnemonic
     """
-    if not a.is_sized_load or a.mnemonic != b.mnemonic:
-        return False
-    width = a.mem_width
+    if not a.is_sized_load:
+        return "notload"
+    if a.mnemonic != b.mnemonic:
+        return "notload" if not b.is_sized_load else "mnmismatch"
     if a.mem is None or b.mem is None:
-        return False
+        return "nomem"
+    width = a.mem_width
     off_a, base_a = a.mem
     off_b, base_b = b.mem
-    if base_a != base_b or abs(off_a - off_b) != width:
-        return False
+    if base_a != base_b:
+        return "basediff"
+    if abs(off_a - off_b) != width:
+        return "stride"
     rd_a = a.defs[0] if a.defs else None
     rd_b = b.defs[0] if b.defs else None
-    return rd_a is not None and rd_b is not None and rd_a != rd_b
+    if rd_a is None or rd_b is None:
+        return "nodef"
+    if rd_a == rd_b:
+        return "samedest"
+    return None
 
 
 def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
-                               liveness: dict) -> bool:
+                               liveness: dict) -> "str | None":
     """
     Pair of same-width stores to adjacent memory locations with the same base.
     Address difference must equal the access width.
@@ -622,22 +652,28 @@ def _rule_adjacent_store_pair(a: "Instruction", b: "Instruction",
         <store>  rs1, N(base)
         <store>  rs2, N±<width>(base)   same mnemonic
     """
-    if not a.is_sized_store or a.mnemonic != b.mnemonic:
-        return False
-    width = a.mem_width
+    if not a.is_sized_store:
+        return "notstore"
+    if a.mnemonic != b.mnemonic:
+        return "notstore" if not b.is_sized_store else "mnmismatch"
     if a.mem is None or b.mem is None:
-        return False
+        return "nomem"
+    width = a.mem_width
     off_a, base_a = a.mem
     off_b, base_b = b.mem
-    if base_a != base_b or abs(off_a - off_b) != width:
-        return False
+    if base_a != base_b:
+        return "basediff"
+    if abs(off_a - off_b) != width:
+        return "stride"
     rs_a = a.uses[0] if a.uses else None
     rs_b = b.uses[0] if b.uses else None
-    return rs_a is not None and rs_b is not None
+    if rs_a is None or rs_b is None:
+        return "nosrc"
+    return None
 
 
 def _rule_addr_chain(a: "Instruction", b: "Instruction",
-                     liveness: dict) -> bool:
+                     liveness: dict) -> "str | None":
     """
     Address computation followed by a load/store using the result as base,
     where the computed address is dead after the memory op (chain form).
@@ -647,18 +683,24 @@ def _rule_addr_chain(a: "Instruction", b: "Instruction",
 
     rd_a must be dead after B — it carries only the computed address.
     """
-    if not a.is_addr_compute or not b.is_mem_op:
-        return False
+    if not a.is_addr_compute:
+        return "noopcode"
+    if not b.is_mem_op:
+        return "notmem"
     if not a.defs:
-        return False
+        return "nodef"
     rd_a = a.defs[0]
-    if b.mem is None or b.mem[1] != rd_a:
-        return False
-    return rd_a in liveness.get(b.index, frozenset())
+    if b.mem is None:
+        return "nomem"
+    if b.mem[1] != rd_a:
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_pre_increment(a: "Instruction", b: "Instruction",
-                        liveness: dict) -> bool:
+                        liveness: dict) -> "str | None":
     """
     Address update followed by a memory op using that result as base
     (pre-increment / stride-then-access).
@@ -673,20 +715,24 @@ def _rule_pre_increment(a: "Instruction", b: "Instruction",
     The stored-value register of a store must not be rd (it would be
     overwritten by A before the store executes).
     """
-    if not a.is_addr_update or not b.is_mem_op:
-        return False
+    if not a.is_addr_update:
+        return "noopcode"
+    if not b.is_mem_op:
+        return "notmem"
     if not a.defs:
-        return False
+        return "nodef"
     rd = a.defs[0]
     if rd not in b.uses:
-        return False
+        return "nodep"
     if b.is_sized_store and b.uses and b.uses[0] == rd:
-        return False
-    return _addr_stride_ok(a, b)
+        return "storesrc"
+    if not _addr_stride_ok(a, b):
+        return "stride"
+    return None
 
 
 def _rule_post_increment(a: "Instruction", b: "Instruction",
-                          liveness: dict) -> bool:
+                          liveness: dict) -> "str | None":
     """
     Memory op followed by an address update on the same base
     (access-then-stride).
@@ -697,17 +743,23 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
     _addr_stride_ok constrains the immediate when B is addi/addiw.
     For loads, the load destination must differ from B's destination.
     """
-    if not a.is_mem_op or not b.is_addr_update:
-        return False
+    if not a.is_mem_op:
+        return "notmem"
+    if not b.is_addr_update:
+        return "noopcode"
     base = a.uses[-1] if a.uses else None
-    if base is None or not b.uses or b.uses[0] != base:
-        return False
+    if base is None:
+        return "nobase"
+    if not b.uses or b.uses[0] != base:
+        return "nodep"
     if a.is_sized_load:
         load_rd  = a.defs[0] if a.defs else None
         arith_rd = b.defs[0] if b.defs else None
         if load_rd is not None and load_rd == arith_rd:
-            return False
-    return _addr_stride_ok(b, a)
+            return "samedest"
+    if not _addr_stride_ok(b, a):
+        return "stride"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +774,7 @@ def _rule_post_increment(a: "Instruction", b: "Instruction",
 #   load_arith_chain  B is an arithmetic op reading the loaded value as rs1,
 #                     with the same encoding constraints as dual_arith_chain.
 def _rule_load_mem_chain(a: "Instruction", b: "Instruction",
-                         liveness: dict) -> bool:
+                         liveness: dict) -> "str | None":
     """
     Load of a value followed by an indexed load/store that uses the loaded
     value as its base, with a small scaled offset.
@@ -736,23 +788,27 @@ def _rule_load_mem_chain(a: "Instruction", b: "Instruction",
     pointer.  Matches the pointer-deref idiom (load pointer, deref field).
     """
     if not a.is_load_producer:
-        return False
+        return "noopcode"
     rd_a = a.defs[0]
-    if not b.is_mem_op or b.mem is None:
-        return False
+    if not b.is_mem_op:
+        return "notmem"
+    if b.mem is None:
+        return "nomem"
     off_b, base_b = b.mem
     if base_b != rd_a:
-        return False
+        return "nodep"
     width_b = b.mem_width
     if width_b == 0 or off_b is None:
-        return False
+        return "nomem"
     if off_b < 0 or off_b % width_b != 0 or off_b // width_b > 3:
-        return False
-    return rd_a in liveness.get(b.index, frozenset())
+        return "stride"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_load_jalr_chain(a: "Instruction", b: "Instruction",
-                          liveness: dict) -> bool:
+                          liveness: dict) -> "str | None":
     """
     Load of a function pointer followed by an indirect jump/call through it.
 
@@ -764,20 +820,22 @@ def _rule_load_jalr_chain(a: "Instruction", b: "Instruction",
     call idioms.
     """
     if not a.is_load_producer:
-        return False
+        return "noopcode"
     rd_a = a.defs[0]
     if b.mnemonic != "jalr":
-        return False
+        return "notjump"
     if not b.uses or b.uses[0] != rd_a:
-        return False
-    return rd_a in liveness.get(b.index, frozenset())
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 _LOAD_BRANCH_MN = frozenset({"beqz", "bnez", "beq", "bne"})
 
 
 def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
-                            liveness: dict) -> bool:
+                            liveness: dict) -> "str | None":
     """
     Load followed by a conditional branch on the loaded value.
 
@@ -788,15 +846,23 @@ def _rule_load_branch_chain(a: "Instruction", b: "Instruction",
     idioms (load a value, branch if zero/non-zero).
     """
     if not a.is_load_producer:
-        return False
+        return "noopcode"
     rd_a = a.defs[0]
     if b.mnemonic not in _LOAD_BRANCH_MN:
-        return False
-    return _is_chained(rd_a, b, liveness)
+        return "notbranch"
+    if not b.uses:
+        return "nodep"
+    if b.uses[0] != rd_a and not (
+            (b.mnemonic in _COMMUTATIVE_BINOP or b.mnemonic in _COMMUTATIVE_BRANCH)
+            and rd_a in b.uses):
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
-                           liveness: dict) -> bool:
+                           liveness: dict) -> "str | None":
     """
     Load followed by arithmetic that uses the loaded value, with the
     same encoding constraints as dual_arith_chain's B slot.
@@ -811,31 +877,42 @@ def _rule_load_arith_chain(a: "Instruction", b: "Instruction",
     A's destination must be dead after B — it carries only the chained value.
     """
     if not a.is_load_producer:
-        return False
+        return "noopcode"
     rd_a = a.defs[0]
     if rd_a not in _DUAL_ARITH_REG:
-        return False
+        return "wrongreg"
     if b.mnemonic not in _DUAL_ARITH_MN:
-        return False
-    if not _is_chained(rd_a, b, liveness):
-        return False
+        return "noopcode"
+    if not b.uses:
+        return "nodep"
+    if b.uses[0] != rd_a and not (
+            b.mnemonic in _COMMUTATIVE_BINOP and rd_a in b.uses):
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
     rd_b = b.defs[0] if b.defs else None
-    if rd_b is None or rd_b not in _DUAL_ARITH_REG:
-        return False
+    if rd_b is None:
+        return "nodef"
+    if rd_b not in _DUAL_ARITH_REG:
+        return "wrongreg"
     if any(u != "x0" and u not in _DUAL_ARITH_REG for u in b.uses):
-        return False
+        return "wrongreg"
     if not _dual_arith_immediate_ok(b):
-        return False
-    return True
+        return "bigimm"
+    return None
 
 
 def _rule_dual_arith(a: "Instruction", b: "Instruction",
-                     liveness: dict) -> bool:
+                     liveness: dict) -> "str | None":
     """
     Two independent arithmetic operations, each satisfying the dual-arith
     encoding constraints (RSD form, registers in x0..x15, 5-bit immediate).
     """
-    return a.dual_arith_ok and b.dual_arith_ok
+    if not a.dual_arith_ok:
+        return "noopcode"
+    if not b.dual_arith_ok:
+        return "partner"
+    return None
 
 
 def _mem_small_offset_ok(instr: "Instruction") -> bool:
@@ -856,7 +933,7 @@ def _mem_small_offset_ok(instr: "Instruction") -> bool:
 
 
 def _rule_arith_mem(a: "Instruction", b: "Instruction",
-                    liveness: dict) -> bool:
+                    liveness: dict) -> "str | None":
     """
     Arithmetic (RSD form, x0..x15 regs) followed by a load or store with a
     small aligned offset (0 .. 3 × access width).
@@ -873,11 +950,27 @@ def _rule_arith_mem(a: "Instruction", b: "Instruction",
     The dep graph still prevents scheduling A before B when a true dependency
     exists.
     """
-    return _is_arith_mem_a(a) and _mem_small_offset_ok(b)
+    if not _is_arith_mem_a(a):
+        mn = a.mnemonic
+        if mn not in _ARITH_MEM_MN:
+            return "noopcode"
+        rd = a.defs[0] if a.defs else None
+        if rd is None or rd not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        if not a.uses or a.uses[0] != rd:
+            return "notrsd"
+        if mn == "addi":
+            return "bigimm"
+        return "wrongreg"
+    if not b.is_mem_op:
+        return "notmem"
+    if not _mem_small_offset_ok(b):
+        return "stride"
+    return None
 
 
 def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
-                            liveness: dict) -> bool:
+                            liveness: dict) -> "str | None":
     """
     Two arithmetic operations where A's result is consumed by B as its first
     source, then discarded (dead after B).
@@ -892,12 +985,35 @@ def _rule_dual_arith_chain(a: "Instruction", b: "Instruction",
     For commutative B ops (add, and, or, xor) rd_a may appear as either
     rs1 or rs2.
     """
-    rd_a = a.defs[0] if a.defs else None
-    return _chain_arith_a(a) and _chain_arith_b(b) and _is_chained(rd_a, b, liveness)
+    if not a.defs:
+        return "nodef"
+    if not _chain_arith_a(a):
+        if a.mnemonic not in _DUAL_ARITH_MN:
+            return "noopcode"
+        if a.defs[0] not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        if any(u != "x0" and u not in _DUAL_ARITH_REG for u in a.uses):
+            return "wrongreg"
+        return "bigimm"
+    if not _chain_arith_b(b):
+        if b.mnemonic not in _DUAL_ARITH_MN:
+            return "noopcode"
+        if b.defs and b.defs[0] not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        return "bigimm"
+    rd_a = a.defs[0]
+    if not b.uses:
+        return "nodep"
+    if b.uses[0] != rd_a and not (
+            b.mnemonic in _COMMUTATIVE_BINOP and rd_a in b.uses):
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_arith_jump(a: "Instruction", b: "Instruction",
-                     liveness: dict) -> bool:
+                     liveness: dict) -> "str | None":
     """
     Arithmetic operation (dual-arith subset) followed by a small
     unconditional branch (j, jr, jalr with zero offset, ret).
@@ -906,11 +1022,19 @@ def _rule_arith_jump(a: "Instruction", b: "Instruction",
         <dual-arith op>  rd, rd, rs2/imm   (RSD form, rd in x0..x15)
         j / jr / jalr 0(rs) / ret
     """
-    return a.dual_arith_ok and b.is_small_jump
+    if not a.dual_arith_ok:
+        if a.mnemonic not in _DUAL_ARITH_MN:
+            return "noopcode"
+        if a.defs and a.defs[0] not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        return "bigimm"
+    if not b.is_small_jump:
+        return "notjump"
+    return None
 
 
 def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
-                       liveness: dict) -> bool:
+                       liveness: dict) -> "str | None":
     """
     Move or small-offset load followed by a small unconditional branch.
 
@@ -918,18 +1042,20 @@ def _rule_mv_load_jump(a: "Instruction", b: "Instruction",
     B slot: j / jr / jalr 0(rs) / ret  (shared with arith_jump)
     """
     if a.is_mv or a.is_li():
-        return b.is_small_jump
-    if a.is_sized_load and a.mem is not None:
+        return None if b.is_small_jump else "notjump"
+    if a.is_sized_load:
+        if a.mem is None:
+            return "nomem"
         off, _base = a.mem
-        if off is not None and off >= 0:
-            width = a.mem_width
-            if width != 0 and off % width == 0 and off <= 3 * width:
-                return b.is_small_jump
-    return False
+        width = a.mem_width
+        if off is None or off < 0 or width == 0 or off % width != 0 or off > 3 * width:
+            return "stride"
+        return None if b.is_small_jump else "notjump"
+    return "noopcode"
 
 
 def _rule_arith_branch(a: "Instruction", b: "Instruction",
-                       liveness: dict) -> bool:
+                       liveness: dict) -> "str | None":
     """
     Arithmetic operation (dual-arith subset) followed by a conditional
     branch on whether the result is zero.  In this instance rsd is
@@ -940,18 +1066,24 @@ def _rule_arith_branch(a: "Instruction", b: "Instruction",
         beqz / bnez      rd, label          (same rd)
     """
     if not a.dual_arith_ok:
-        return False
+        if a.mnemonic not in _DUAL_ARITH_MN:
+            return "noopcode"
+        if a.defs and a.defs[0] not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        return "bigimm"
     rd = a.defs[0] if a.defs else None
     if rd is None:
-        return False
+        return "nodef"
     if b.mnemonic not in ("beqz", "bnez"):
-        return False
+        return "notbranch"
     tested = b.uses[0] if b.uses else None
-    return tested == rd
+    if tested != rd:
+        return "nodep"
+    return None
 
 
 def _rule_addi_branch(a: "Instruction", b: "Instruction",
-                      liveness: dict) -> bool:
+                      liveness: dict) -> "str | None":
     """
     Add-immediate (RSD form) followed by a two-register conditional branch
     on the same register.
@@ -974,13 +1106,18 @@ def _rule_addi_branch(a: "Instruction", b: "Instruction",
         addi  a2, a2, 1
         beq   s0, a2, .done      # rsd=a2 is rs2 (commutative match)
     """
-    if not a.dual_arith_ok or a.mnemonic != "addi":
-        return False
+    if a.mnemonic != "addi":
+        return "noopcode"
+    if not a.dual_arith_ok:
+        if a.defs and a.defs[0] not in _DUAL_ARITH_REG:
+            return "wrongreg"
+        return "bigimm"
     rsd = a.defs[0] if a.defs else None
     if b.mnemonic not in ("beq", "bne"):
-        return False
-    # rsd must appear as either operand of the branch (commutativity).
-    return rsd in b.uses
+        return "notbranch"
+    if rsd not in b.uses:
+        return "nodep"
+    return None
 
 
 # Pairs of mnemonics that consume the same two source registers but produce
@@ -1012,7 +1149,7 @@ _OP_PAIR_TABLE: dict = {
 
 
 def _rule_op_pair(a: "Instruction", b: "Instruction",
-                      liveness: dict) -> bool:
+                      liveness: dict) -> "str | None":
     """
     Two instructions that together take two inputs and produce two independent
     results (dual-result form).
@@ -1039,23 +1176,32 @@ def _rule_op_pair(a: "Instruction", b: "Instruction",
         mv / li         - one register copy, one constant load
         li / li         — two independent small constant loads
     """
-    if not a.defs or not b.defs or a.defs[0] == b.defs[0]:
-        return False
-    # Move/li pairs: each instruction is an independent one-input→one-output
-    # data path; no shared-source requirement.  Only same-kind pairs allowed:
-    # mv+mv (each routes a different register) or li+li (each loads a constant).
-    # li+mv is intentionally excluded to concede the case where a source
-    # register is copied and then replaced with a constant, and
-    # reordering can achieve any complementary case of li+mv.
+    if not a.defs:
+        return "nodef"
+    if not b.defs:
+        return "nodef"
+    if a.defs[0] == b.defs[0]:
+        return "samedest"
+    # Move/li pairs.
     if a.is_mv:
-        return b.is_mv or b.is_li()
+        if b.is_mv or b.is_li():
+            return None
+        return "partner"
     if a.is_li():
-        return b.is_li()
+        if b.is_li():
+            return None
+        return "partner"
     # Table-driven same-input pairs.
     partners = _OP_PAIR_TABLE.get(a.mnemonic)
-    if partners is None or b.mnemonic not in partners:
-        return False
-    return bool(a.real_uses) and a.uses == b.uses
+    if partners is None:
+        return "noopcode"
+    if b.mnemonic not in partners:
+        return "partner"
+    if not a.real_uses:
+        return "nodep"
+    if a.uses != b.uses:
+        return "samesrc"
+    return None
 
 
 # Chain form: A's result is consumed by B, then dead.
@@ -1066,7 +1212,7 @@ _OP_PAIR_CHAIN_TABLE: dict = {
 
 
 def _rule_op_pair_chain(a: "Instruction", b: "Instruction",
-                        liveness: dict) -> bool:
+                        liveness: dict) -> "str | None":
     """
     Chain form of op_pair: A computes a value into rd_a, B consumes rd_a
     as one of its source registers, and rd_a is dead after B.
@@ -1082,18 +1228,22 @@ def _rule_op_pair_chain(a: "Instruction", b: "Instruction",
         slli / or     — shift left then OR (bit-field insertion)
     """
     partners = _OP_PAIR_CHAIN_TABLE.get(a.mnemonic)
-    if partners is None or b.mnemonic not in partners:
-        return False
+    if partners is None:
+        return "noopcode"
+    if b.mnemonic not in partners:
+        return "partner"
     if not a.defs:
-        return False
+        return "nodef"
     rd_a = a.defs[0]
     if rd_a not in b.uses:
-        return False
-    return rd_a in liveness.get(b.index, frozenset())
+        return "nodep"
+    if rd_a not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
 def _rule_li_branch_chain(a: "Instruction", b: "Instruction",
-                          liveness: dict) -> bool:
+                          liveness: dict) -> "str | None":
     """
     Load-immediate followed by a conditional branch using the loaded value,
     effectively synthesising ``bXX rs1, imm, label``.
@@ -1107,20 +1257,27 @@ def _rule_li_branch_chain(a: "Instruction", b: "Instruction",
     (−16..15) because the fused branch-with-immediate encoding has room
     for a 10-bit signed operand.
     """
-    if a.mnemonic != "addi" or a.real_uses or not a.defs:
-        return False
+    if a.mnemonic != "addi":
+        return "noopcode"
+    if a.real_uses or not a.defs:
+        return "notli"
     imm = a.imm
     if imm is None or imm < -512 or imm > 511:
-        return False
+        return "bigimm"
     rd = a.defs[0]
     if b.mnemonic not in _BRANCH_CMP:
-        return False
+        return "notbranch"
     if rd not in b.uses:
-        return False
-    return rd in liveness.get(b.index, frozenset())
+        return "nodep"
+    if rd not in liveness.get(b.index, frozenset()):
+        return "live"
+    return None
 
 
-# the first match wins.
+# Ordered list of primary pairing rules.  Each entry is (name, rule_fn).
+# rule_fn(a, b, liveness) returns None on a successful match and a short
+# reason token (str) when the pair is rejected.  First match wins when
+# multiple rules accept the same pair.
 COMPACT32_RULES: list = [
     ("bit_branch_rsd",      _rule_bit_branch_rsd),
     ("bit_branch_chain",    _rule_bit_branch_chain),
@@ -1139,6 +1296,7 @@ COMPACT32_RULES: list = [
     ("op_pair_chain",       _rule_op_pair_chain),
     ("dual_arith",          _rule_dual_arith),
     ("dual_arith_chain",    _rule_dual_arith_chain),
+    ("arith_mem",           _rule_arith_mem),
     ("arith_jump",          _rule_arith_jump),
     ("mv_load_jump",        _rule_mv_load_jump),
     ("arith_branch",        _rule_arith_branch),
@@ -1146,250 +1304,267 @@ COMPACT32_RULES: list = [
     ("li_branch_chain",     _rule_li_branch_chain),
 ]
 
-def _rule_chain(a: "Instruction", b: "Instruction",
-                liveness: dict) -> bool:
-    """
-    Generic chain: A defines a register that B consumes and is dead after B.
-
-    Matches any producer-consumer adjacent pair where A's result register is
-    used by B and not live after B.  Catches patterns not covered by the more
-    specific primary chain rules (addr_chain, op_pair_chain, …).
-    """
-    if not a.defs:
-        return False
-    rd = a.defs[0]
-    if rd == "x0":
-        return False
-    if rd not in b.uses:
-        return False
-    return rd in liveness.get(b.index, frozenset())
-
-
-def _rule_rsd_live(a: "Instruction", b: "Instruction",
-                   liveness: dict) -> bool:
-    """
-    RSD-form update feeding B where A's result stays live after B.
-
-    A is in RSD form (rs1 == rd): it updates a register in-place.  B reads
-    that register, but the value is still needed afterwards (not dead).
-    Contrasts with the chain rules where the value is dead after B.
-    """
-    if not a.defs or not a.uses:
-        return False
-    rd = a.defs[0]
-    if rd == "x0":
-        return False
-    if a.uses[0] != rd:          # rsd constraint: rs1 == rd
-        return False
-    if rd not in b.uses:
-        return False
-    return rd not in liveness.get(b.index, frozenset())  # NOT dead after B
-
-
-def _rule_arith_return(a: "Instruction", b: "Instruction",
-                       liveness: dict) -> bool:
-    """
-    Any arithmetic before a function return (ret or jalr-as-return).
-
-    Catches the common pattern of computing a return value immediately before
-    returning.  A may be any instruction that defines a register and is not
-    itself a branch, memory access, or return.
-    """
-    if not b.is_return:
-        return False
-    if not a.defs:
-        return False
-    if a.mnemonic in _COMPACT32_BRANCH_MN or a.is_mem_op:
-        return False
-    if a.mnemonic in ("nop", "ret", "tail", "call", "ecall", "ebreak",
-                      "fence", "fence.i"):
-        return False
-    return True
+_COMPACT32_RULE_BY_NAME: dict = {name: fn for name, fn in COMPACT32_RULES}
 
 
 # ---------------------------------------------------------------------------
-# Per-side eligibility predicates for tally rules
+# Rule categories
 # ---------------------------------------------------------------------------
-# Each function tests whether a single instruction is structurally eligible
-# to occupy the A slot (first/producer) or B slot (second/consumer) of the
-# corresponding tally rule.  These are used to annotate unpaired instructions
-# in the scheduler output; the downstream rv32_tally.py tool reads these
-# annotations to compute statistics without re-running the scheduler.
+# Each rule belongs to a structural category.  Categories let the scheduler
+# report per-group near-miss statistics for unpaired instructions: when an
+# instruction is structurally eligible as the A or B slot of a category but
+# fails to pair, the output is annotated with the category plus the set of
+# rejection reasons returned by the category's member rules.
 #
-# Liveness-dependent rules (chain, rsd_live) use loose structural criteria
-# that do not require knowledge of the adjacent instruction.
+#   chain    — A produces rd, B consumes rd, and rd is dead after B.
+#   rsd      — A is in RSD form (rs1 == rd) and B reads rd (may stay live).
+#   lspair   — Adjacent same-width memory accesses on the same base.
+#   addrmem  — Address update and memory op on the same base (either order).
+#   dual     — Two independent operations packed into one word.
+#   jumpret  — A small op immediately preceding an unconditional jump/return.
+_RULE_CATEGORY: dict = {
+    # chain: producer -> consumer, result dies at the consumer
+    "bit_branch_chain":    "chain",
+    "cmp_branch_chain":    "chain",
+    "addr_chain":          "chain",
+    "load_mem_chain":      "chain",
+    "load_jalr_chain":     "chain",
+    "load_branch_chain":   "chain",
+    "load_arith_chain":    "chain",
+    "op_pair_chain":       "chain",
+    "dual_arith_chain":    "chain",
+    "li_branch_chain":     "chain",
+    # rsd: A writes back into its own source, B reads it
+    "bit_branch_rsd":      "rsd",
+    "cmp_branch_rsd":      "rsd",
+    "arith_branch":        "rsd",
+    "addi_branch":         "rsd",
+    # lspair: adjacent memory accesses of matching width on the same base
+    "adjacent_load_pair":  "lspair",
+    "adjacent_store_pair": "lspair",
+    # addrmem: address arithmetic fused with a neighbouring memory op
+    "pre_increment":       "addrmem",
+    "post_increment":      "addrmem",
+    # dual: two independent operations (no producer -> consumer edge)
+    "dual_arith":          "dual",
+    "op_pair":             "dual",
+    "arith_mem":           "dual",
+    # jumpret: small op immediately before an unconditional jump/return
+    "arith_jump":          "jumpret",
+    "mv_load_jump":        "jumpret",
+}
 
-def _chain_a_eligible(instr: "Instruction") -> bool:
-    """A-eligible for 'chain': defines a non-x0 register (potential producer)."""
-    return bool(instr.defs) and instr.defs[0] != "x0"
+# Stable display order — the scheduler emits MISS-A/MISS-B annotations in
+# this order so diffs between runs are easy to compare.
+RULE_CATEGORIES: list = ["chain", "rsd", "lspair", "addrmem", "dual", "jumpret"]
 
-
-def _chain_b_eligible(instr: "Instruction") -> bool:
-    """B-eligible for 'chain': has at least one real use (potential consumer)."""
-    return bool(instr.real_uses)
-
-
-def _rsd_live_a_eligible(instr: "Instruction") -> bool:
-    """A-eligible for 'rsd_live': RSD form (rs1 == rd), rd != x0."""
-    if not instr.defs or not instr.uses:
-        return False
-    rd = instr.defs[0]
-    return rd != "x0" and instr.uses[0] == rd
-
-
-def _rsd_live_b_eligible(instr: "Instruction") -> bool:
-    """B-eligible for 'rsd_live': has at least one real use (potential consumer)."""
-    return bool(instr.real_uses)
-
-
-def _arith_return_a_eligible(instr: "Instruction") -> bool:
-    """A-eligible for 'arith_return': defines a register, not branch/mem/return/nop."""
-    if not instr.defs:
-        return False
-    if instr.mnemonic in _COMPACT32_BRANCH_MN or instr.is_mem_op:
-        return False
-    if instr.mnemonic in ("nop", "ret", "tail", "call", "ecall", "ebreak",
-                          "fence", "fence.i"):
-        return False
-    return True
+_CATEGORY_RULES: dict = {cat: [] for cat in RULE_CATEGORIES}
+for _rule_name, _rule_fn in COMPACT32_RULES:
+    _cat = _RULE_CATEGORY.get(_rule_name)
+    if _cat is not None:
+        _CATEGORY_RULES[_cat].append((_rule_name, _rule_fn))
 
 
 # ---------------------------------------------------------------------------
-# Tally rules
+# Per-rule structural eligibility predicates
 # ---------------------------------------------------------------------------
-# Candidate pairing rules used for statistics gathering only.  They are never
-# activated during scheduling; instead, unpaired instructions in the scheduler
-# output are annotated with TALLY:name:A / TALLY:name:B tags indicating which
-# rules each instruction is eligible for on each side.
-#
-# Each entry is (name, pair_fn, a_eligible_fn, b_eligible_fn).
-#   name           : short identifier, used in annotations and --list-rules
-#   pair_fn        : full rule predicate (a, b, liveness) -> bool
-#   a_eligible_fn  : per-instruction A-side structural check (instr) -> bool
-#   b_eligible_fn  : per-instruction B-side structural check (instr) -> bool
-TALLY_RULES: list = [
-    ("arith_mem",    _rule_arith_mem,    _is_arith_mem_a,           _mem_small_offset_ok),
-    ("chain",        _rule_chain,        _chain_a_eligible,         _chain_b_eligible),
-    ("rsd_live",     _rule_rsd_live,     _rsd_live_a_eligible,      _rsd_live_b_eligible),
-    ("arith_return", _rule_arith_return, _arith_return_a_eligible,  lambda i: i.is_return),
-]
+# A-side and B-side structural filters — they identify whether a single
+# instruction *could* occupy the named slot of the named rule, ignoring the
+# partner.  The rule itself is still the authority on acceptance; these
+# predicates exist so the scheduler can (a) skip rules that cannot possibly
+# match and (b) decide whether an unpaired instruction "qualified" for a
+# category for near-miss reporting.
+
+_OP_PAIR_B_MN: frozenset = frozenset(
+    mn for partners in _OP_PAIR_TABLE.values() for mn in partners)
+_OP_PAIR_CHAIN_B_MN: frozenset = frozenset(
+    mn for partners in _OP_PAIR_CHAIN_TABLE.values() for mn in partners)
+
+
+def _a_eligible_rules(a: "Instruction") -> "frozenset[str]":
+    """
+    Set of rule names for which *a* is structurally eligible as the A (first)
+    slot.  An empty set means no pairing rule will accept *a* as A.
+    """
+    elig = set()
+    if a.defs and a.is_cmp:
+        rd = a.defs[0]
+        if a.uses and a.uses[0] == rd:
+            elig.add("cmp_branch_rsd")
+        else:
+            elig.add("cmp_branch_chain")
+    if a.defs and a.is_li():
+        elig.add("cmp_branch_chain")
+    if (a.mnemonic == "addi" and not a.real_uses and a.defs
+            and a.imm is not None and -512 <= a.imm <= 511):
+        elig.add("li_branch_chain")
+    if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
+        rd = a.defs[0]
+        if a.uses and a.uses[0] == rd:
+            elig.add("bit_branch_rsd")
+        else:
+            elig.add("bit_branch_chain")
+    if a.defs and a.mnemonic in ("slli", "srli", "srai"):
+        if not (a.uses and a.uses[0] == a.defs[0]):  # non-RSD only
+            elig.add("bit_branch_chain")
+    if a.is_sized_load:
+        elig.add("adjacent_load_pair")
+    if a.is_sized_store:
+        elig.add("adjacent_store_pair")
+    if a.is_addr_compute:
+        elig.add("addr_chain")
+    if a.is_addr_update:
+        elig.add("pre_increment")
+    if a.is_mem_op:
+        elig.add("post_increment")
+    if a.is_load_producer:
+        elig.add("load_mem_chain")
+        elig.add("load_jalr_chain")
+        elig.add("load_branch_chain")
+        elig.add("load_arith_chain")
+    if a.mnemonic in _OP_PAIR_TABLE or a.is_mv or a.is_li():
+        elig.add("op_pair")
+    if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
+        elig.add("op_pair_chain")
+    if a.is_mv or (a.is_sized_load and _mem_small_offset_ok(a)):
+        elig.add("mv_load_jump")
+    if _chain_arith_a(a):
+        elig.add("dual_arith_chain")
+    if _is_arith_mem_a(a):
+        elig.add("arith_mem")
+    if _dual_arith_ok(a):
+        elig.add("dual_arith")
+        elig.add("arith_jump")
+        elig.add("arith_branch")
+        if a.mnemonic == "addi":
+            elig.add("addi_branch")
+    return frozenset(elig)
+
+
+def _b_eligible_rules(b: "Instruction") -> "frozenset[str]":
+    """
+    Set of rule names for which *b* is structurally eligible as the B (second)
+    slot.  Symmetric counterpart of ``_a_eligible_rules``.
+    """
+    elig = set()
+    mn = b.mnemonic
+    if mn in ("beqz", "bnez"):
+        elig.add("bit_branch_rsd")
+        elig.add("bit_branch_chain")
+        elig.add("cmp_branch_rsd")
+        elig.add("cmp_branch_chain")
+        elig.add("arith_branch")
+    if mn in _BRANCH_CMP:
+        elig.add("cmp_branch_chain")
+        elig.add("li_branch_chain")
+    if mn in _LOAD_BRANCH_MN:
+        elig.add("load_branch_chain")
+    if mn in ("beq", "bne"):
+        elig.add("addi_branch")
+    if b.is_sized_load:
+        elig.add("adjacent_load_pair")
+    if b.is_sized_store:
+        elig.add("adjacent_store_pair")
+    if b.is_mem_op:
+        elig.add("addr_chain")
+        elig.add("pre_increment")
+        elig.add("load_mem_chain")
+        elig.add("arith_mem")
+    if b.is_addr_update:
+        elig.add("post_increment")
+    if mn == "jalr":
+        elig.add("load_jalr_chain")
+    if b.is_small_jump:
+        elig.add("arith_jump")
+        elig.add("mv_load_jump")
+    if mn in _DUAL_ARITH_MN:
+        elig.add("load_arith_chain")
+    if _dual_arith_ok(b):
+        elig.add("dual_arith")
+    if _chain_arith_b(b):
+        elig.add("dual_arith_chain")
+    if mn in _OP_PAIR_B_MN or b.is_mv or b.is_li():
+        elig.add("op_pair")
+    if mn in _OP_PAIR_CHAIN_B_MN:
+        elig.add("op_pair_chain")
+    return frozenset(elig)
+
+
 
 
 # ---------------------------------------------------------------------------
 # Compact-32 scorer factory
 # ---------------------------------------------------------------------------
 
-def make_compact32_scorer(liveness: dict,
-                          tally_rules: "list[str]" = []) -> "PairScoreFn":
+def make_compact32_scorer(liveness: dict) -> "PairScoreFn":
     """
     Return a pair-scoring function for the compact-32 encoding experiment.
 
     The scorer holds its liveness reference in a mutable cell so that
     the streaming processor can refresh it per block after renaming.
 
-    tally_rules
-        Ordered list of tally rule names to activate (see TALLY_RULES).
-        Each name corresponds to a rule that is tried only after all primary
-        rules have failed.  Order matches --tally= list order.
+    Each rule in ``COMPACT32_RULES`` returns ``None`` on a successful match
+    and a short reason token (``str``) on rejection.  The scorer returns
+    ``1.0`` for the first rule that accepts the pair and ``0.0`` otherwise.
     """
     cell: list = [liveness]
-
-    _tally_by_name = {name: fn for name, fn, _a, _b in TALLY_RULES}
-    active_tally: list = [
-        (name, _tally_by_name[name])
-        for name in tally_rules
-        if name in _tally_by_name
-    ]
-
     rules = list(COMPACT32_RULES)
 
-    def _a_eligible(a: "Instruction") -> "frozenset[str]":
-        eligible = set()
-        if a.defs and a.is_cmp:
-            rd = a.defs[0]
-            if a.uses and a.uses[0] == rd:
-                eligible.add("cmp_branch_rsd")
-            else:
-                eligible.add("cmp_branch_chain")
-        if a.defs and a.is_li():
-            eligible.add("cmp_branch_chain")
-        if (a.mnemonic == "addi" and not a.real_uses and a.defs
-                and a.imm is not None and -512 <= a.imm <= 511):
-            eligible.add("li_branch_chain")
-        if a.defs and a.mnemonic == "andi" and _is_pow2_imm(a.imm):
-            rd = a.defs[0]
-            if a.uses and a.uses[0] == rd:
-                eligible.add("bit_branch_rsd")
-            else:
-                eligible.add("bit_branch_chain")
-        if a.defs and a.mnemonic in ("slli", "srli", "srai"):
-            if not (a.uses and a.uses[0] == a.defs[0]):  # non-RSD only
-                eligible.add("bit_branch_chain")
-        if a.is_sized_load:
-            eligible.add("adjacent_load_pair")
-        if a.is_sized_store:
-            eligible.add("adjacent_store_pair")
-        if a.is_addr_compute:
-            eligible.add("addr_chain")
-        if a.is_addr_update:
-            eligible.add("pre_increment")
-        if a.is_mem_op:
-            eligible.add("post_increment")
-        if a.is_load_producer:
-            eligible.add("load_mem_chain")
-            eligible.add("load_jalr_chain")
-            eligible.add("load_branch_chain")
-            eligible.add("load_arith_chain")
-        if a.mnemonic in _OP_PAIR_TABLE or a.is_mv or a.is_li():
-            eligible.add("op_pair")
-        if a.mnemonic in _OP_PAIR_CHAIN_TABLE:
-            eligible.add("op_pair_chain")
-        if a.is_mv or (a.is_sized_load and _mem_small_offset_ok(a)):
-            eligible.add("mv_load_jump")
-        if _chain_arith_a(a):
-            eligible.add("dual_arith_chain")
-        if _dual_arith_ok(a):
-            eligible.add("dual_arith")
-            eligible.add("arith_jump")
-            eligible.add("arith_branch")
-            if a.mnemonic == "addi":
-                eligible.add("addi_branch")
-        return frozenset(eligible)
+    _a_cache: dict = {}
+    _b_cache: dict = {}
 
-    _elig_cache: dict = {}
-
-    def _get_eligible(a: "Instruction") -> "frozenset[str]":
+    def _get_a_elig(a: "Instruction") -> "frozenset[str]":
         idx = a.index
-        if idx not in _elig_cache:
-            _elig_cache[idx] = _a_eligible(a)
-        return _elig_cache[idx]
+        cached = _a_cache.get(idx)
+        if cached is None:
+            cached = _a_eligible_rules(a)
+            _a_cache[idx] = cached
+        return cached
+
+    def _get_b_elig(b: "Instruction") -> "frozenset[str]":
+        idx = b.index
+        cached = _b_cache.get(idx)
+        if cached is None:
+            cached = _b_eligible_rules(b)
+            _b_cache[idx] = cached
+        return cached
 
     def _score(a: "Instruction", b: "Instruction") -> float:
-        """Score for BnB scheduling — primary rules only, no tally rules."""
+        """Score for BnB scheduling — 1.0 on a successful rule match."""
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return 0.0
-        elig = _get_eligible(a)
+        elig = _get_a_elig(a)
         if not elig:
             return 0.0
-        for _name, rule in rules:
-            if _name in elig and rule(a, b, cell[0]):
+        live = cell[0]
+        for name, rule in rules:
+            if name in elig and rule(a, b, live) is None:
                 return 1.0
         return 0.0
 
     def _describe(a: "Instruction", b: "Instruction") -> str:
         if a.mnemonic in _COMPACT32_BRANCH_MN:
             return ""
-        elig = _get_eligible(a)
+        elig = _get_a_elig(a)
+        live = cell[0]
         for name, rule in rules:
-            if name in elig and rule(a, b, cell[0]):
+            if name in elig and rule(a, b, live) is None:
                 return name
         return ""
 
-    _score._liveness_cell   = cell
-    _score._elig_cache      = _elig_cache   # exposed so the renamer can invalidate
-    _score._describe_pair   = _describe
-    _score._rule_list       = rules          # primary only (wide-aware)
-    _score._tally_rule_list = active_tally
+    def _invalidate(idx: int) -> None:
+        """Drop cached eligibility for *idx* on both sides."""
+        _a_cache.pop(idx, None)
+        _b_cache.pop(idx, None)
+
+    _score._liveness_cell = cell
+    _score._elig_cache    = _a_cache        # legacy name, renamer uses .pop()
+    _score._b_elig_cache  = _b_cache
+    _score._invalidate    = _invalidate
+    _score._get_a_elig    = _get_a_elig
+    _score._get_b_elig    = _get_b_elig
+    _score._describe_pair = _describe
+    _score._rule_list     = rules
     return _score
 
 

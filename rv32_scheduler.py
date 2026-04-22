@@ -6,11 +6,17 @@ RV32 instruction scheduler: reads assembly source,
 reorders instructions within basic blocks to maximise pairing opportunities,
 and emits the reordered assembly with PAIR+ annotations.
 
-Unpaired instructions are annotated with TALLY-A:, TALLY-B:, and CLASS:
-tags (all comma-separated lists) indicating which secondary pairing rules
-(see TALLY_RULES in rv32_scorers.py) they are eligible for on each side,
-and which instruction classes they belong to (arith/mem/control/big/rvc).
-Use rv32_tally.py to analyse these annotations.
+Unpaired instructions are annotated with per-category MISS tags describing
+the rejection reasons returned by each pairing rule they qualified for:
+
+    # MISS-A:chain[load_arith_chain:nodep,load_branch_chain:live]
+    # MISS-B:jumpret[arith_jump:wrongreg]
+
+MISS-A tags describe the instruction's failure as the first instruction of
+a potential pair (partnered with the next instruction in output order);
+MISS-B tags describe failure as the second instruction (partnered with the
+previous).  See ``rv32_scorers.RULE_CATEGORIES`` for the category list and
+``rv32_tally.py`` for aggregation.
 
 Usage
 -----
@@ -38,7 +44,9 @@ from rv32_analysis import (
 )
 from rv32_scorers import (
     PairScoreFn, can_compress, _compress_pair_score,
-    COMPACT32_RULES, TALLY_RULES, SCORERS,
+    COMPACT32_RULES, RULE_CATEGORIES, SCORERS,
+    _RULE_CATEGORY, _CATEGORY_RULES,
+    _a_eligible_rules, _b_eligible_rules,
     make_compact32_scorer,
 )
 from rv32_rename import (
@@ -140,7 +148,7 @@ class PairStats:
 
         Rule rows follow at one level of indentation, then the size estimate.
         Opcode tally tables have moved to the rv32_tally.py tool, which reads
-        TALLY-A:/TALLY-B:/CLASS: annotations from the scheduler output.
+        MISS-A:/MISS-B: annotations from the scheduler output.
         """
         # ── Header rows: pairs achieved vs rvc ceiling ───────────────────
         lbl_pairs = "pairs:"
@@ -233,121 +241,74 @@ class PairStats:
         )
 
 # ---------------------------------------------------------------------------
-# Instruction class sets (used for CLASS: annotations on unpaired instructions)
+# Near-miss annotations for unpaired instructions
 # ---------------------------------------------------------------------------
 
-# Arithmetic and logic: integer ALU, shifts, multiply/divide, bit-manip.
-# Does NOT include lui/auipc (handled as separate tokens) or mem/control.
-_TALLY_ARITH_MN: frozenset = frozenset({
-    "add",  "addw",  "sub",  "subw",  "neg",  "negw",
-    "addi", "addiw",
-    "and",  "or",  "xor",  "not",
-    "andi", "ori", "xori",
-    "sll",  "sllw", "srl",  "srlw", "sra",  "sraw",
-    "slli", "slliw","srli", "srliw","srai", "sraiw",
-    "slt",  "sltu", "slti", "sltiu",
-    "seqz", "snez", "sltz", "sgtz",
-    "mul",  "mulh", "mulhu","mulhsu","mulw",
-    "div",  "divu", "rem",  "remu",
-    "divw", "divuw","remw", "remuw",
-    "mv", "li",
-    # Zb* bit-manipulation
-    "bic",  "andn", "xnor",
-    "sh1add","sh2add","sh3add",
-    "add.uw", "slli.uw",
-    "min",  "minu", "max",  "maxu",
-    "clz",  "ctz",  "cpop", "rev8",
-    "clzw", "ctzw", "cpopw",
-    "sext.b","sext.h","zext.h",
-    "bset", "bclr", "binv", "bext",
-    "bseti","bclri","binvi","bexti",
-    "ror",  "rol",  "rori", "orc.b",
-    "rorw", "rolw", "roriw",
-    # Zicond
-    "czero.eqz", "czero.nez",
-})
+def _miss_tag(instr: "Instruction", partner: "Instruction",
+              side: str, liveness: dict) -> str:
+    """Build a single ``MISS-<side>`` annotation string for *instr*.
 
-# Control flow: conditional branches, jumps, calls, returns, traps.
-_TALLY_CONTROL_MN: frozenset = frozenset({
-    "beq",  "bne",  "blt",  "bge",  "bltu", "bgeu",
-    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
-    "j",    "jal",  "jalr", "jr",
-    "ret",  "call", "tail",
-    "ecall","ebreak","nop",
-    "fence","fence.i","sfence.vma",
-    "mret", "sret", "uret",
-    "c.beqz","c.bnez","c.j","c.jal","c.jalr","c.jr",
-})
+    *side* is ``"A"`` (instr is the first of the putative pair, partnered with
+    the *next* instruction in output order) or ``"B"`` (instr is the second,
+    partnered with the *previous*).  *partner* is the adjacent instruction on
+    that side, or ``None`` if there is no partner (start/end of block).
 
-# Memory: loads and stores — same set as Instruction.is_mem_op.
-_TALLY_MEM_MN: frozenset = _MEM_OPS
-
-# Upper-immediate instructions are always "big" (20-bit immediate).
-_UPPER_IMM_MN: frozenset = frozenset({"lui", "auipc"})
-
-# Shift-amount fields are structurally bounded (1..31) and never "big".
-_SHIFT_MN: frozenset = frozenset({
-    "slli", "srli", "srai", "slliw", "srliw", "sraiw",
-})
-
-
-def _imm_is_big(instr: "Instruction") -> bool:
-    """Return True if *instr* carries a large immediate.
-
-    ``lui`` and ``auipc`` are always considered big (20-bit immediate).
-    Shift-amount fields are always small (structurally bounded 1..31).
-    Memory ops use a 5-bit signed field scaled by data width (±16 elements).
-    ``addi rd, sp, imm`` uses a 5-bit unsigned field scaled by 4.
-    All other immediates use a plain 5-bit signed check (−16..+15).
-    Returns False for instructions that carry no immediate.
+    The annotation lists every category in which *instr* was structurally
+    eligible but at least one rule rejected the pair.  Categories fully
+    covered by accepted rules are omitted — they would already have produced
+    a PAIR+ annotation.  Returns an empty string if *instr* has no
+    near-miss categories.
     """
-    mn = instr.mnemonic
-    if mn in _UPPER_IMM_MN:
-        return True
-    if mn in _SHIFT_MN:
-        return False
-    if instr.mem is not None:
-        off = instr.mem[0]
-        if off is None:
-            return False
-        scale = instr.mem_width or 1
-        return not (off % scale == 0 and -16 * scale <= off <= 15 * scale)
-    imm = instr.imm
-    if imm is None:
-        return False
-    if mn == "addi" and instr.uses and instr.uses[0] == "x2":
-        return not (0 <= imm and imm % 4 == 0 and imm <= 124)
-    return not (-16 <= imm <= 15)
-
-
-# Map class name → mnemonic set, used for CLASS: annotation generation.
-# "big" is handled separately via _imm_is_big() since it is not purely
-# mnemonic-based; _UPPER_IMM_MN lists the mnemonics that are always big.
-_TALLY_GROUP: dict = {
-    "arith":   _TALLY_ARITH_MN,
-    "mem":     _TALLY_MEM_MN,
-    "control": _TALLY_CONTROL_MN,
-}
+    if partner is None:
+        return ""
+    if side == "A":
+        elig = _a_eligible_rules(instr)
+        a, b = instr, partner
+    else:
+        elig = _b_eligible_rules(instr)
+        a, b = partner, instr
+    if not elig:
+        return ""
+    buckets: dict = {cat: [] for cat in RULE_CATEGORIES}
+    for cat in RULE_CATEGORIES:
+        for name, fn in _CATEGORY_RULES[cat]:
+            if name not in elig:
+                continue
+            reason = fn(a, b, liveness)
+            if reason is None:
+                # One rule accepted — the instruction *could* pair here.
+                # We still list rejections from sibling rules in the same
+                # category since they are informative near-misses.
+                continue
+            buckets[cat].append(f"{name}:{reason}")
+    parts = []
+    for cat in RULE_CATEGORIES:
+        if buckets[cat]:
+            parts.append(f"MISS-{side}:{cat}[{','.join(buckets[cat])}]")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Chain-reorder helpers
 # ---------------------------------------------------------------------------
 
-def _order_run_by_chains(instrs: list, graph: "DepGraph") -> list:
+def _order_run_by_chains(instrs: list, graph: "DepGraph",
+                         pair_score: "PairScoreFn" = None) -> list:
     """
-    Topologically sort *instrs* with a greedy producer-consumer bias.
+    Topologically sort *instrs* with a greedy "closest would-be partner" bias.
 
-    Within the constraints of the dep graph, prefer to schedule each
-    instruction immediately after the instruction that produces one of its
-    source registers (i.e. a direct RAW predecessor that is itself in
-    *instrs*).  This maximises the number of producer→consumer adjacent
-    pairs and is what --chain-reorder uses to reorder singleton runs.
+    Within the constraints of the dep graph, pick each next instruction so
+    it sits next to the instruction most likely to be its encoding partner.
+    The ranking is:
 
-    The algorithm is a standard Kahn's-algorithm topological sort with a
-    priority tie-break: among all currently-ready instructions, prefer one
-    whose most recently scheduled predecessor is the instruction just
-    emitted (direct chain continuation).
+        1. A direct dep-graph predecessor of ``last_emitted`` (producer-
+           consumer chain continuation).
+        2. A candidate that shares a rule-category membership with
+           ``last_emitted`` — ``last_emitted`` qualifies as A of some rule
+           and the candidate qualifies as B of the same category, or vice
+           versa.  This groups leftover instructions with their closest
+           would-be partner even when no real pair is possible.
+        3. Lowest original index (stable fallback).
 
     Parameters
     ----------
@@ -355,6 +316,10 @@ def _order_run_by_chains(instrs: list, graph: "DepGraph") -> list:
         The instructions to reorder (a contiguous singleton run, no pairs).
     graph
         The full block dep graph — used for predecessor/successor lookups.
+    pair_score
+        Optional scorer whose ``_get_a_elig`` / ``_get_b_elig`` hooks are
+        used for category-affinity tie-breaking.  ``None`` disables the
+        affinity bias and falls back to plain chain-reorder behaviour.
 
     Returns
     -------
@@ -366,6 +331,13 @@ def _order_run_by_chains(instrs: list, graph: "DepGraph") -> list:
     idx_set = {instr.index for instr in instrs}
     by_idx  = {instr.index: instr for instr in instrs}
 
+    get_a_elig = getattr(pair_score, "_get_a_elig", None)
+    get_b_elig = getattr(pair_score, "_get_b_elig", None)
+
+    def _categories(elig: "frozenset[str]") -> "frozenset[str]":
+        return frozenset(_RULE_CATEGORY[name] for name in elig
+                         if name in _RULE_CATEGORY)
+
     # Compute in-degree restricted to edges within this run.
     in_deg: dict = {instr.index: 0 for instr in instrs}
     for instr in instrs:
@@ -375,22 +347,31 @@ def _order_run_by_chains(instrs: list, graph: "DepGraph") -> list:
 
     ready = [instr for instr in instrs if in_deg[instr.index] == 0]
     result: list = []
-    last_emitted_idx: "int | None" = None
+    last_emitted: "Instruction | None" = None
 
     while ready:
-        # Prefer an instruction that directly follows the last emitted one.
         chosen = None
-        if last_emitted_idx is not None:
+        # Tier 1: dep-graph successor of last_emitted (hard chain).
+        if last_emitted is not None:
             for cand in ready:
-                if last_emitted_idx in graph.predecessors[cand.index]:
+                if last_emitted.index in graph.predecessors[cand.index]:
                     chosen = cand
                     break
+        # Tier 2: category affinity with last_emitted.
+        if chosen is None and last_emitted is not None and get_b_elig is not None:
+            last_a_cats = _categories(get_a_elig(last_emitted))
+            if last_a_cats:
+                for cand in ready:
+                    if last_a_cats & _categories(get_b_elig(cand)):
+                        chosen = cand
+                        break
+        # Tier 3: stable fallback.
         if chosen is None:
             chosen = ready[0]
 
         ready.remove(chosen)
         result.append(chosen)
-        last_emitted_idx = chosen.index
+        last_emitted = chosen
 
         for succ in graph.successors[chosen.index]:
             if succ in idx_set:
@@ -409,6 +390,7 @@ def _chain_reorder_singletons(
     pair_start_set: set,
     pair_end_set:   set,
     graph:          "DepGraph",
+    pair_score:     "PairScoreFn" = None,
 ) -> list:
     """
     Reorder singleton runs within *real_scheduled* to maximise
@@ -430,13 +412,13 @@ def _chain_reorder_singletons(
     for pos, instr in enumerate(real_scheduled):
         if pos in pair_start_set or pos in pair_end_set:
             if run:
-                result.extend(_order_run_by_chains(run, graph))
+                result.extend(_order_run_by_chains(run, graph, pair_score))
                 run.clear()
             result.append(instr)
         else:
             run.append(instr)
     if run:
-        result.extend(_order_run_by_chains(run, graph))
+        result.extend(_order_run_by_chains(run, graph, pair_score))
     return result
 
 
@@ -641,7 +623,7 @@ def _process_block(
 
             if rule_list is not None:
                 matching_primary = [rn for rn, rf in rule_list
-                                    if rf(a_s, b_s, liveness_snap)]
+                                    if rf(a_s, b_s, liveness_snap) is None]
                 if matching_primary:
                     winner = matching_primary[0]
                     if slot_scores:
@@ -671,41 +653,29 @@ def _process_block(
     # ── Optional chain-reorder of singleton runs ─────────────────────────
     if chain_reorder:
         real_scheduled = _chain_reorder_singletons(
-            real_scheduled, pair_start_set, pair_end_set, graph)
+            real_scheduled, pair_start_set, pair_end_set, graph, pair_score)
         real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
 
-    # ── Annotate each unpaired instruction with TALLY and CLASS tags ──────
-    # For each instruction that was not claimed by a primary rule, compute:
-    #   TALLY-A:<rule1>,<rule2>,…   — tally rules this instruction can play A in
-    #   TALLY-B:<rule1>,<rule2>,…   — tally rules this instruction can play B in
-    #   CLASS:<cls1>,<cls2>,…       — instruction class membership
-    #                                 (arith/mem/control/big/rvc)
-    # All three tags use the same comma-separated list format.  They are
-    # written into the output as assembly comments and parsed by the
-    # rv32_tally.py analysis tool.
+    # ── Annotate each unpaired instruction with MISS-A/MISS-B tags ────────
+    # For each unpaired instruction, run every rule that it qualifies for
+    # against its adjacent neighbour (next for A-side, previous for B-side)
+    # and collect the rejection reasons per category.  Paired instructions
+    # are skipped since they produce PAIR+/PAIR= annotations instead.
     tally_annots: dict = {}   # {instruction.index: "TAG1 TAG2 …"}
     for i, instr in enumerate(real_scheduled):
         if i in pair_start_set or i in pair_end_set:
             continue
-        tags: list = []
-        a_rules = [name for name, _pair_fn, a_fn, _b_fn in TALLY_RULES
-                   if a_fn(instr)]
-        b_rules = [name for name, _pair_fn, _a_fn, b_fn in TALLY_RULES
-                   if b_fn(instr)]
-        if a_rules:
-            tags.append("TALLY-A:" + ",".join(a_rules))
-        if b_rules:
-            tags.append("TALLY-B:" + ",".join(b_rules))
-        classes = [cls for cls, mn_set in _TALLY_GROUP.items()
-                   if instr.mnemonic in mn_set]
-        if _imm_is_big(instr):
-            classes.append("big")
-        if can_compress(instr):
-            classes.append("rvc")
-        if classes:
-            tags.append("CLASS:" + ",".join(sorted(classes)))
-        if tags:
-            tally_annots[instr.index] = " ".join(tags)
+        parts = []
+        next_partner = real_scheduled[i + 1] if i + 1 < total_instrs else None
+        prev_partner = real_scheduled[i - 1] if i > 0 else None
+        a_tag = _miss_tag(instr, next_partner, "A", liveness_snap)
+        b_tag = _miss_tag(instr, prev_partner, "B", liveness_snap)
+        if a_tag:
+            parts.append(a_tag)
+        if b_tag:
+            parts.append(b_tag)
+        if parts:
+            tally_annots[instr.index] = " ".join(parts)
 
     # ── Emit annotated output ─────────────────────────────────────────────
     # Walk `scheduled` (sentinels included) in order.  Sentinels are barriers
@@ -926,11 +896,9 @@ class AssemblyScheduler:
         is processed and written to *out* before the next block is read.
         Peak memory is O(block_size), not O(file_size).
 
-        Unpaired instructions are annotated with TALLY-A:, TALLY-B:, and
-        CLASS: tags (comma-separated rule / class lists — see rv32_tally.py)
-        indicating which secondary pairing rules they are eligible for on
-        each side, and which classes they belong to.  Use rv32_tally.py to
-        analyse the output.
+        Unpaired instructions are annotated with per-category MISS-A/MISS-B
+        tags listing the rejection reasons returned by each pairing rule
+        they qualified for.  Use rv32_tally.py to aggregate these.
 
         Parameters
         ----------
@@ -1288,12 +1256,14 @@ def main():
         print("compact32 rules (in match order):")
         for name, fn in COMPACT32_RULES:
             doc = (fn.__doc__ or "").strip().splitlines()[0]
-            print(f"  {name:26s}  {doc}")
+            cat = _RULE_CATEGORY.get(name, "-")
+            print(f"  {name:26s} [{cat:7s}]  {doc}")
         print()
-        print("tally rules (annotated on unpaired instructions as TALLY-A:name,… / TALLY-B:name,…):")
-        for name, fn, a_fn, b_fn in TALLY_RULES:
-            doc  = (fn.__doc__ or "").strip().splitlines()[0]
-            print(f"  {name:26s}  {doc}")
+        print("rule categories (MISS-A:<cat>/MISS-B:<cat> annotations):")
+        for cat in RULE_CATEGORIES:
+            rules_in = [n for n, fn in COMPACT32_RULES
+                        if _RULE_CATEGORY.get(n) == cat]
+            print(f"  {cat:8s}  {', '.join(rules_in)}")
         return
 
     if args.scorer not in SCORERS:
