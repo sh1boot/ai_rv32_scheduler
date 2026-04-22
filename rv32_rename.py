@@ -357,10 +357,11 @@ def rename_destinations(
     # If the scoring function holds a mutable liveness cell (e.g. compact32),
     # capture it so try_rename can refresh it during trial scoring.
     _liveness_cell  = getattr(pair_score, "_liveness_cell", None)
-    # Eligibility cache inside the scorer (keyed by instruction index).
+    # Eligibility caches inside the scorer (keyed by instruction index).
     # Must be invalidated whenever an instruction's registers change so that
-    # _a_eligible() is re-run with the current defs/uses.
-    _elig_cache_ref = getattr(pair_score, "_elig_cache",    None)
+    # eligibility is re-run with the current defs/uses.  ``_invalidate``
+    # drops both A-side and B-side entries in one call.
+    _invalidate_ref = getattr(pair_score, "_invalidate", None)
 
     def _refresh_liveness():
         """Recompute and install fresh liveness if the scorer needs it."""
@@ -371,8 +372,8 @@ def rename_destinations(
         """Drop the cached eligibility for the instruction at *pos*.
         Called after _apply_rename so the scorer recomputes eligibility from
         the instruction's current (post-rename) register state."""
-        if _elig_cache_ref is not None:
-            _elig_cache_ref.pop(scheduled[pos].index, None)
+        if _invalidate_ref is not None:
+            _invalidate_ref(scheduled[pos].index)
 
     def _greedy_pair_count(seq, lo: int, hi: int) -> int:
         """Greedy pair count over seq[lo..hi].
