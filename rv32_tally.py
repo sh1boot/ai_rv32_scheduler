@@ -41,12 +41,13 @@ _PAIR_A_RE   = re.compile(r'#\s*PAIR\+\s*(?:\[([^\]]*)\])?')
 _PAIR_B_RE   = re.compile(r'#\s*PAIR=')
 # Match MISS-A or MISS-B, capturing the category name and the bracketed body.
 _MISS_RE     = re.compile(r'MISS-([AB]):(\w+)\[([^\]]*)\]')
+_CLASS_RE    = re.compile(r'CLASS:([\w,]+)')
 
 
 class AnnotatedInstr:
     """Parsed record for one instruction line."""
     __slots__ = ("mnemonic", "is_pair_a", "pair_rule", "is_pair_b",
-                 "miss_a", "miss_b", "parsed")
+                 "miss_a", "miss_b", "classes", "parsed")
 
     def __init__(self):
         self.mnemonic:  str       = ""
@@ -56,6 +57,7 @@ class AnnotatedInstr:
         # miss_a / miss_b: {category: [(rule_name, reason), ...]}
         self.miss_a:    dict      = {}
         self.miss_b:    dict      = {}
+        self.classes:   frozenset = frozenset()
         self.parsed:    object    = None
 
 
@@ -102,6 +104,10 @@ def parse_annotated_stream(lines):
         for side, cat, body in _MISS_RE.findall(comment):
             target = ai.miss_a if side == "A" else ai.miss_b
             target.setdefault(cat, []).extend(_parse_miss_body(body))
+
+        m_cls = _CLASS_RE.search(comment)
+        if m_cls:
+            ai.classes = frozenset(m_cls.group(1).split(","))
 
         yield ai
 

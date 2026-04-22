@@ -241,6 +241,85 @@ class PairStats:
         )
 
 # ---------------------------------------------------------------------------
+# Instruction class sets (used for CLASS: annotations on unpaired instructions)
+# ---------------------------------------------------------------------------
+
+_TALLY_ARITH_MN: frozenset = frozenset({
+    "add",  "addw",  "sub",  "subw",  "neg",  "negw",
+    "addi", "addiw",
+    "and",  "or",  "xor",  "not",
+    "andi", "ori", "xori",
+    "sll",  "sllw", "srl",  "srlw", "sra",  "sraw",
+    "slli", "slliw","srli", "srliw","srai", "sraiw",
+    "slt",  "sltu", "slti", "sltiu",
+    "seqz", "snez", "sltz", "sgtz",
+    "mul",  "mulh", "mulhu","mulhsu","mulw",
+    "div",  "divu", "rem",  "remu",
+    "divw", "divuw","remw", "remuw",
+    "mv", "li",
+    "bic",  "andn", "xnor",
+    "sh1add","sh2add","sh3add",
+    "add.uw", "slli.uw",
+    "min",  "minu", "max",  "maxu",
+    "clz",  "ctz",  "cpop", "rev8",
+    "clzw", "ctzw", "cpopw",
+    "sext.b","sext.h","zext.h",
+    "bset", "bclr", "binv", "bext",
+    "bseti","bclri","binvi","bexti",
+    "ror",  "rol",  "rori", "orc.b",
+    "rorw", "rolw", "roriw",
+    "czero.eqz", "czero.nez",
+})
+
+_TALLY_CONTROL_MN: frozenset = frozenset({
+    "beq",  "bne",  "blt",  "bge",  "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "j",    "jal",  "jalr", "jr",
+    "ret",  "call", "tail",
+    "ecall","ebreak","nop",
+    "fence","fence.i","sfence.vma",
+    "mret", "sret", "uret",
+    "c.beqz","c.bnez","c.j","c.jal","c.jalr","c.jr",
+})
+
+_TALLY_MEM_MN: frozenset = _MEM_OPS
+
+_UPPER_IMM_MN: frozenset = frozenset({"lui", "auipc"})
+
+_SHIFT_MN: frozenset = frozenset({
+    "slli", "srli", "srai", "slliw", "srliw", "sraiw",
+})
+
+
+def _imm_is_big(instr: "Instruction") -> bool:
+    """Return True if *instr* carries a large immediate."""
+    mn = instr.mnemonic
+    if mn in _UPPER_IMM_MN:
+        return True
+    if mn in _SHIFT_MN:
+        return False
+    if instr.mem is not None:
+        off = instr.mem[0]
+        if off is None:
+            return False
+        scale = instr.mem_width or 1
+        return not (off % scale == 0 and -16 * scale <= off <= 15 * scale)
+    imm = instr.imm
+    if imm is None:
+        return False
+    if mn == "addi" and instr.uses and instr.uses[0] == "x2":
+        return not (0 <= imm and imm % 4 == 0 and imm <= 124)
+    return not (-16 <= imm <= 15)
+
+
+_TALLY_GROUP: dict = {
+    "arith":   _TALLY_ARITH_MN,
+    "mem":     _TALLY_MEM_MN,
+    "control": _TALLY_CONTROL_MN,
+}
+
+
+# ---------------------------------------------------------------------------
 # Near-miss annotations for unpaired instructions
 # ---------------------------------------------------------------------------
 
@@ -656,7 +735,7 @@ def _process_block(
             real_scheduled, pair_start_set, pair_end_set, graph, pair_score)
         real_pos = {instr.index: p for p, instr in enumerate(real_scheduled)}
 
-    # ── Annotate each unpaired instruction with MISS-A/MISS-B tags ────────
+    # ── Annotate each unpaired instruction with MISS-A/MISS-B and CLASS tags ─
     # For each unpaired instruction, run every rule that it qualifies for
     # against its adjacent neighbour (next for A-side, previous for B-side)
     # and collect the rejection reasons per category.  Paired instructions
@@ -674,6 +753,14 @@ def _process_block(
             parts.append(a_tag)
         if b_tag:
             parts.append(b_tag)
+        classes = [cls for cls, mn_set in _TALLY_GROUP.items()
+                   if instr.mnemonic in mn_set]
+        if _imm_is_big(instr):
+            classes.append("big")
+        if can_compress(instr):
+            classes.append("rvc")
+        if classes:
+            parts.append("CLASS:" + ",".join(sorted(classes)))
         if parts:
             tally_annots[instr.index] = " ".join(parts)
 
